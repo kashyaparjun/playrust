@@ -32,4 +32,9 @@ jobs:
         env:
           PLAYRUST_FFMPEG: /usr/bin/ffmpeg
           PLAYRUST_FFPROBE: /usr/bin/ffprobe
-        run: cargo test --locked --test wikipedia_e2e -- --ignored --test-threads=1
+        run: >-
+          cargo test --locked
+          --test wikipedia_search_e2e
+          --test wikipedia_navigation_e2e
+          --test wikipedia_failure_e2e
+          -- --ignored --test-threads=1

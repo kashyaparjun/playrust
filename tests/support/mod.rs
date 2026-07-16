@@ -1,0 +1,94 @@
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use playrust::report::AggregateReport;
+
+pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_playrust"));
+    command
+        .args(arguments)
+        .envs(environment.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    output_with_timeout(command, Duration::from_secs(180))
+}
+
+pub fn assert_success(command: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "playrust {command} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+pub fn read_report(artifacts: &Path) -> AggregateReport {
+    serde_json::from_slice(&fs::read(artifacts.join("report.json")).expect("read JSON report"))
+        .expect("decode JSON report")
+}
+
+pub fn assert_png(path: &Path, expected: (u32, u32)) {
+    let png = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(
+        (
+            u32::from_be_bytes(png[16..20].try_into().unwrap()),
+            u32::from_be_bytes(png[20..24].try_into().unwrap()),
+        ),
+        expected,
+    );
+}
+
+pub fn assert_vp9_video(path: &Path) {
+    let ffprobe = env::var_os("PLAYRUST_FFPROBE").unwrap_or_else(|| "ffprobe".into());
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert_success("ffprobe", &output);
+    let metadata = String::from_utf8_lossy(&output.stdout);
+    assert!(metadata.contains("codec_name=vp9"), "{metadata}");
+    assert!(metadata.contains("width=1280"), "{metadata}");
+    assert!(metadata.contains("height=720"), "{metadata}");
+}
+
+pub fn ffmpeg_path() -> String {
+    env::var_os("PLAYRUST_FFMPEG")
+        .unwrap_or_else(|| "ffmpeg".into())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    let mut child = command.spawn().expect("run playrust");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll playrust").is_some() {
+            return child.wait_with_output().expect("collect playrust output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("collect timed out output");
+            panic!(
+                "playrust timed out\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
