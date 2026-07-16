@@ -99,6 +99,15 @@ const STATE_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
+const GEOLOCATION_HTML: &str = r#"<!doctype html>
+<html lang="en">
+  <body>
+    <button id="locate" onclick="navigator.geolocation.getCurrentPosition(position => document.querySelector('#position').textContent = JSON.stringify([position.coords.latitude, position.coords.longitude, position.coords.accuracy]), error => document.querySelector('#position').textContent = error.message)">Locate</button>
+    <p id="position">pending</p>
+  </body>
+</html>
+"#;
+
 struct FixtureServer {
     address: std::net::SocketAddr,
     stop: Arc<AtomicBool>,
@@ -298,7 +307,7 @@ steps:
         .await
         .expect("launch pinned Chrome");
     let other_context = host
-        .create_context(playrust::browser::Viewport::new(800, 600).unwrap())
+        .create_context(playrust::browser::Viewport::new(800, 600).unwrap(), None)
         .await
         .expect("create second isolated context");
     other_context
@@ -322,6 +331,64 @@ steps:
     shutdown.expect("shut down Chrome cleanly");
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
     assert_eq!(other_cookie, "flow=present");
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn geolocation_is_applied_only_to_the_flow_context() {
+    let chrome = PathBuf::from(
+        env::var_os("PLAYRUST_CHROME")
+            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
+    );
+    let server = FixtureServer::start(GEOLOCATION_HTML);
+    let url = format!("http://{}", server.address);
+    let flow = compile_yaml(
+        &format!(
+            r##"version: 1
+name: geolocation
+base_url: {url}
+settings:
+  video: off
+  geolocation: {{ latitude: 37.7749, longitude: -122.4194, accuracy: 7.25 }}
+steps:
+  - open: /
+  - click: {{ target: {{ css: "#locate" }} }}
+  - assert: {{ text: {{ target: {{ css: "#position" }}, equals: "[37.7749,-122.4194,7.25]" }} }}
+"##
+        ),
+        "geolocation.yaml",
+        &BTreeMap::new(),
+    )
+    .expect("compile geolocation flow");
+    let artifacts = tempfile::tempdir().expect("create artifact directory");
+    let host = BrowserHost::launch(&chrome, false)
+        .await
+        .expect("launch pinned Chrome");
+
+    let report = run_flow(&host, &flow, &RunOptions::new(artifacts.path())).await;
+    let other_context = host
+        .create_context(playrust::browser::Viewport::new(800, 600).unwrap(), None)
+        .await
+        .expect("create second isolated context");
+    other_context
+        .page()
+        .goto(url.as_str())
+        .await
+        .expect("open fixture in second context");
+    let permission: String = other_context
+        .page()
+        .evaluate("navigator.permissions.query({ name: 'geolocation' }).then(value => value.state)")
+        .await
+        .expect("read second context geolocation permission")
+        .into_value()
+        .expect("decode second context geolocation permission");
+    host.dispose_context(other_context).await.unwrap();
+    let shutdown = host.shutdown().await;
+    server.shutdown();
+
+    shutdown.expect("shut down Chrome cleanly");
+    assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+    assert_ne!(permission, "granted");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -205,7 +205,10 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         return report(flow, started, artifacts, Vec::new(), true);
     }
     // Context creation must run to completion so a late response cannot orphan its context.
-    let context = match host.create_context(viewport).await {
+    let context = match host
+        .create_context(viewport, flow.settings.geolocation)
+        .await
+    {
         Ok(context) => context,
         Err(error) => {
             if is_cancelled(options.cancellation.as_ref()) {
@@ -1833,7 +1836,7 @@ mod tests {
         let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
         let host = BrowserHost::launch(chrome, false).await.unwrap();
         let context = host
-            .create_context(Viewport::new(800, 600).unwrap())
+            .create_context(Viewport::new(800, 600).unwrap(), None)
             .await
             .unwrap();
         let page = context.page().clone();
@@ -1878,7 +1881,7 @@ mod tests {
         let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
         let host = BrowserHost::launch(chrome, false).await.unwrap();
         let context = host
-            .create_context(Viewport::new(800, 600).unwrap())
+            .create_context(Viewport::new(800, 600).unwrap(), None)
             .await
             .unwrap();
         let page = context.page().clone();

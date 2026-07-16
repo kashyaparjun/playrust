@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::browser::Geolocation;
+
 pub const REDACTED: &str = "[REDACTED]";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum accepted YAML flow source size in bytes (1 MiB).
@@ -123,6 +125,7 @@ pub struct RawSettings {
     pub timeout: Option<String>,
     pub viewport: Option<RawViewport>,
     pub video: Option<VideoMode>,
+    pub geolocation: Option<RawGeolocation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +133,14 @@ pub struct RawSettings {
 pub struct RawViewport {
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawGeolocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub accuracy: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -312,7 +323,7 @@ pub enum ClearTarget {
     Storage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledFlow {
     pub source: PathBuf,
     pub name: String,
@@ -323,11 +334,12 @@ pub struct CompiledFlow {
     pub redactor: Redactor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowSettings {
     pub timeout: Duration,
     pub viewport: Viewport,
     pub video: VideoMode,
+    pub geolocation: Option<Geolocation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,6 +594,18 @@ pub fn compile_raw(
     {
         return invalid("video requires even viewport width and height");
     }
+    let geolocation = raw
+        .settings
+        .geolocation
+        .map(|value| {
+            Geolocation::new(
+                value.latitude,
+                value.longitude,
+                value.accuracy.unwrap_or(0.0),
+            )
+            .map_err(|error| FlowError::Invalid(error.to_string()))
+        })
+        .transpose()?;
 
     let base_url = raw
         .base_url
@@ -596,6 +620,7 @@ pub fn compile_raw(
         timeout,
         viewport,
         video,
+        geolocation,
     };
     let mut ids = BTreeSet::new();
     let mut screenshot_names = BTreeSet::new();
@@ -1482,6 +1507,43 @@ steps:
         )
         .unwrap();
         assert_eq!(disabled.settings.video, VideoMode::Off);
+    }
+
+    #[test]
+    fn compiles_and_validates_geolocation_settings() {
+        let default_accuracy = compile(
+            "version: 1\nname: x\nsettings: { geolocation: { latitude: 51.5, longitude: -0.12 } }\nsteps: [{ open: https://x.test }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            default_accuracy.settings.geolocation,
+            Some(Geolocation {
+                latitude: 51.5,
+                longitude: -0.12,
+                accuracy: 0.0,
+            })
+        );
+        assert!(
+            compile("version: 1\nname: x\nsteps: [{ open: https://x.test }]\n")
+                .unwrap()
+                .settings
+                .geolocation
+                .is_none()
+        );
+
+        for (geolocation, expected) in [
+            ("{ latitude: .nan, longitude: 0 }", "latitude"),
+            ("{ latitude: 91, longitude: 0 }", "latitude"),
+            ("{ latitude: 0, longitude: -.inf }", "longitude"),
+            ("{ latitude: 0, longitude: 181 }", "longitude"),
+            ("{ latitude: 0, longitude: 0, accuracy: .inf }", "accuracy"),
+            ("{ latitude: 0, longitude: 0, accuracy: -1 }", "accuracy"),
+        ] {
+            let source = format!(
+                "version: 1\nname: x\nsettings: {{ geolocation: {geolocation} }}\nsteps: [{{ open: https://x.test }}]\n"
+            );
+            assert!(error(&source).contains(expected), "accepted {geolocation}");
+        }
     }
 
     #[test]

@@ -58,7 +58,10 @@ settings:
   timeout: 10s
   viewport: { width: 1280, height: 720 }
   video: retain-on-failure
+  geolocation: { latitude: 51.5074, longitude: -0.1278, accuracy: 10 }
 ```
+
+`geolocation` is optional. Latitude must be between `-90` and `90`, longitude between `-180` and `180`, and accuracy must be a non-negative number in meters; accuracy defaults to `0`. When set, Playrust grants geolocation permission only in that flow's isolated browser context and applies the coordinates to its page before any steps run.
 
 ### Actions
 
