@@ -17,7 +17,7 @@ use playrust::install::{PINNED_CHROME_VERSION, install_browser, resolve_or_insta
 use playrust::report::{
     AggregateReport, ArtifactPaths, ChromiumInfo, ExitCode, Failure, FailureCategory, FlowReport,
     FlowStatus, RunnerInfo, SafeText, artifact_directory, write_aggregate_report,
-    write_junit_report,
+    write_html_report, write_junit_report,
 };
 use playrust::runner::{CancellationToken, RunOptions, run_flow};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
@@ -79,6 +79,9 @@ struct RunArgs {
     /// Write a JUnit XML report to <artifacts>/junit.xml.
     #[arg(long)]
     junit: bool,
+    /// Write an HTML report to <artifacts>/report.html.
+    #[arg(long)]
+    html: bool,
 }
 
 #[derive(Debug, Args)]
@@ -197,6 +200,7 @@ async fn run(args: RunArgs) -> ExitCode {
                 started,
                 &args.artifacts,
                 args.junit,
+                args.html,
                 None,
                 vec![specification_report(&args.path, &args.artifacts, error)],
             );
@@ -209,6 +213,7 @@ async fn run(args: RunArgs) -> ExitCode {
                 started,
                 &args.artifacts,
                 args.junit,
+                args.html,
                 None,
                 vec![specification_report(
                     &args.path,
@@ -256,6 +261,7 @@ async fn run(args: RunArgs) -> ExitCode {
             started,
             &args.artifacts,
             args.junit,
+            args.html,
             None,
             compilation_failures,
         );
@@ -268,6 +274,7 @@ async fn run(args: RunArgs) -> ExitCode {
                 started,
                 &args.artifacts,
                 args.junit,
+                args.html,
                 None,
                 setup_failure_reports(&runs, FailureCategory::BrowserLaunch, error.to_string()),
             );
@@ -294,6 +301,7 @@ async fn run(args: RunArgs) -> ExitCode {
                 started,
                 &args.artifacts,
                 args.junit,
+                args.html,
                 None,
                 setup_failure_reports(&runs, FailureCategory::Recording, error.to_string()),
             );
@@ -312,6 +320,7 @@ async fn run(args: RunArgs) -> ExitCode {
                 started,
                 &args.artifacts,
                 args.junit,
+                args.html,
                 None,
                 setup_failure_reports(&runs, FailureCategory::BrowserLaunch, error.to_string()),
             );
@@ -332,6 +341,7 @@ async fn run(args: RunArgs) -> ExitCode {
         started,
         &args.artifacts,
         args.junit,
+        args.html,
         Some(chromium),
         reports,
     )
@@ -554,6 +564,7 @@ fn finish_report(
     started: Instant,
     artifacts: &Path,
     junit: bool,
+    html: bool,
     chromium: Option<ChromiumInfo>,
     flows: Vec<FlowReport>,
 ) -> ExitCode {
@@ -569,7 +580,7 @@ fn finish_report(
     );
     let exit_code = report.exit_code();
     print_results(&report);
-    for name in ["report.json", "junit.xml"] {
+    for name in ["report.json", "junit.xml", "report.html"] {
         let path = artifacts.join(name);
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -600,11 +611,30 @@ fn finish_report(
             }
         }
     }
+    if html {
+        match write_html_report(artifacts, &report) {
+            Ok(path) => println!("HTML: {}", path.display()),
+            Err(error) => {
+                if junit {
+                    let _ = fs::remove_file(artifacts.join("junit.xml"));
+                }
+                eprintln!("error: {error}");
+                return if exit_code == ExitCode::Interrupted {
+                    ExitCode::Interrupted
+                } else {
+                    ExitCode::Infrastructure
+                };
+            }
+        }
+    }
     match write_aggregate_report(artifacts, &report) {
         Ok(path) => println!("Report: {}", path.display()),
         Err(error) => {
             if junit {
                 let _ = fs::remove_file(artifacts.join("junit.xml"));
+            }
+            if html {
+                let _ = fs::remove_file(artifacts.join("report.html"));
             }
             eprintln!("error: {error}");
             return if exit_code == ExitCode::Interrupted {
