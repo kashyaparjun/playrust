@@ -4,7 +4,9 @@ Playrust is a YAML-based web testing automation tool written in Rust. It runs se
 
 ## Demo
 
-[Watch Playrust run three browser tests](docs/playrust-demo.mp4) covering sign-in, task management, and interactive controls.
+<video src="https://raw.githubusercontent.com/kashyaparjun/playrust/main/docs/playrust-demo.mp4" controls width="100%"></video>
+
+[Watch the MP4 directly](docs/playrust-demo.mp4) if the embedded player is unavailable. The demo shows the YAML flow, Chromium launch, and one continuous test covering sign-in, task management, and interactive controls.
 
 ## Install
 
