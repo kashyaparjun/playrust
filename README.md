@@ -42,7 +42,7 @@ playrust run examples/example.yaml --var username=alice
 playrust check <path> [--var NAME=VALUE]
 playrust run <path> [--headed] [--jobs N] [--browser PATH]
                     [--var NAME=VALUE] [--video MODE]
-                    [--ffmpeg-path PATH] [--artifacts DIR]
+                    [--ffmpeg-path PATH] [--artifacts DIR] [--junit]
 ```
 
 `run` defaults to headless mode, up to four concurrent flows, and `./playrust-artifacts`. Use `--jobs 1` for sequential execution. Exit codes are `0` for success, `2` for invalid input/specification, `3` for an automation or assertion failure, `4` for infrastructure/recording failure, and `130` when interrupted.
@@ -133,7 +133,7 @@ Video modes are `off`, `on`, and `retain-on-failure`. `on` keeps every recording
 
 Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libvpx-vp9` encoder. Playrust records the fixed page viewport as silent 15 FPS WebM/VP9; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 
-Each `run` writes `<artifacts>/report.json`. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. Per-flow directories may also contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
+Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically write `<artifacts>/junit.xml`; automation failures are JUnit failures, while invalid specifications, infrastructure failures, and interruptions are JUnit errors. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. Per-flow directories may also contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
 
 ## Boundaries
 

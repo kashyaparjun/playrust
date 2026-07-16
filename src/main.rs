@@ -17,6 +17,7 @@ use playrust::install::{PINNED_CHROME_VERSION, install_browser, resolve_or_insta
 use playrust::report::{
     AggregateReport, ArtifactPaths, ChromiumInfo, ExitCode, Failure, FailureCategory, FlowReport,
     FlowStatus, RunnerInfo, SafeText, artifact_directory, write_aggregate_report,
+    write_junit_report,
 };
 use playrust::runner::{CancellationToken, RunOptions, run_flow};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
@@ -75,6 +76,9 @@ struct RunArgs {
     /// Root directory for flow artifacts and report.json.
     #[arg(long, default_value = DEFAULT_ARTIFACTS)]
     artifacts: PathBuf,
+    /// Write a JUnit XML report to <artifacts>/junit.xml.
+    #[arg(long)]
+    junit: bool,
 }
 
 #[derive(Debug, Args)]
@@ -192,6 +196,7 @@ async fn run(args: RunArgs) -> ExitCode {
             return finish_report(
                 started,
                 &args.artifacts,
+                args.junit,
                 None,
                 vec![specification_report(&args.path, &args.artifacts, error)],
             );
@@ -203,6 +208,7 @@ async fn run(args: RunArgs) -> ExitCode {
             return finish_report(
                 started,
                 &args.artifacts,
+                args.junit,
                 None,
                 vec![specification_report(
                     &args.path,
@@ -246,7 +252,13 @@ async fn run(args: RunArgs) -> ExitCode {
             FailureCategory::Specification,
             "not run because another flow failed validation".to_owned(),
         ));
-        return finish_report(started, &args.artifacts, None, compilation_failures);
+        return finish_report(
+            started,
+            &args.artifacts,
+            args.junit,
+            None,
+            compilation_failures,
+        );
     }
 
     let browser_path = match resolve_or_install_browser(args.browser.as_deref()).await {
@@ -255,6 +267,7 @@ async fn run(args: RunArgs) -> ExitCode {
             return finish_report(
                 started,
                 &args.artifacts,
+                args.junit,
                 None,
                 setup_failure_reports(&runs, FailureCategory::BrowserLaunch, error.to_string()),
             );
@@ -280,6 +293,7 @@ async fn run(args: RunArgs) -> ExitCode {
             return finish_report(
                 started,
                 &args.artifacts,
+                args.junit,
                 None,
                 setup_failure_reports(&runs, FailureCategory::Recording, error.to_string()),
             );
@@ -297,6 +311,7 @@ async fn run(args: RunArgs) -> ExitCode {
             return finish_report(
                 started,
                 &args.artifacts,
+                args.junit,
                 None,
                 setup_failure_reports(&runs, FailureCategory::BrowserLaunch, error.to_string()),
             );
@@ -313,7 +328,13 @@ async fn run(args: RunArgs) -> ExitCode {
     if interrupted {
         eprintln!("Interrupted");
     }
-    finish_report(started, &args.artifacts, Some(chromium), reports)
+    finish_report(
+        started,
+        &args.artifacts,
+        args.junit,
+        Some(chromium),
+        reports,
+    )
 }
 
 async fn execute_runs(
@@ -532,6 +553,7 @@ fn add_infrastructure_failure(reports: &mut [FlowReport], message: String) {
 fn finish_report(
     started: Instant,
     artifacts: &Path,
+    junit: bool,
     chromium: Option<ChromiumInfo>,
     flows: Vec<FlowReport>,
 ) -> ExitCode {
@@ -556,6 +578,19 @@ fn finish_report(
             } else {
                 ExitCode::Infrastructure
             };
+        }
+    }
+    if junit {
+        match write_junit_report(artifacts, &report) {
+            Ok(path) => println!("JUnit: {}", path.display()),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return if exit_code == ExitCode::Interrupted {
+                    ExitCode::Interrupted
+                } else {
+                    ExitCode::Infrastructure
+                };
+            }
         }
     }
     exit_code
