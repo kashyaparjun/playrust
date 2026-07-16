@@ -1372,16 +1372,19 @@ async fn step_failure(
     };
     let timeout_ms = deadline_timeout_ms(&error, step.timeout);
     let mut failure = Failure::new(category, safe(flow, error.message));
-    failure.step = Some(step_context(step));
+    failure.step = Some(step_context(flow, step));
     failure.current_url = current_url;
     failure.timeout_ms = timeout_ms;
     failure.last_observed = error.last_observed.map(|value| safe(flow, value));
     failure
 }
 
-fn step_context(step: &CompiledStep) -> StepContext {
+fn step_context(flow: &CompiledFlow, step: &CompiledStep) -> StepContext {
+    let included = step.source != flow.source;
     StepContext {
         number: step.index,
+        source: included.then(|| path_text(&step.source)),
+        source_step: included.then_some(step.source_index),
         id: step.id.clone(),
         operation: operation_name(&step.operation).to_owned(),
         locator: operation_locator(&step.operation).map(locator_text),
@@ -1695,7 +1698,7 @@ mod tests {
             &BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]),
         )
         .unwrap();
-        let context = step_context(&flow.steps[0]);
+        let context = step_context(&flow, &flow.steps[0]);
         assert_eq!(context.locator.unwrap().as_str(), "[REDACTED]");
     }
 
@@ -1708,7 +1711,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        let context = step_context(&flow.steps[0]);
+        let context = step_context(&flow, &flow.steps[0]);
         assert_eq!(
             context.locator.unwrap().as_str(),
             "css=\"button\" index=1 checked=false focused=true"
@@ -1724,7 +1727,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        let context = step_context(&flow.steps[0]);
+        let context = step_context(&flow, &flow.steps[0]);
         assert_eq!(context.operation, "double_click");
         assert_eq!(context.locator.unwrap().as_str(), "css=\"button\"");
     }
@@ -1744,10 +1747,39 @@ mod tests {
             (&flow.steps[2], "scroll", None),
             (&flow.steps[3], "back", None),
         ] {
-            let context = step_context(step);
+            let context = step_context(&flow, step);
             assert_eq!(context.operation, name);
             assert_eq!(context.locator.as_ref().map(SafeText::as_str), locator);
         }
+    }
+
+    #[test]
+    fn included_step_context_preserves_child_source_and_local_number() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("child.subflow.yaml");
+        std::fs::write(
+            &root,
+            "version: 1\nname: root\nsettings: { video: off }\nsteps: [{ run: ./child.subflow.yaml }]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            "version: 1\nname: child\nsteps:\n  - open: https://example.test\n  - assert: { visible: { css: missing } }\n",
+        )
+        .unwrap();
+        let flow = crate::flow::compile_file(&root, &BTreeMap::new()).unwrap();
+
+        let context = step_context(&flow, &flow.steps[1]);
+
+        assert_eq!(context.number, 2);
+        assert_eq!(context.source_step, Some(2));
+        assert!(
+            context
+                .source
+                .as_deref()
+                .is_some_and(|source| source.ends_with("child.subflow.yaml"))
+        );
     }
 
     #[test]

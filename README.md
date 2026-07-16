@@ -36,7 +36,7 @@ playrust check examples/example.yaml --var username=alice
 playrust run examples/example.yaml --var username=alice
 ```
 
-`check` validates YAML, inputs, URLs, durations, keys, and configuration without launching Chromium. A path may be one `.yaml`/`.yml` file or a directory, searched recursively in stable path order.
+`check` validates YAML, inputs, URLs, durations, keys, subflows, and configuration without launching Chromium. A path may be one `.yaml`/`.yml` file or a directory, searched recursively in stable path order. Files ending in `.subflow.yaml` or `.subflow.yml` are not directory entrypoints; they run only when included.
 
 ```text
 playrust check <path> [--var NAME=VALUE]
@@ -51,7 +51,7 @@ playrust run <path> [--headed] [--jobs N] [--browser PATH]
 
 Every file requires `version: 1`, a non-empty `name`, and non-empty `steps`. Unknown fields, duplicate keys, aliases, merge keys, unresolved inputs, and multiple operations in one step are rejected. A step may also have a unique `id` and a `timeout` using an integer followed by `ms`, `s`, or `m`.
 
-Defaults are a `10s` timeout, `1280x720` viewport, and video `off`.
+Defaults are a `10s` timeout, `1280x720` viewport, and video `on`.
 
 ```yaml
 settings:
@@ -62,6 +62,21 @@ settings:
 ```
 
 `geolocation` is optional. Latitude must be between `-90` and `90`, longitude between `-180` and `180`, and accuracy must be a non-negative number in meters; accuracy defaults to `0`. When set, Playrust grants geolocation permission only in that flow's isolated browser context and applies the coordinates to its page before any steps run.
+
+### Subflows
+
+Include reusable steps at compile time with a relative path:
+
+```yaml
+steps:
+  - open: /login
+  - run: ./shared/sign-in.subflow.yaml
+  - assert: { url: { path: /dashboard } }
+```
+
+A subflow is a normal V1 document with `version`, `name`, and `steps`. Includes are expanded in place, may be nested up to 32 levels, and the expanded flow may contain at most 10,000 steps. Include paths are literal, must end in `.subflow.yaml` or `.subflow.yml`, and resolve relative to the file containing the `run` step. The `run` field must be the only field in its step. Canonical active include paths are checked for cycles; the same subflow may be included more than once when it is not already active.
+
+Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `secrets`; these values are not inherited across file boundaries. CLI variables apply to every file that declares the name and are rejected unless at least one file declares them. Child secrets remain redacted in root-flow diagnostics. Subflows cannot set `settings.viewport` or `settings.video`; those runtime-wide settings belong to the entrypoint. Child names and resolved inputs do not replace the entrypoint's report identity or inputs. Runtime failures from expanded steps report both the expanded step number and child source path/local step number.
 
 ### Actions
 
@@ -149,6 +164,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 operates in the main frame with one page per isolated flow. Iframes, shadow-root traversal, popups, multiple tabs, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, loops, branches, mutable variables, imports, or plugins.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 operates in the main frame with one page per isolated flow. Iframes, shadow-root traversal, popups, multiple tabs, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, loops, branches, mutable variables, parameterized imports, or plugins.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

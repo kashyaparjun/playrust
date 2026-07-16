@@ -19,6 +19,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_FLOW_SOURCE_BYTES: usize = 1024 * 1024;
 /// Maximum number of steps in one flow.
 pub const MAX_FLOW_STEPS: usize = 10_000;
+/// Maximum nested subflow include depth, excluding the entrypoint.
+pub const MAX_SUBFLOW_DEPTH: usize = 32;
 /// Maximum size of a YAML scalar or interpolated value in bytes (64 KiB).
 pub const MAX_SCALAR_BYTES: usize = 64 * 1024;
 /// Maximum timeout accepted for flow settings or an individual step.
@@ -93,6 +95,13 @@ impl Redactor {
     pub fn is_empty(&self) -> bool {
         self.secrets.is_empty()
     }
+
+    fn extend(&mut self, other: &Self) {
+        self.secrets.extend(other.secrets.iter().cloned());
+        self.secrets
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        self.secrets.dedup();
+    }
 }
 
 impl fmt::Debug for Redactor {
@@ -166,8 +175,11 @@ pub struct RawSecret {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawStep {
+    #[serde(skip)]
+    source_index: Option<usize>,
     pub id: Option<String>,
     pub timeout: Option<String>,
+    pub run: Option<String>,
     pub open: Option<String>,
     pub click: Option<RawTargetAction>,
     pub double_click: Option<RawTargetAction>,
@@ -351,6 +363,8 @@ pub struct Viewport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledStep {
     pub index: usize,
+    pub source: PathBuf,
+    pub source_index: usize,
     pub id: Option<String>,
     pub timeout: Duration,
     pub operation: Operation,
@@ -516,7 +530,58 @@ pub fn compile_file(
     path: impl AsRef<Path>,
     cli_vars: &BTreeMap<String, String>,
 ) -> Result<CompiledFlow, FlowError> {
+    compile_file_with_video(path, cli_vars, None)
+}
+
+pub fn compile_file_with_video(
+    path: impl AsRef<Path>,
+    cli_vars: &BTreeMap<String, String>,
+    video: Option<VideoMode>,
+) -> Result<CompiledFlow, FlowError> {
+    let environment = std::env::vars().collect();
+    compile_file_with_env_and_video(path, cli_vars, &environment, video)
+}
+
+pub fn compile_file_with_env(
+    path: impl AsRef<Path>,
+    cli_vars: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+) -> Result<CompiledFlow, FlowError> {
+    compile_file_with_env_and_video(path, cli_vars, environment, None)
+}
+
+fn compile_file_with_env_and_video(
+    path: impl AsRef<Path>,
+    cli_vars: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+    video: Option<VideoMode>,
+) -> Result<CompiledFlow, FlowError> {
     let path = path.as_ref();
+    let canonical = fs::canonicalize(path).map_err(|source| FlowError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut state = ExpansionState {
+        active: vec![(canonical, path.to_owned())],
+        declared_cli_vars: BTreeSet::new(),
+    };
+    let mut raw = read_flow(path)?;
+    if let Some(video) = video {
+        raw.settings.video = Some(video);
+    }
+    let mut flow =
+        compile_raw_expanded(raw, path.to_owned(), cli_vars, environment, 0, &mut state)?;
+    if let Some(name) = cli_vars
+        .keys()
+        .find(|name| !state.declared_cli_vars.contains(*name))
+    {
+        return invalid(format!("CLI variable {name:?} is not declared under vars"));
+    }
+    validate_expanded_steps(&mut flow.steps)?;
+    Ok(flow)
+}
+
+fn read_flow(path: &Path) -> Result<RawFlow, FlowError> {
     let file = fs::File::open(path).map_err(|source| FlowError::Io {
         path: path.to_owned(),
         source,
@@ -542,7 +607,7 @@ pub fn compile_file(
         path: path.to_owned(),
         source: io::Error::new(io::ErrorKind::InvalidData, source),
     })?;
-    compile_yaml(&source, path, cli_vars)
+    parse_yaml(&source).map_err(|error| with_path(path, error))
 }
 
 pub fn compile_raw(
@@ -551,17 +616,34 @@ pub fn compile_raw(
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
 ) -> Result<CompiledFlow, FlowError> {
+    compile_raw_inner(raw, source_path.into(), cli_vars, environment, true, false)
+}
+
+fn compile_raw_inner(
+    raw: RawFlow,
+    source_path: PathBuf,
+    cli_vars: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+    reject_unknown_cli_vars: bool,
+    allow_empty_steps: bool,
+) -> Result<CompiledFlow, FlowError> {
     if raw.version != 1 {
         return invalid("version must be 1");
     }
-    if raw.steps.is_empty() {
+    if raw.steps.is_empty() && !allow_empty_steps {
         return invalid("steps must not be empty");
     }
     if raw.steps.len() > MAX_FLOW_STEPS {
         return invalid(format!("steps must not exceed {MAX_FLOW_STEPS}"));
     }
 
-    let inputs = resolve_inputs(&raw.vars, &raw.secrets, cli_vars, environment)?;
+    let inputs = resolve_inputs(
+        &raw.vars,
+        &raw.secrets,
+        cli_vars,
+        environment,
+        reject_unknown_cli_vars,
+    )?;
     let redactor = Redactor::from_inputs(&inputs);
     let name = interpolate_non_secret("name", &raw.name, &inputs)?;
     require_non_empty("name", &name)?;
@@ -626,7 +708,7 @@ pub fn compile_raw(
     let mut screenshot_names = BTreeSet::new();
     let mut steps = Vec::with_capacity(raw.steps.len());
     for (offset, step) in raw.steps.into_iter().enumerate() {
-        let index = offset + 1;
+        let index = step.source_index.unwrap_or(offset + 1);
         let id = step
             .id
             .as_deref()
@@ -646,6 +728,11 @@ pub fn compile_raw(
             .map(|value| parse_duration(&format!("step {index} timeout"), value.expose()))
             .transpose()?
             .unwrap_or(timeout);
+        if step.run.is_some() {
+            return invalid(format!(
+                "step {index} subflow includes require compiling a flow file"
+            ));
+        }
         let operation = compile_operation(step, index, base_url.as_ref(), viewport, &inputs)?;
         if let Operation::Screenshot { name, .. } = &operation
             && !screenshot_names.insert(name.to_ascii_lowercase())
@@ -654,6 +741,8 @@ pub fn compile_raw(
         }
         steps.push(CompiledStep {
             index,
+            source: source_path.clone(),
+            source_index: index,
             id,
             timeout: step_timeout,
             operation,
@@ -661,7 +750,7 @@ pub fn compile_raw(
     }
 
     Ok(CompiledFlow {
-        source: source_path.into(),
+        source: source_path,
         name,
         base_url,
         settings,
@@ -669,6 +758,183 @@ pub fn compile_raw(
         steps,
         redactor,
     })
+}
+
+struct ExpansionState {
+    active: Vec<(PathBuf, PathBuf)>,
+    declared_cli_vars: BTreeSet<String>,
+}
+
+fn compile_raw_expanded(
+    mut raw: RawFlow,
+    source_path: PathBuf,
+    cli_vars: &BTreeMap<String, String>,
+    environment: &BTreeMap<String, String>,
+    depth: usize,
+    state: &mut ExpansionState,
+) -> Result<CompiledFlow, FlowError> {
+    if depth > 0 && (raw.settings.viewport.is_some() || raw.settings.video.is_some()) {
+        return invalid(format!(
+            "{}: subflows cannot set settings.viewport or settings.video",
+            source_path.display()
+        ));
+    }
+    if raw.steps.is_empty() {
+        return invalid(format!(
+            "{}: steps must not be empty",
+            source_path.display()
+        ));
+    }
+    if raw.steps.len() > MAX_FLOW_STEPS {
+        return invalid(format!(
+            "{}: steps must not exceed {MAX_FLOW_STEPS}",
+            source_path.display()
+        ));
+    }
+    state.declared_cli_vars.extend(raw.vars.keys().cloned());
+    let mut includes = BTreeMap::new();
+    for (offset, step) in raw.steps.iter_mut().enumerate() {
+        step.source_index = Some(offset + 1);
+        if let Some(run) = &step.run {
+            let operation_count = [
+                step.open.is_some(),
+                step.click.is_some(),
+                step.double_click.is_some(),
+                step.fill.is_some(),
+                step.press.is_some(),
+                step.screenshot.is_some(),
+                step.clear.is_some(),
+                step.assertion.is_some(),
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+            if step.id.is_some() || step.timeout.is_some() || operation_count != 0 {
+                return invalid(format!(
+                    "{}: step {} run must be the only field",
+                    source_path.display(),
+                    offset + 1
+                ));
+            }
+            includes.insert(offset, run.clone());
+        }
+    }
+    raw.steps.retain(|step| step.run.is_none());
+    let filtered_cli = cli_vars
+        .iter()
+        .filter(|(name, _)| raw.vars.contains_key(*name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let mut flow = compile_raw_inner(
+        raw,
+        source_path.clone(),
+        &filtered_cli,
+        environment,
+        false,
+        true,
+    )
+    .map_err(|error| with_path(&source_path, error))?;
+
+    let mut compiled = flow.steps.into_iter();
+    let original_len = compiled.len() + includes.len();
+    let mut steps = Vec::new();
+    for offset in 0..original_len {
+        let local_index = offset + 1;
+        if let Some(run) = includes.get(&offset) {
+            if depth == MAX_SUBFLOW_DEPTH {
+                return invalid(format!(
+                    "{}: step {local_index} exceeds maximum subflow depth {MAX_SUBFLOW_DEPTH}",
+                    source_path.display()
+                ));
+            }
+            validate_subflow_path(run, &source_path, local_index)?;
+            let child_path = source_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(run);
+            let canonical = fs::canonicalize(&child_path).map_err(|source| FlowError::Io {
+                path: child_path.clone(),
+                source,
+            })?;
+            if let Some(position) = state
+                .active
+                .iter()
+                .position(|(active, _)| active == &canonical)
+            {
+                let mut cycle = state.active[position..]
+                    .iter()
+                    .map(|(_, path)| path.display().to_string())
+                    .collect::<Vec<_>>();
+                cycle.push(child_path.display().to_string());
+                return invalid(format!("subflow include cycle: {}", cycle.join(" -> ")));
+            }
+            state.active.push((canonical, child_path.clone()));
+            let child_raw = read_flow(&child_path)?;
+            let child = compile_raw_expanded(
+                child_raw,
+                child_path,
+                cli_vars,
+                environment,
+                depth + 1,
+                state,
+            );
+            state.active.pop();
+            let child = child?;
+            flow.redactor.extend(&child.redactor);
+            steps.extend(child.steps);
+        } else if let Some(mut step) = compiled.next() {
+            step.source_index = local_index;
+            steps.push(step);
+        }
+        if steps.len() > MAX_FLOW_STEPS {
+            return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
+        }
+    }
+    flow.steps = steps;
+    Ok(flow)
+}
+
+fn validate_subflow_path(run: &str, source: &Path, index: usize) -> Result<(), FlowError> {
+    require_scalar_size(&format!("step {index} run"), run)?;
+    require_non_empty(&format!("step {index} run"), run)?;
+    let path = Path::new(run);
+    if path.is_absolute() {
+        return invalid(format!(
+            "{}: step {index} run must be relative to its containing flow",
+            source.display()
+        ));
+    }
+    if !is_subflow(path) {
+        return invalid(format!(
+            "{}: step {index} run must name a .subflow.yaml or .subflow.yml file",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> {
+    let mut ids = BTreeSet::new();
+    let mut screenshots = BTreeSet::new();
+    for (offset, step) in steps.iter_mut().enumerate() {
+        step.index = offset + 1;
+        if let Some(id) = &step.id
+            && !ids.insert(id.clone())
+        {
+            return invalid(format!("duplicate step id {id:?} in expanded flow"));
+        }
+        if let Operation::Screenshot { name, .. } = &step.operation
+            && !screenshots.insert(name.to_ascii_lowercase())
+        {
+            return invalid(format!(
+                "duplicate screenshot name {name:?} in expanded flow"
+            ));
+        }
+    }
+    if steps.is_empty() {
+        return invalid("expanded steps must not be empty");
+    }
+    Ok(())
 }
 
 pub fn discover_flow_files(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, FlowError> {
@@ -742,6 +1008,7 @@ fn resolve_inputs(
     secrets: &BTreeMap<String, RawSecret>,
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
+    reject_unknown_cli_vars: bool,
 ) -> Result<BTreeMap<String, Resolved<String>>, FlowError> {
     for name in vars.keys().chain(secrets.keys()) {
         validate_input_name(name)?;
@@ -765,7 +1032,9 @@ fn resolve_inputs(
             "input {name:?} is declared in both vars and secrets"
         ));
     }
-    if let Some(name) = cli_vars.keys().find(|name| !vars.contains_key(*name)) {
+    if reject_unknown_cli_vars
+        && let Some(name) = cli_vars.keys().find(|name| !vars.contains_key(*name))
+    {
         return invalid(format!("CLI variable {name:?} is not declared under vars"));
     }
 
@@ -1365,7 +1634,7 @@ fn discover_directory(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), 
         })?;
         if file_type.is_dir() {
             discover_directory(&entry.path(), files)?;
-        } else if file_type.is_file() && is_yaml(&entry.path()) {
+        } else if file_type.is_file() && is_yaml(&entry.path()) && !is_subflow(&entry.path()) {
             files.push(entry.path());
         }
     }
@@ -1377,6 +1646,20 @@ fn is_yaml(path: &Path) -> bool {
         path.extension().and_then(|value| value.to_str()),
         Some("yaml" | "yml")
     )
+}
+
+fn is_subflow(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.ends_with(".subflow.yaml") || name.ends_with(".subflow.yml"))
+}
+
+fn with_path(path: &Path, error: FlowError) -> FlowError {
+    match error {
+        FlowError::Yaml(message) => FlowError::Yaml(format!("{}: {message}", path.display())),
+        FlowError::Invalid(message) => FlowError::Invalid(format!("{}: {message}", path.display())),
+        error @ FlowError::Io { .. } => error,
+    }
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -1975,6 +2258,8 @@ steps:
         fs::write(directory.path().join("a.yaml"), "").unwrap();
         fs::write(directory.path().join("ignored.txt"), "").unwrap();
         fs::write(nested.join("b.yaml"), "").unwrap();
+        fs::write(nested.join("shared.subflow.yaml"), "").unwrap();
+        fs::write(nested.join("shared.subflow.yml"), "").unwrap();
 
         let files = discover_flow_files(directory.path()).unwrap();
         let relative = files
@@ -2000,5 +2285,256 @@ steps:
         let text = directory.path().join("flow.txt");
         fs::write(&text, "").unwrap();
         assert!(discover_flow_files(text).is_err());
+    }
+
+    #[test]
+    fn expands_nested_subflows_in_place_with_file_scoped_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = nested.join("child.subflow.yaml");
+        let grandchild = directory.path().join("grandchild.subflow.yml");
+        fs::write(
+            &root,
+            "version: 1\nname: root-${root_name}\nbase_url: https://root.test\nsettings: { timeout: 9s, video: off }\nvars: { root_name: root }\nsteps:\n  - open: /before\n  - run: ./nested/child.subflow.yaml\n  - assert: { url: { path: /after } }\n",
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            "version: 1\nname: child\nbase_url: https://child.test/base/\nsettings: { timeout: 2s }\nvars: { child_value: default }\nsteps:\n  - open: page\n  - run: ../grandchild.subflow.yml\n",
+        )
+        .unwrap();
+        fs::write(
+            &grandchild,
+            "version: 1\nname: grandchild\nvars: { leaf: default }\nsecrets: { token: { env: TOKEN } }\nsteps:\n  - fill: { target: { css: input }, value: '${leaf}-${token}' }\n",
+        )
+        .unwrap();
+        let cli = BTreeMap::from([
+            ("root_name".to_owned(), "entry".to_owned()),
+            ("child_value".to_owned(), "unused".to_owned()),
+            ("leaf".to_owned(), "value".to_owned()),
+        ]);
+        let environment = BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]);
+
+        let flow = compile_file_with_env(&root, &cli, &environment).unwrap();
+
+        assert_eq!(flow.name, "root-entry");
+        assert_eq!(flow.settings.timeout, Duration::from_secs(9));
+        assert_eq!(flow.settings.video, VideoMode::Off);
+        assert_eq!(flow.steps.len(), 4);
+        assert_eq!(
+            flow.steps.iter().map(|step| step.index).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        assert_eq!(flow.steps[1].source, child);
+        assert_eq!(flow.steps[1].source_index, 1);
+        assert_eq!(
+            fs::canonicalize(&flow.steps[2].source).unwrap(),
+            fs::canonicalize(&grandchild).unwrap()
+        );
+        assert_eq!(flow.steps[2].source_index, 1);
+        assert_eq!(flow.steps[1].timeout, Duration::from_secs(2));
+        assert_eq!(flow.steps[2].timeout, DEFAULT_TIMEOUT);
+        assert!(matches!(
+            &flow.steps[1].operation,
+            Operation::Open { url } if url.expose().as_str() == "https://child.test/base/page"
+        ));
+        assert!(matches!(
+            &flow.steps[2].operation,
+            Operation::Fill { value, .. }
+                if value.expose() == "value-canary-secret" && value.is_secret()
+        ));
+        assert_eq!(flow.redactor.redact("canary-secret"), REDACTED);
+        assert_eq!(flow.inputs["root_name"].expose(), "entry");
+        assert!(!flow.inputs.contains_key("leaf"));
+    }
+
+    #[test]
+    fn subflows_are_reusable_but_canonical_active_stack_cycles_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("shared.subflow.yaml");
+        fs::write(
+            &root,
+            "version: 1\nname: root\nsettings: { video: off }\nsteps:\n  - run: ./shared.subflow.yaml\n  - run: ./shared.subflow.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            "version: 1\nname: shared\nsteps: [{ open: https://example.test }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            compile_file(&root, &BTreeMap::new()).unwrap().steps.len(),
+            2
+        );
+
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(
+            &child,
+            "version: 1\nname: cycle\nsteps: [{ run: './nested/../shared.subflow.yaml' }]\n",
+        )
+        .unwrap();
+        let message = compile_file(&root, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("subflow include cycle"), "{message}");
+        assert!(message.contains("shared.subflow.yaml"), "{message}");
+    }
+
+    #[test]
+    fn rejects_unsafe_or_ambiguous_subflow_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("child.subflow.yaml");
+        let compile_case = |root_source: &str, child_source: &str| {
+            fs::write(&root, root_source).unwrap();
+            fs::write(&child, child_source).unwrap();
+            compile_file(&root, &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+        };
+        let root_source = "version: 1\nname: root\nsteps: [{ run: ./child.subflow.yaml }]\n";
+        for child_source in [
+            "version: 1\nname: child\nsteps: []\n",
+            "version: 1\nname: child\nsettings: { viewport: { width: 800, height: 600 } }\nsteps: [{ open: https://example.test }]\n",
+            "version: 1\nname: child\nsettings: { video: off }\nsteps: [{ open: https://example.test }]\n",
+        ] {
+            let message = compile_case(root_source, child_source);
+            assert!(
+                message.contains("steps must not be empty")
+                    || message.contains("subflows cannot set"),
+                "invalid child was accepted: {message}"
+            );
+        }
+
+        fs::write(
+            &child,
+            "version: 1\nname: child\nsteps: [{ open: https://example.test }]\n",
+        )
+        .unwrap();
+        for (step, expected) in [
+            ("{ id: x, run: ./child.subflow.yaml }", "only field"),
+            ("{ timeout: 1s, run: ./child.subflow.yaml }", "only field"),
+            (
+                "{ run: ./child.subflow.yaml, open: https://x.test }",
+                "only field",
+            ),
+            ("{ run: ./child.yaml }", ".subflow.yaml"),
+            ("{ run: /tmp/child.subflow.yaml }", "must be relative"),
+        ] {
+            fs::write(&root, format!("version: 1\nname: root\nsteps: [{step}]\n")).unwrap();
+            let message = compile_file(&root, &BTreeMap::new())
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(
+            compile("version: 1\nname: memory\nsteps: [{ run: ./child.subflow.yaml }]\n")
+                .unwrap_err()
+                .to_string()
+                .contains("require compiling a flow file")
+        );
+    }
+
+    #[test]
+    fn validates_expanded_uniqueness_and_reports_child_compile_locations() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("child.subflow.yaml");
+        fs::write(
+            &root,
+            "version: 1\nname: root\nsteps:\n  - id: same\n    screenshot: { name: same }\n  - run: ./child.subflow.yaml\n",
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            "version: 1\nname: child\nsteps:\n  - id: same\n    open: https://example.test\n",
+        )
+        .unwrap();
+        assert!(
+            compile_file(&root, &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate step id")
+        );
+
+        fs::write(
+            &child,
+            "version: 1\nname: child\nsteps:\n  - open: https://example.test\n  - click: { target: { css: x, text: y } }\n",
+        )
+        .unwrap();
+        let message = compile_file(&root, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("child.subflow.yaml"), "{message}");
+        assert!(message.contains("step 2 locator"), "{message}");
+
+        fs::write(
+            &child,
+            "version: 1\nname: child\nsteps: [{ screenshot: { name: Same } }]\n",
+        )
+        .unwrap();
+        assert!(
+            compile_file(&root, &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate screenshot name")
+        );
+    }
+
+    #[test]
+    fn enforces_expanded_step_and_subflow_depth_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("many.subflow.yaml");
+        let root_steps = "  - open: https://root.test\n".repeat(MAX_FLOW_STEPS / 2);
+        let child_steps = "  - open: https://child.test\n".repeat(MAX_FLOW_STEPS / 2 + 1);
+        fs::write(
+            &root,
+            format!(
+                "version: 1\nname: root\nsettings: {{ video: off }}\nsteps:\n{root_steps}  - run: ./many.subflow.yaml\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            format!("version: 1\nname: child\nsteps:\n{child_steps}"),
+        )
+        .unwrap();
+        assert!(
+            compile_file(&root, &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("expanded steps must not exceed")
+        );
+
+        for depth in 0..=MAX_SUBFLOW_DEPTH {
+            let path = if depth == 0 {
+                root.clone()
+            } else {
+                directory.path().join(format!("{depth}.subflow.yaml"))
+            };
+            let next = depth + 1;
+            fs::write(
+                path,
+                format!(
+                    "version: 1\nname: depth-{depth}\nsteps: [{{ run: ./{next}.subflow.yaml }}]\n"
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(
+            directory
+                .path()
+                .join(format!("{}.subflow.yaml", MAX_SUBFLOW_DEPTH + 1)),
+            "version: 1\nname: leaf\nsteps: [{ open: https://example.test }]\n",
+        )
+        .unwrap();
+        let message = compile_file(&root, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("maximum subflow depth 32"), "{message}");
     }
 }

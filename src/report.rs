@@ -184,6 +184,10 @@ pub struct StepContext {
     /// One-based YAML step number.
     pub number: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_step: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub operation: String,
     #[serde(skip_serializing_if = "Option::is_none")]

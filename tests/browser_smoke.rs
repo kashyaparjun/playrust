@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use playrust::browser::BrowserHost;
-use playrust::flow::compile_yaml;
+use playrust::flow::{compile_file, compile_yaml};
 use playrust::report::FlowStatus;
 use playrust::runner::{RunOptions, run_flow};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
@@ -181,8 +181,12 @@ async fn browser_flow_smoke() {
     );
     let server = FixtureServer::start(HTML);
 
-    let flow = compile_yaml(
-        &format!(
+    let flow_files = tempfile::tempdir().expect("create subflow directory");
+    let root = flow_files.path().join("browser-smoke.yaml");
+    let child = flow_files.path().join("actions.subflow.yaml");
+    std::fs::write(
+        &root,
+        format!(
             r##"version: 1
 name: browser-smoke
 base_url: http://{}
@@ -190,65 +194,73 @@ settings:
   video: off
 steps:
   - open: /
-  - erase: {{ target: {{ label: Name }} }}
-  - select: {{ target: {{ label: Choice }}, value: second }}
-  - click: {{ target: {{ css: "#inspect" }} }}
+  - run: ./actions.subflow.yaml
+"##,
+            server.address
+        ),
+    )
+    .expect("write smoke entrypoint");
+    std::fs::write(
+        &child,
+        r##"version: 1
+name: browser-smoke-actions
+steps:
+  - erase: { target: { label: Name } }
+  - select: { target: { label: Choice }, value: second }
+  - click: { target: { css: "#inspect" } }
   - assert:
       text:
-        target: {{ css: "#controls" }}
+        target: { css: "#controls" }
         equals: "name=;choice=second;erase=input,change;select=input,change"
   - fill:
-      target: {{ label: Name }}
+      target: { label: Name }
       value: Playrust
   - assert:
-      visible: {{ css: "#name", focused: true }}
+      visible: { css: "#name", focused: true }
   - click:
-      target: {{ css: ".choice", checked: false, index: 1 }}
+      target: { css: ".choice", checked: false, index: 1 }
   - assert:
-      text: {{ target: {{ css: "#selected-choice" }}, equals: third }}
+      text: { target: { css: "#selected-choice" }, equals: third }
   - assert:
-      visible: {{ css: ".choice", checked: false }}
+      visible: { css: ".choice", checked: false }
   - assert:
-      text: {{ target: {{ css: option, selected: false, index: 0 }}, equals: Alpha }}
+      text: { target: { css: option, selected: false, index: 0 }, equals: Alpha }
   - assert:
-      text: {{ target: {{ css: option, selected: true }}, equals: Beta }}
+      text: { target: { css: option, selected: true }, equals: Beta }
   - click:
       target:
         role:
           value: button
           name: Submit
   - assert:
-      visible: {{ css: "#message" }}
+      visible: { css: "#message" }
   - assert:
       text:
-        target: {{ css: "#message" }}
+        target: { css: "#message" }
         equals: "Hello, Playrust"
   - screenshot:
       name: result
-      crop: {{ x: 5, y: 7, width: 100, height: 80 }}
+      crop: { x: 5, y: 7, width: 100, height: 80 }
   - assert:
       url:
         path: /done
   - double_click:
-      target: {{ test_id: double }}
+      target: { test_id: double }
   - assert:
       text:
-        target: {{ css: "#mouse-events" }}
+        target: { css: "#mouse-events" }
         equals: "mousedown:1,mouseup:1,click:1,mousedown:2,mouseup:2,click:2,dblclick:2"
-  - scroll: {{ y: 600 }}
-  - assert: {{ text: {{ target: {{ css: "#scroll-status" }}, equals: scrolled }} }}
-  - back: {{}}
-  - assert: {{ url: {{ path: / }} }}
+  - scroll: { y: 600 }
+  - assert: { text: { target: { css: "#scroll-status" }, equals: scrolled } }
+  - back: {}
+  - assert: { url: { path: / } }
   - open: /other
-  - back: {{}}
-  - assert: {{ url: {{ path: / }} }}
+  - back: {}
+  - assert: { url: { path: / } }
 "##,
-            server.address
-        ),
-        "browser-smoke.yaml",
-        &BTreeMap::new(),
     )
-    .expect("compile smoke flow");
+    .expect("write smoke subflow");
+    let flow = compile_file(&root, &BTreeMap::new()).expect("compile smoke flow");
     let artifacts = tempfile::tempdir().expect("create artifact directory");
     let host = BrowserHost::launch(&chrome, false)
         .await

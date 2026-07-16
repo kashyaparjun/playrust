@@ -10,8 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use playrust::browser::BrowserHost;
 use playrust::flow::{
-    CompiledFlow, FlowError, RawFlow, VideoMode, compile_file, compile_raw, discover_flow_files,
-    parse_yaml,
+    CompiledFlow, FlowError, VideoMode, compile_file, compile_file_with_video, discover_flow_files,
 };
 use playrust::install::{PINNED_CHROME_VERSION, install_browser, resolve_or_install_browser};
 use playrust::report::{
@@ -453,19 +452,7 @@ fn compile_file_for_run(
     variables: &BTreeMap<String, String>,
     video: Option<VideoMode>,
 ) -> Result<CompiledFlow, FlowError> {
-    let source = fs::read_to_string(path).map_err(|source| FlowError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut raw = parse_yaml(&source)?;
-    apply_video_override(&mut raw, video);
-    compile_raw(raw, path, variables, &std::env::vars().collect())
-}
-
-fn apply_video_override(flow: &mut RawFlow, video: Option<VideoMode>) {
-    if let Some(video) = video {
-        flow.settings.video = Some(video);
-    }
+    compile_file_with_video(path, variables, video)
 }
 
 fn relative_flow_path(input: &Path, file: &Path, input_is_directory: bool) -> PathBuf {
@@ -678,6 +665,10 @@ fn print_results(report: &AggregateReport) {
                         if let Some(locator) = &step.locator {
                             println!("  Locator: {}", terminal_text(locator.as_str()));
                         }
+                        if let (Some(source), Some(source_step)) = (&step.source, step.source_step)
+                        {
+                            println!("  Source: {} (step {source_step})", terminal_text(source));
+                        }
                     }
                     if let Some(url) = &failure.current_url {
                         println!("  URL: {}", terminal_text(url.as_str()));
@@ -725,7 +716,6 @@ fn duration_ms(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use playrust::flow::{compile_raw, parse_yaml};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -756,14 +746,15 @@ mod tests {
 
     #[test]
     fn video_override_is_applied_before_viewport_validation() {
-        let mut flow = parse_yaml(
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("odd.yaml");
+        std::fs::write(
+            &path,
             "version: 1\nname: odd\nsettings: { viewport: { width: 801, height: 600 } }\nsteps: [{ open: https://example.test }]\n",
         )
         .unwrap();
-        apply_video_override(&mut flow, Some(VideoMode::On));
-        assert!(compile_raw(flow.clone(), "odd.yaml", &BTreeMap::new(), &BTreeMap::new()).is_err());
-        apply_video_override(&mut flow, Some(VideoMode::Off));
-        assert!(compile_raw(flow, "odd.yaml", &BTreeMap::new(), &BTreeMap::new()).is_ok());
+        assert!(compile_file_with_video(&path, &BTreeMap::new(), Some(VideoMode::On)).is_err());
+        assert!(compile_file_with_video(&path, &BTreeMap::new(), Some(VideoMode::Off)).is_ok());
     }
 
     #[test]
