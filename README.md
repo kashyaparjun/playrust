@@ -100,9 +100,12 @@ target: { text: "Sign in" }
 target: { text: { value: "Welcome", match: contains } }
 target: { label: Email }
 target: { role: { value: button, name: "Sign in" } }
+target: { css: ".row", checked: true, index: 0 }
 ```
 
 Each target has exactly one strategy. `test_id` matches `data-testid`. Label and role use Chromium accessibility names. Text matching is case-sensitive, whitespace-collapsed, and exact unless `match: contains` is set.
+
+The optional boolean filters `checked`, `selected`, and `focused` match the corresponding live DOM state. `checked` applies only to checkable elements and `selected` only to selectable elements. An optional zero-based `index` then selects from the filtered matches in DOM order. Filters and `index` run before uniqueness and actionability checks; without `index`, actions and positive assertions still require one final match. Relational selectors are not supported.
 
 ### Assertions
 

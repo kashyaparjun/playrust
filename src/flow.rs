@@ -262,6 +262,10 @@ pub struct RawLocator {
     pub text: Option<RawTextLocator>,
     pub label: Option<String>,
     pub role: Option<RawRoleLocator>,
+    pub index: Option<usize>,
+    pub checked: Option<bool>,
+    pub selected: Option<bool>,
+    pub focused: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,7 +411,16 @@ pub enum UrlExpectation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Locator {
+pub struct Locator {
+    pub strategy: LocatorStrategy,
+    pub index: Option<usize>,
+    pub checked: Option<bool>,
+    pub selected: Option<bool>,
+    pub focused: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocatorStrategy {
     Css(Resolved<String>),
     TestId(Resolved<String>),
     Text {
@@ -1067,10 +1080,10 @@ fn compile_locator(
         ));
     }
     let context = format!("step {index} locator");
-    let locator = if let Some(value) = raw.css {
-        Locator::Css(interpolate_non_empty(&context, &value, inputs)?)
+    let strategy = if let Some(value) = raw.css {
+        LocatorStrategy::Css(interpolate_non_empty(&context, &value, inputs)?)
     } else if let Some(value) = raw.test_id {
-        Locator::TestId(interpolate_non_empty(&context, &value, inputs)?)
+        LocatorStrategy::TestId(interpolate_non_empty(&context, &value, inputs)?)
     } else if let Some(text) = raw.text {
         let (value, match_kind) = match text {
             RawTextLocator::Scalar(value) => (value, TextMatch::Exact),
@@ -1079,15 +1092,15 @@ fn compile_locator(
                 options.match_kind.unwrap_or(TextMatch::Exact),
             ),
         };
-        Locator::Text {
+        LocatorStrategy::Text {
             value: interpolate_non_empty(&context, &value, inputs)?,
             match_kind,
         }
     } else if let Some(value) = raw.label {
-        Locator::Label(interpolate_non_empty(&context, &value, inputs)?)
+        LocatorStrategy::Label(interpolate_non_empty(&context, &value, inputs)?)
     } else {
         let role = raw.role.expect("strategy count checked");
-        Locator::Role {
+        LocatorStrategy::Role {
             value: interpolate_non_empty(&context, &role.value, inputs)?,
             name: role
                 .name
@@ -1096,7 +1109,13 @@ fn compile_locator(
                 .transpose()?,
         }
     };
-    Ok(locator)
+    Ok(Locator {
+        strategy,
+        index: raw.index,
+        checked: raw.checked,
+        selected: raw.selected,
+        focused: raw.focused,
+    })
 }
 
 fn interpolate_non_empty(
@@ -1437,8 +1456,11 @@ steps:
         assert!(matches!(
             &flow.steps[7].operation,
             Operation::Click {
-                target: Locator::Text {
-                    match_kind: TextMatch::Contains,
+                target: Locator {
+                    strategy: LocatorStrategy::Text {
+                        match_kind: TextMatch::Contains,
+                        ..
+                    },
                     ..
                 }
             }
@@ -1524,7 +1546,10 @@ steps:
         assert!(matches!(
             &flow.steps[0].operation,
             Operation::DoubleClick {
-                target: Locator::TestId(value)
+                target: Locator {
+                    strategy: LocatorStrategy::TestId(value),
+                    ..
+                }
             } if value.expose() == "item"
         ));
         assert!(error(
@@ -1687,6 +1712,43 @@ steps: [{ open: https://x.test }]
             error("version: 1\nname: x\nsteps:\n  - click:\n      target: { css: x, text: y }\n")
                 .contains("exactly one strategy")
         );
+    }
+
+    #[test]
+    fn compiles_flat_locator_modifiers_without_counting_them_as_strategies() {
+        let flow = compile(
+            "version: 1\nname: x\nsteps:\n  - click:\n      target: { css: option, index: 0, checked: false, selected: true, focused: false }\n",
+        )
+        .unwrap();
+        let Operation::Click { target } = &flow.steps[0].operation else {
+            panic!("expected click");
+        };
+        assert!(matches!(target.strategy, LocatorStrategy::Css(_)));
+        assert_eq!(target.index, Some(0));
+        assert_eq!(target.checked, Some(false));
+        assert_eq!(target.selected, Some(true));
+        assert_eq!(target.focused, Some(false));
+
+        assert!(
+            error("version: 1\nname: x\nsteps: [{ click: { target: { index: 0 } } }]\n")
+                .contains("exactly one strategy")
+        );
+        assert!(
+            parse_yaml(
+                "version: 1\nname: x\nsteps: [{ click: { target: { css: x, index: -1 } } }]\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_yaml(
+                "version: 1\nname: x\nsteps: [{ click: { target: { css: x, checked: yes } } }]\n"
+            )
+            .is_err()
+        );
+        assert!(parse_yaml(
+            "version: 1\nname: x\nsteps: [{ click: { target: { css: x, has: { text: y } } } }]\n"
+        )
+        .is_err());
     }
 
     #[test]

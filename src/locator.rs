@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::flow::{Locator, TextMatch};
+use crate::flow::{Locator, LocatorStrategy, TextMatch};
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -48,6 +48,13 @@ const NATIVE_LABEL_MATCH_FUNCTION: &str = r#"function(expected) {
     const normalize = value => value.replace(/\s+/gu, ' ').trim();
     return 'labels' in this && this.labels !== null &&
         normalize(Array.from(this.labels, label => label.textContent).join(' ')) === expected;
+}"#;
+
+const STATE_FILTER_FUNCTION: &str = r#"function(checked, selected, focused) {
+    if (checked !== null && (!('checked' in this) || this.checked !== checked)) return false;
+    if (selected !== null && (!('selected' in this) || this.selected !== selected)) return false;
+    if (focused !== null && (document.activeElement === this) !== focused) return false;
+    return true;
 }"#;
 
 const ACTIONABILITY_FUNCTION: &str = r#"function(scroll) {
@@ -239,17 +246,19 @@ impl<'page> LocatorEngine<'page> {
     }
 
     pub async fn resolve_all(&self, locator: &Locator) -> Result<CandidateSet, LocatorError> {
-        let mut backend_node_ids = match locator {
-            Locator::Css(selector) => self.resolve_css(selector.expose()).await?,
-            Locator::TestId(test_id) => {
+        let backend_node_ids = match &locator.strategy {
+            LocatorStrategy::Css(selector) => self.resolve_css(selector.expose()).await?,
+            LocatorStrategy::TestId(test_id) => {
                 self.resolve_css(&test_id_selector(test_id.expose()))
                     .await?
             }
-            Locator::Text { value, match_kind } => {
+            LocatorStrategy::Text { value, match_kind } => {
                 self.resolve_text(value.expose(), *match_kind).await?
             }
-            Locator::Label(name) => self.resolve_ax(None, Some(name.expose()), true).await?,
-            Locator::Role { value, name } => {
+            LocatorStrategy::Label(name) => {
+                self.resolve_ax(None, Some(name.expose()), true).await?
+            }
+            LocatorStrategy::Role { value, name } => {
                 self.resolve_ax(
                     Some(value.expose()),
                     name.as_ref().map(|name| name.expose().as_str()),
@@ -258,9 +267,45 @@ impl<'page> LocatorEngine<'page> {
                 .await?
             }
         };
-        backend_node_ids.sort_by_key(|id| *id.inner());
-        backend_node_ids.dedup();
+        let mut backend_node_ids = if locator.index.is_some() {
+            self.in_dom_order(backend_node_ids).await?
+        } else {
+            let mut backend_node_ids = backend_node_ids;
+            backend_node_ids.sort_by_key(|id| *id.inner());
+            backend_node_ids.dedup();
+            backend_node_ids
+        };
+        if locator.checked.is_some() || locator.selected.is_some() || locator.focused.is_some() {
+            let arguments = [
+                optional_bool(locator.checked),
+                optional_bool(locator.selected),
+                optional_bool(locator.focused),
+            ];
+            let mut filtered = Vec::with_capacity(backend_node_ids.len());
+            for backend_node_id in backend_node_ids {
+                if self
+                    .call_on_node::<bool>(backend_node_id, STATE_FILTER_FUNCTION, &arguments)
+                    .await?
+                {
+                    filtered.push(backend_node_id);
+                }
+            }
+            backend_node_ids = filtered;
+        }
+        backend_node_ids = select_index(backend_node_ids, locator.index);
         Ok(CandidateSet { backend_node_ids })
+    }
+
+    async fn in_dom_order(
+        &self,
+        candidates: Vec<BackendNodeId>,
+    ) -> Result<Vec<BackendNodeId>, LocatorError> {
+        let elements = self.page.find_elements("*").await.map_err(protocol)?;
+        Ok(elements
+            .into_iter()
+            .map(|element| element.backend_node_id)
+            .filter(|id| candidates.contains(id))
+            .collect())
     }
 
     pub async fn observe_unique(
@@ -668,6 +713,17 @@ fn argument(value: Value) -> CallArgument {
     CallArgument::builder().value(value).build()
 }
 
+fn optional_bool(value: Option<bool>) -> CallArgument {
+    argument(value.map_or(Value::Null, Value::Bool))
+}
+
+fn select_index<T>(values: Vec<T>, index: Option<usize>) -> Vec<T> {
+    match index {
+        Some(index) => values.into_iter().nth(index).into_iter().collect(),
+        None => values,
+    }
+}
+
 fn ax_matches(node: &AxNode, role: Option<&str>, name: Option<&str>) -> bool {
     role.is_none_or(|expected| ax_string(node.role.as_ref()) == Some(expected))
         && name.is_none_or(|expected| ax_string(node.name.as_ref()) == Some(expected))
@@ -768,6 +824,14 @@ mod tests {
             "[data-testid=\"quote\\\" slash\\\\ line\\a end\"]"
         );
         assert_eq!(test_id_selector("nul\0id"), "[data-testid=\"nul�id\"]");
+    }
+
+    #[test]
+    fn index_is_zero_based_and_out_of_range_is_no_match() {
+        assert_eq!(select_index(vec![10, 20, 30], Some(0)), [10]);
+        assert_eq!(select_index(vec![10, 20, 30], Some(2)), [30]);
+        assert!(select_index(vec![10, 20, 30], Some(3)).is_empty());
+        assert_eq!(select_index(vec![10, 20, 30], None), [10, 20, 30]);
     }
 
     #[test]

@@ -28,6 +28,14 @@ const HTML: &str = r#"<!doctype html>
     <p id="controls"></p>
     <button onclick="document.querySelector('#message').textContent = 'Hello, ' + document.querySelector('#name').value; document.querySelector('#message').hidden = false; history.pushState({}, '', '/done')">Submit</button>
     <p id="message" hidden></p>
+    <input class="choice" type="checkbox" data-name="first">
+    <input class="choice" type="checkbox" data-name="second" checked>
+    <input class="choice" type="checkbox" data-name="third">
+    <p id="selected-choice"></p>
+    <select size="2">
+      <option>Alpha</option>
+      <option selected>Beta</option>
+    </select>
     <button data-testid="double">Double</button>
     <p id="mouse-events"></p>
     <p id="scroll-status">not scrolled</p>
@@ -42,6 +50,11 @@ const HTML: &str = r#"<!doctype html>
         document.querySelector('#choice').addEventListener(type, () => selectEvents.push(type));
       }
       addEventListener('scroll', () => document.querySelector('#scroll-status').textContent = 'scrolled', { once: true });
+      for (const choice of document.querySelectorAll('.choice')) {
+        choice.addEventListener('change', () => {
+          document.querySelector('#selected-choice').textContent = choice.dataset.name;
+        });
+      }
       const target = document.querySelector('[data-testid="double"]');
       for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) {
         target.addEventListener(type, event => {
@@ -178,6 +191,18 @@ steps:
   - fill:
       target: {{ label: Name }}
       value: Playrust
+  - assert:
+      visible: {{ css: "#name", focused: true }}
+  - click:
+      target: {{ css: ".choice", checked: false, index: 1 }}
+  - assert:
+      text: {{ target: {{ css: "#selected-choice" }}, equals: third }}
+  - assert:
+      visible: {{ css: ".choice", checked: false }}
+  - assert:
+      text: {{ target: {{ css: option, selected: false, index: 0 }}, equals: Alpha }}
+  - assert:
+      text: {{ target: {{ css: option, selected: true }}, equals: Beta }}
   - click:
       target:
         role:

@@ -30,8 +30,8 @@ use tokio::sync::{Notify, oneshot};
 
 use crate::browser::{BrowserHost, BrowserStatus, Viewport};
 use crate::flow::{
-    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, Modifier, NamedKey,
-    Operation, TextMatch, UrlExpectation, VideoMode,
+    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, LocatorStrategy,
+    Modifier, NamedKey, Operation, TextMatch, UrlExpectation, VideoMode,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -1426,26 +1426,42 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
 }
 
 fn locator_text(locator: &Locator) -> SafeText {
-    let (kind, value, secret) = match locator {
-        Locator::Css(value) => ("css", value.expose().as_str(), value.is_secret()),
-        Locator::TestId(value) => ("test_id", value.expose().as_str(), value.is_secret()),
-        Locator::Text { value, .. } => ("text", value.expose().as_str(), value.is_secret()),
-        Locator::Label(value) => ("label", value.expose().as_str(), value.is_secret()),
-        Locator::Role { value, name } => {
+    let (mut text, secret) = match &locator.strategy {
+        LocatorStrategy::Css(value) => (format!("css={:?}", value.expose()), value.is_secret()),
+        LocatorStrategy::TestId(value) => {
+            (format!("test_id={:?}", value.expose()), value.is_secret())
+        }
+        LocatorStrategy::Text { value, .. } => {
+            (format!("text={:?}", value.expose()), value.is_secret())
+        }
+        LocatorStrategy::Label(value) => (format!("label={:?}", value.expose()), value.is_secret()),
+        LocatorStrategy::Role { value, name } => {
             if value.is_secret() || name.as_ref().is_some_and(|name| name.is_secret()) {
                 return SafeText::secret();
             }
-            return SafeText::public(match name {
-                Some(name) => format!("role={:?} name={:?}", value.expose(), name.expose()),
-                None => format!("role={:?}", value.expose()),
-            });
+            (
+                match name {
+                    Some(name) => format!("role={:?} name={:?}", value.expose(), name.expose()),
+                    None => format!("role={:?}", value.expose()),
+                },
+                false,
+            )
         }
     };
     if secret {
-        SafeText::secret()
-    } else {
-        SafeText::public(format!("{kind}={value:?}"))
+        return SafeText::secret();
     }
+    for (name, value) in [
+        ("index", locator.index.map(|value| value.to_string())),
+        ("checked", locator.checked.map(|value| value.to_string())),
+        ("selected", locator.selected.map(|value| value.to_string())),
+        ("focused", locator.focused.map(|value| value.to_string())),
+    ] {
+        if let Some(value) = value {
+            text.push_str(&format!(" {name}={value}"));
+        }
+    }
+    SafeText::public(text)
 }
 
 fn report(
@@ -1670,7 +1686,7 @@ mod tests {
     #[test]
     fn secret_locators_are_never_rendered_in_step_context() {
         let flow = compile_yaml_with_env(
-            "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ click: { target: { css: '${token}' } } }]\n",
+            "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ click: { target: { css: '${token}', index: 2, checked: true } } }]\n",
             "x.yaml",
             &BTreeMap::new(),
             &BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]),
@@ -1678,6 +1694,22 @@ mod tests {
         .unwrap();
         let context = step_context(&flow.steps[0]);
         assert_eq!(context.locator.unwrap().as_str(), "[REDACTED]");
+    }
+
+    #[test]
+    fn public_locator_diagnostics_include_modifiers() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps: [{ click: { target: { css: button, index: 1, checked: false, focused: true } } }]\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let context = step_context(&flow.steps[0]);
+        assert_eq!(
+            context.locator.unwrap().as_str(),
+            "css=\"button\" index=1 checked=false focused=true"
+        );
     }
 
     #[test]
