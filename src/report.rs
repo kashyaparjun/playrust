@@ -952,6 +952,8 @@ mod tests {
         failed.failures[0].message = SafeText::public("expected <ok> & got 'no'\u{1}");
         failed.failures[0].step = Some(StepContext {
             number: 2,
+            source: None,
+            source_step: None,
             id: Some("check<status>".to_owned()),
             operation: "assert text".to_owned(),
             locator: Some(SafeText::public("[data-name=\"x&y\"]")),

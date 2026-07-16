@@ -200,10 +200,9 @@ steps:
         ),
     )
     .expect("write smoke entrypoint");
-    std::fs::write(
-        &child,
-        r##"version: 1
+    let child_source = r##"version: 1
 name: browser-smoke-actions
+base_url: __BASE_URL__
 steps:
   - erase: { target: { label: Name } }
   - select: { target: { label: Choice }, value: second }
@@ -224,9 +223,9 @@ steps:
   - assert:
       visible: { css: ".choice", checked: false }
   - assert:
-      text: { target: { css: option, selected: false, index: 0 }, equals: Alpha }
+      text: { target: { css: "select[size] option", selected: false, index: 0 }, equals: Alpha }
   - assert:
-      text: { target: { css: option, selected: true }, equals: Beta }
+      text: { target: { css: "select[size] option", selected: true }, equals: Beta }
   - click:
       target:
         role:
@@ -257,9 +256,9 @@ steps:
   - open: /other
   - back: {}
   - assert: { url: { path: / } }
-"##,
-    )
-    .expect("write smoke subflow");
+"##
+    .replace("__BASE_URL__", &format!("http://{}", server.address));
+    std::fs::write(&child, child_source).expect("write smoke subflow");
     let flow = compile_file(&root, &BTreeMap::new()).expect("compile smoke flow");
     let artifacts = tempfile::tempdir().expect("create artifact directory");
     let host = BrowserHost::launch(&chrome, false)
