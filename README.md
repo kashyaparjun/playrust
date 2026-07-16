@@ -45,7 +45,7 @@ playrust run <path> [--headed] [--jobs N] [--browser PATH]
                     [--ffmpeg-path PATH] [--artifacts DIR] [--junit]
 ```
 
-`run` defaults to headless mode, up to four concurrent flows, and `./playrust-artifacts`. Use `--jobs 1` for sequential execution. Exit codes are `0` for success, `2` for invalid input/specification, `3` for an automation or assertion failure, `4` for infrastructure/recording failure, and `130` when interrupted.
+`run` defaults to headless mode, retained video recording, up to four concurrent flows, and `./playrust-artifacts`. Use `--video off` to disable recording or `--jobs 1` for sequential execution. Exit codes are `0` for success, `2` for invalid input/specification, `3` for an automation or assertion failure, `4` for infrastructure/recording failure, and `130` when interrupted.
 
 ## YAML V1
 
@@ -129,7 +129,7 @@ Treat flow files as executable test configuration. They can navigate to private 
 
 ## Video and artifacts
 
-Video modes are `off`, `on`, and `retain-on-failure`. `on` keeps every recording; `retain-on-failure` removes recordings for passing flows. Set a mode in YAML or override all flows with `--video MODE`.
+Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`, which keeps every recording and prints its path after the flow finishes. `retain-on-failure` removes recordings for passing flows. Set a mode in YAML or override all flows with `--video MODE`.
 
 Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libvpx-vp9` encoder. Playrust records the fixed page viewport as silent 15 FPS WebM/VP9; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 

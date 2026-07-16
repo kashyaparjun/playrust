@@ -527,7 +527,7 @@ pub fn compile_raw(
     if viewport.width == 0 || viewport.height == 0 {
         return invalid("viewport width and height must be greater than zero");
     }
-    let video = raw.settings.video.unwrap_or(VideoMode::Off);
+    let video = raw.settings.video.unwrap_or(VideoMode::On);
     if video != VideoMode::Off
         && (!viewport.width.is_multiple_of(2) || !viewport.height.is_multiple_of(2))
     {
@@ -1387,6 +1387,18 @@ steps:
             Operation::Assert(Assertion::Url(UrlExpectation::Path(path)))
                 if path.expose() == "/dashboard?q=a%20b"
         ));
+    }
+
+    #[test]
+    fn video_defaults_on_and_can_be_disabled() {
+        let enabled = compile("version: 1\nname: x\nsteps: [{ open: https://x.test }]\n").unwrap();
+        assert_eq!(enabled.settings.video, VideoMode::On);
+
+        let disabled = compile(
+            "version: 1\nname: x\nsettings: { video: off }\nsteps: [{ open: https://x.test }]\n",
+        )
+        .unwrap();
+        assert_eq!(disabled.settings.video, VideoMode::Off);
     }
 
     #[test]

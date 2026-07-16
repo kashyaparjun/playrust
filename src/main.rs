@@ -662,16 +662,16 @@ fn print_results(report: &AggregateReport) {
                 if let Some(path) = &report.artifacts.failure_screenshot {
                     println!("  Screenshot: {}", terminal_text(path));
                 }
-                if let Some(path) = &report.artifacts.recording {
-                    println!("  Recording: {}", terminal_text(path));
-                }
-                if let Some(path) = &report.artifacts.partial_recording {
-                    println!("  Partial recording: {}", terminal_text(path));
-                }
             }
         }
         for path in &report.artifacts.screenshots {
             println!("  Screenshot: {}", terminal_text(path));
+        }
+        if let Some(path) = &report.artifacts.recording {
+            println!("  Recording: {}", terminal_text(path));
+        }
+        if let Some(path) = &report.artifacts.partial_recording {
+            println!("  Partial recording: {}", terminal_text(path));
         }
     }
 }

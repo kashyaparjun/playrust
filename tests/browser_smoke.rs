@@ -224,6 +224,8 @@ async fn clear_state_is_scoped_to_the_active_flow() {
             r##"version: 1
 name: clear-state
 base_url: {url}
+settings:
+  video: off
 steps:
   - open: /
   - clear: cookies
@@ -288,7 +290,6 @@ base_url: http://{}
 settings:
   timeout: 10s
   viewport: {{ width: 800, height: 600 }}
-  video: on
 steps:
   - open: /
   - assert:
