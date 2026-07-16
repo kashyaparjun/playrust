@@ -43,6 +43,7 @@ const SCREENSHOT_NAME: &str = "failure.png";
 const RECORDING_NAME: &str = "recording.webm";
 const SECONDARY_TIMEOUT: Duration = Duration::from_secs(2);
 const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(7);
+const FINAL_FRAME_DELAY: Duration = Duration::from_millis(250);
 
 const FOCUS_FUNCTION: &str = r#"function() {
     if (!this.isConnected) return false;
@@ -210,7 +211,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     }
 
     let mut video_stop_at = None;
-    for (offset, step) in flow.steps.iter().enumerate().filter(|_| !interrupted) {
+    for step in flow.steps.iter().filter(|_| !interrupted) {
         let Some(deadline) = Instant::now().checked_add(step.timeout) else {
             video_stop_at = Some(Instant::now());
             artifacts.failure_screenshot =
@@ -242,7 +243,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             ) => result,
         };
         let succeeded = matches!(&result, Ok(Ok(())));
-        if offset + 1 == flow.steps.len() || !succeeded {
+        if !succeeded {
             video_stop_at = Some(Instant::now());
         }
         let error = match result {
@@ -256,6 +257,18 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                 .map(|path| path_text(&path));
         primary = Some(step_failure(host, flow, &page, step, error).await);
         break;
+    }
+
+    if primary.is_none() && !interrupted && video.is_some() {
+        let _ = tokio::time::timeout(
+            SECONDARY_TIMEOUT,
+            page.evaluate(
+                "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+            ),
+        )
+        .await;
+        tokio::time::sleep(FINAL_FRAME_DELAY).await;
+        video_stop_at = Some(Instant::now());
     }
 
     if let Some(session) = video.take() {

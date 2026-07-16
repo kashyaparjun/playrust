@@ -1,0 +1,23 @@
+version: 1
+name: playrust-full-demo
+base_url: http://127.0.0.1:8765
+settings: { timeout: 10s, viewport: { width: 960, height: 720 }, video: on }
+steps:
+  - open: /showcase.html
+  - fill: { target: { label: Email }, value: ada@example.test }
+  - fill: { target: { label: Password }, value: correct-horse }
+  - click: { target: { role: { value: button, name: Enter workspace } } }
+  - assert: { url: { path: /welcome } }
+  - fill: { target: { label: New task }, value: Write browser tests }
+  - click: { target: { role: { value: button, name: Add task } } }
+  - fill: { target: { label: New task }, value: Review recording }
+  - click: { target: { role: { value: button, name: Add task } } }
+  - assert: { visible: { text: Review recording } }
+  - click: { target: { role: { value: checkbox, name: Write browser tests } } }
+  - assert: { text: { target: { test_id: task-status }, equals: "Completed: 1" } }
+  - click: { target: { role: { value: button, name: Switch to night } } }
+  - assert: { text: { target: { test_id: control-status }, equals: "Theme: night" } }
+  - click: { target: { role: { value: button, name: Increase count } } }
+  - click: { target: { role: { value: button, name: Increase count } } }
+  - click: { target: { role: { value: button, name: Increase count } } }
+  - assert: { text: { target: { test_id: counter }, equals: "3" } }
