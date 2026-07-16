@@ -614,6 +614,9 @@ fn print_results(report: &AggregateReport) {
                 }
             }
         }
+        for path in &report.artifacts.screenshots {
+            println!("  Screenshot: {}", terminal_text(path));
+        }
     }
 }
 

@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const REPORT_VERSION: u32 = 1;
+pub const REPORT_VERSION: u32 = 2;
 pub const REDACTED: &str = "[REDACTED]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -208,6 +208,8 @@ impl Failure {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactPaths {
     pub directory: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_screenshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -510,6 +512,7 @@ mod tests {
         let redactor = Redactor::new(["canary-secret"]);
         let mut failed = flow(FlowStatus::Failed, Some(FailureCategory::Assertion));
         failed.failures[0].message = redactor.sanitize("expected canary-secret");
+        failed.artifacts.screenshots = vec!["artifacts/home.png".to_owned()];
         let report = AggregateReport::new(
             RunnerInfo {
                 name: "playrust".to_owned(),
@@ -529,6 +532,10 @@ mod tests {
         assert_eq!(decoded.report_version, REPORT_VERSION);
         assert_eq!(decoded.status, AggregateStatus::Failed);
         assert_eq!(decoded.exit_code, ExitCode::Automation.as_i32());
+        assert_eq!(
+            decoded.flows[0].artifacts.screenshots,
+            ["artifacts/home.png"]
+        );
         assert!(!json.contains("canary-secret"));
         assert!(json.ends_with('\n'));
     }

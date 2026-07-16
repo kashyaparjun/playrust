@@ -140,6 +140,9 @@ steps:
       text:
         target: {{ css: "#message" }}
         equals: "Hello, Playrust"
+  - screenshot:
+      name: result
+      crop: {{ x: 5, y: 7, width: 100, height: 80 }}
   - assert:
       url:
         path: /done
@@ -161,6 +164,16 @@ steps:
 
     shutdown.expect("shut down Chrome cleanly");
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+    let screenshot = report
+        .artifacts
+        .screenshots
+        .first()
+        .expect("report screenshot path");
+    assert!(screenshot.ends_with("result.png"));
+    let png = std::fs::read(screenshot).expect("read screenshot");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 100);
+    assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 80);
 }
 
 #[tokio::test(flavor = "current_thread")]

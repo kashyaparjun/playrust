@@ -68,8 +68,17 @@ settings:
 | Click | `click: { target: { test_id: submit } }` |
 | Fill | `fill: { target: { label: Email }, value: "${username}" }` |
 | Press | `press: { target: { label: Search }, key: Enter, modifiers: [Control] }` |
+| Screenshot | `screenshot: { name: dashboard }` |
 
 Click, fill, and press wait for one unique, visible, stable, enabled, uncovered target; fill also requires an editable target. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
+
+Screenshots are PNG files written atomically to the flow artifact directory as `<name>.png`. Names may contain 1-64 ASCII letters, numbers, `-`, or `_`, must start and end with a letter or number, cannot be `failure` in any letter case, cannot contain secrets, and must be case-insensitively unique within a flow. An optional crop uses viewport-relative CSS pixels and must fit within the configured viewport:
+
+```yaml
+- screenshot:
+    name: dashboard-panel
+    crop: { x: 40, y: 80, width: 640, height: 360 }
+```
 
 ### Selectors
 
@@ -119,7 +128,7 @@ Video modes are `off`, `on`, and `retain-on-failure`. `on` keeps every recording
 
 Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libvpx-vp9` encoder. Playrust records the fixed page viewport as silent 15 FPS WebM/VP9; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 
-Each `run` writes `<artifacts>/report.json`. Per-flow directories may contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
+Each `run` writes `<artifacts>/report.json`. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. Per-flow directories may also contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
 
 ## Boundaries
 

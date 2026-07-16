@@ -161,8 +161,25 @@ pub struct RawStep {
     pub click: Option<RawTargetAction>,
     pub fill: Option<RawFill>,
     pub press: Option<RawPress>,
+    pub screenshot: Option<RawScreenshot>,
     #[serde(rename = "assert")]
     pub assertion: Option<RawAssertion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawScreenshot {
+    pub name: String,
+    pub crop: Option<RawCrop>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawCrop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,7 +324,19 @@ pub enum Operation {
         key: Key,
         modifiers: Vec<Modifier>,
     },
+    Screenshot {
+        name: String,
+        crop: Option<Crop>,
+    },
     Assert(Assertion),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,6 +536,7 @@ pub fn compile_raw(
         video,
     };
     let mut ids = BTreeSet::new();
+    let mut screenshot_names = BTreeSet::new();
     let mut steps = Vec::with_capacity(raw.steps.len());
     for (offset, step) in raw.steps.into_iter().enumerate() {
         let index = offset + 1;
@@ -529,7 +559,12 @@ pub fn compile_raw(
             .map(|value| parse_duration(&format!("step {index} timeout"), value.expose()))
             .transpose()?
             .unwrap_or(timeout);
-        let operation = compile_operation(step, index, base_url.as_ref(), &inputs)?;
+        let operation = compile_operation(step, index, base_url.as_ref(), viewport, &inputs)?;
+        if let Operation::Screenshot { name, .. } = &operation
+            && !screenshot_names.insert(name.to_ascii_lowercase())
+        {
+            return invalid(format!("duplicate screenshot name {name:?}"));
+        }
         steps.push(CompiledStep {
             index,
             id,
@@ -692,6 +727,7 @@ fn compile_operation(
     step: RawStep,
     index: usize,
     base_url: Option<&Resolved<Url>>,
+    viewport: Viewport,
     inputs: &BTreeMap<String, Resolved<String>>,
 ) -> Result<Operation, FlowError> {
     let operation_count = [
@@ -699,6 +735,7 @@ fn compile_operation(
         step.click.is_some(),
         step.fill.is_some(),
         step.press.is_some(),
+        step.screenshot.is_some(),
         step.assertion.is_some(),
     ]
     .into_iter()
@@ -773,11 +810,72 @@ fn compile_operation(
             modifiers,
         });
     }
+    if let Some(raw) = step.screenshot {
+        let name =
+            interpolate_non_secret(&format!("step {index} screenshot.name"), &raw.name, inputs)?;
+        validate_screenshot_name(index, &name)?;
+        let crop = raw
+            .crop
+            .map(|crop| validate_crop(index, crop, viewport))
+            .transpose()?;
+        return Ok(Operation::Screenshot { name, crop });
+    }
     Ok(Operation::Assert(compile_assertion(
         step.assertion.expect("operation count checked"),
         index,
         inputs,
     )?))
+}
+
+fn validate_screenshot_name(index: usize, name: &str) -> Result<(), FlowError> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && !name.eq_ignore_ascii_case("failure")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric);
+    if !valid {
+        return invalid(format!(
+            "step {index} screenshot.name must be 1-64 ASCII letters, numbers, '-' or '_', starting and ending with a letter or number, and cannot be 'failure'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_crop(index: usize, crop: RawCrop, viewport: Viewport) -> Result<Crop, FlowError> {
+    if crop.width == 0 || crop.height == 0 {
+        return invalid(format!(
+            "step {index} screenshot.crop width and height must be greater than zero"
+        ));
+    }
+    if crop
+        .x
+        .checked_add(crop.width)
+        .is_none_or(|right| right > viewport.width)
+        || crop
+            .y
+            .checked_add(crop.height)
+            .is_none_or(|bottom| bottom > viewport.height)
+    {
+        return invalid(format!(
+            "step {index} screenshot.crop must fit within the {}x{} viewport",
+            viewport.width, viewport.height
+        ));
+    }
+    Ok(Crop {
+        x: crop.x,
+        y: crop.y,
+        width: crop.width,
+        height: crop.height,
+    })
 }
 
 fn compile_assertion(
@@ -1192,6 +1290,9 @@ steps:
       target: { label: Search }
       key: Enter
       modifiers: [Control, Shift]
+  - screenshot:
+      name: search-results
+      crop: { x: 10, y: 20, width: 400, height: 300 }
   - click:
       target:
         text: { value: Welcome, match: contains }
@@ -1219,7 +1320,7 @@ steps:
         let flow = compile(source).unwrap();
         assert_eq!(flow.settings.timeout, Duration::from_secs(2));
         assert_eq!(flow.settings.video, VideoMode::RetainOnFailure);
-        assert_eq!(flow.steps.len(), 12);
+        assert_eq!(flow.steps.len(), 13);
         assert!(matches!(
             &flow.steps[0].operation,
             Operation::Open { url } if url.expose().as_str() == "https://example.test/home"
@@ -1231,6 +1332,13 @@ steps:
         ));
         assert!(matches!(
             &flow.steps[4].operation,
+            Operation::Screenshot {
+                name,
+                crop: Some(Crop { x: 10, y: 20, width: 400, height: 300 })
+            } if name == "search-results"
+        ));
+        assert!(matches!(
+            &flow.steps[5].operation,
             Operation::Click {
                 target: Locator::Text {
                     match_kind: TextMatch::Contains,
@@ -1239,10 +1347,59 @@ steps:
             }
         ));
         assert!(matches!(
-            &flow.steps[11].operation,
+            &flow.steps[12].operation,
             Operation::Assert(Assertion::Url(UrlExpectation::Path(path)))
                 if path.expose() == "/dashboard?q=a%20b"
         ));
+    }
+
+    #[test]
+    fn validates_screenshot_names_crops_duplicates_and_secrets() {
+        let valid = compile(
+            "version: 1\nname: x\nsettings: { viewport: { width: 800, height: 600 } }\nsteps:\n  - screenshot: { name: full }\n  - screenshot: { name: corner_2, crop: { x: 700, y: 500, width: 100, height: 100 } }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            &valid.steps[0].operation,
+            Operation::Screenshot { name, crop: None } if name == "full"
+        ));
+
+        for (source, expected) in [
+            (
+                "version: 1\nname: x\nsteps: [{ screenshot: { name: '../escape' } }]\n",
+                "screenshot.name must be",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ screenshot: { name: x, crop: { x: 0, y: 0, width: 0, height: 1 } } }]\n",
+                "greater than zero",
+            ),
+            (
+                "version: 1\nname: x\nsettings: { viewport: { width: 10, height: 10 } }\nsteps: [{ screenshot: { name: x, crop: { x: 9, y: 0, width: 2, height: 1 } } }]\n",
+                "fit within the 10x10 viewport",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ screenshot: { name: same } }, { screenshot: { name: same } }]\n",
+                "duplicate screenshot name",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ screenshot: { name: Same } }, { screenshot: { name: same } }]\n",
+                "duplicate screenshot name",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ screenshot: { name: Failure } }]\n",
+                "cannot be 'failure'",
+            ),
+        ] {
+            assert!(error(source).contains(expected), "missing {expected:?}");
+        }
+
+        let source = "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ screenshot: { name: '${token}' } }]\n";
+        let environment = BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]);
+        let message = compile_yaml_with_env(source, "x.yaml", &BTreeMap::new(), &environment)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("screenshot.name cannot contain a secret"));
+        assert!(!message.contains("canary-secret"));
     }
 
     #[test]

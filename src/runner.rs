@@ -17,18 +17,20 @@ use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventFrameStartedNavigating, EventLifecycleEvent,
     EventScreencastFrame, GetFrameTreeParams, NavigateParams, ScreencastFrameAckParams,
     StartScreencastFormat, StartScreencastParams, StopScreencastParams,
+    Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams};
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot};
 
 use crate::browser::{BrowserHost, BrowserStatus, Viewport};
 use crate::flow::{
-    Assertion, CompiledFlow, CompiledStep, Key, Locator, Modifier, NamedKey, Operation, TextMatch,
-    UrlExpectation, VideoMode,
+    Assertion, CompiledFlow, CompiledStep, Crop, Key, Locator, Modifier, NamedKey, Operation,
+    TextMatch, UrlExpectation, VideoMode,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -239,15 +241,20 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             }
             result = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                execute_step(&page, step, deadline),
+                execute_step(&page, step, deadline, &options.artifact_directory),
             ) => result,
         };
-        let succeeded = matches!(&result, Ok(Ok(())));
+        let succeeded = matches!(&result, Ok(Ok(_)));
         if !succeeded {
             video_stop_at = Some(Instant::now());
         }
         let error = match result {
-            Ok(Ok(())) => continue,
+            Ok(Ok(screenshot)) => {
+                if let Some(path) = screenshot {
+                    artifacts.screenshots.push(path_text(&path));
+                }
+                continue;
+            }
             Ok(Err(error)) => error,
             Err(_) => StepError::new(FailureCategory::Timeout, "step deadline expired").deadline(),
         };
@@ -328,12 +335,17 @@ async fn execute_step(
     page: &Page,
     step: &CompiledStep,
     deadline: Instant,
-) -> Result<(), StepError> {
+    artifact_directory: &Path,
+) -> Result<Option<PathBuf>, StepError> {
     match &step.operation {
-        Operation::Open { url } => navigate(page, url.expose().as_str(), deadline).await,
+        Operation::Open { url } => navigate(page, url.expose().as_str(), deadline)
+            .await
+            .map(|_| None),
         Operation::Click { target } => {
             let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
-            dispatch_click(page, element.center.x, element.center.y).await
+            dispatch_click(page, element.center.x, element.center.y)
+                .await
+                .map(|_| None)
         }
         Operation::Fill { target, value } => {
             let element = wait_actionable(page, target, Actionability::EDITABLE, deadline).await?;
@@ -341,7 +353,7 @@ async fn execute_step(
             page.execute(InsertTextParams::new(value.expose()))
                 .await
                 .map_err(protocol)?;
-            Ok(())
+            Ok(None)
         }
         Operation::Press {
             target,
@@ -350,9 +362,14 @@ async fn execute_step(
         } => {
             let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
             focus(page, element.backend_node_id).await?;
-            dispatch_key(page, key, modifiers).await
+            dispatch_key(page, key, modifiers).await.map(|_| None)
         }
-        Operation::Assert(assertion) => assert(page, assertion, deadline).await,
+        Operation::Screenshot { name, crop } => {
+            capture_screenshot(page, artifact_directory, &format!("{name}.png"), *crop)
+                .await
+                .map(Some)
+        }
+        Operation::Assert(assertion) => assert(page, assertion, deadline).await.map(|_| None),
     }
 }
 
@@ -1068,24 +1085,64 @@ async fn stop_screencast(page: &Page) -> Option<String> {
 }
 
 async fn capture_failure_screenshot(page: &Page, directory: &Path) -> Option<PathBuf> {
-    let path = directory.join(SCREENSHOT_NAME);
-    let capture = async {
-        tokio::fs::create_dir_all(directory).await?;
-        let bytes = page
-            .screenshot(
-                ScreenshotParams::builder()
-                    .format(CaptureScreenshotFormat::Png)
-                    .build(),
-            )
-            .await
-            .map_err(std::io::Error::other)?;
-        tokio::fs::write(&path, bytes).await?;
-        Ok::<_, std::io::Error>(())
-    };
-    match tokio::time::timeout(SECONDARY_TIMEOUT, capture).await {
-        Ok(Ok(())) => Some(path),
+    match tokio::time::timeout(
+        SECONDARY_TIMEOUT,
+        capture_screenshot(page, directory, SCREENSHOT_NAME, None),
+    )
+    .await
+    {
+        Ok(Ok(path)) => Some(path),
         _ => None,
     }
+}
+
+async fn capture_screenshot(
+    page: &Page,
+    directory: &Path,
+    file_name: &str,
+    crop: Option<Crop>,
+) -> Result<PathBuf, StepError> {
+    let mut params = ScreenshotParams::builder().format(CaptureScreenshotFormat::Png);
+    if let Some(crop) = crop {
+        let viewport = page
+            .layout_metrics()
+            .await
+            .map_err(protocol)?
+            .css_visual_viewport;
+        params = params.clip(ScreenshotViewport {
+            x: viewport.page_x + f64::from(crop.x),
+            y: viewport.page_y + f64::from(crop.y),
+            width: f64::from(crop.width),
+            height: f64::from(crop.height),
+            scale: 1.0,
+        });
+    }
+    let bytes = page.screenshot(params.build()).await.map_err(protocol)?;
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|error| protocol(format!("create artifact directory: {error}")))?;
+    let path = directory.join(file_name);
+    let temporary = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|error| protocol(format!("create temporary screenshot: {error}")))?;
+    let mut writer = tokio::fs::File::from_std(
+        temporary
+            .reopen()
+            .map_err(|error| protocol(format!("open temporary screenshot: {error}")))?,
+    );
+    writer
+        .write_all(&bytes)
+        .await
+        .map_err(|error| protocol(format!("write screenshot: {error}")))?;
+    writer
+        .sync_all()
+        .await
+        .map_err(|error| protocol(format!("flush screenshot: {error}")))?;
+    drop(writer);
+    // Keep publication await-free so cancellation cannot publish an unreported screenshot.
+    temporary
+        .persist(&path)
+        .map_err(|error| protocol(format!("publish screenshot: {}", error.error)))?;
+    Ok(path)
 }
 
 async fn step_failure(
@@ -1129,6 +1186,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Click { .. } => "click",
         Operation::Fill { .. } => "fill",
         Operation::Press { .. } => "press",
+        Operation::Screenshot { .. } => "screenshot",
         Operation::Assert(Assertion::Visible(_)) => "assert.visible",
         Operation::Assert(Assertion::Hidden(_)) => "assert.hidden",
         Operation::Assert(Assertion::Text { .. }) => "assert.text",
@@ -1143,7 +1201,9 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::Press { target, .. }
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
-        Operation::Open { .. } | Operation::Assert(Assertion::Url(_)) => None,
+        Operation::Open { .. }
+        | Operation::Screenshot { .. }
+        | Operation::Assert(Assertion::Url(_)) => None,
     }
 }
 
@@ -1553,9 +1613,14 @@ steps:
         .unwrap();
 
         for step in &flow.steps {
-            execute_step(&page, step, Instant::now() + Duration::from_secs(2))
-                .await
-                .unwrap_or_else(|error| panic!("{}: {:?}", error.message, error.last_observed));
+            execute_step(
+                &page,
+                step,
+                Instant::now() + Duration::from_secs(2),
+                Path::new("."),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}: {:?}", error.message, error.last_observed));
         }
         for (id, expected) in [
             ("wrapped", "wrapped"),
