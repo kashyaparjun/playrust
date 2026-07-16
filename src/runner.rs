@@ -343,7 +343,13 @@ async fn execute_step(
             .map(|_| None),
         Operation::Click { target } => {
             let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
-            dispatch_click(page, element.center.x, element.center.y)
+            dispatch_click(page, element.center.x, element.center.y, 1)
+                .await
+                .map(|_| None)
+        }
+        Operation::DoubleClick { target } => {
+            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            dispatch_click(page, element.center.x, element.center.y, 2)
                 .await
                 .map(|_| None)
         }
@@ -603,31 +609,34 @@ fn character_text(character: char, modifiers: &[Modifier]) -> (String, String) {
     (shifted.to_string(), unmodified)
 }
 
-async fn dispatch_click(page: &Page, x: f64, y: f64) -> Result<(), StepError> {
+async fn dispatch_click(page: &Page, x: f64, y: f64, clicks: i64) -> Result<(), StepError> {
     page.move_mouse(chromiumoxide::layout::Point::new(x, y))
         .await
         .map_err(protocol)?;
-    let event = |event_type| {
-        DispatchMouseEventParams::builder()
-            .r#type(event_type)
-            .x(x)
-            .y(y)
-            .button(MouseButton::Left)
-            .click_count(1)
-            .build()
-            .expect("all mandatory mouse event fields are set")
-    };
-    let press_result = page
-        .execute(event(DispatchMouseEventType::MousePressed))
-        .await
-        .map(|_| ())
-        .map_err(protocol);
-    let release_result = page
-        .execute(event(DispatchMouseEventType::MouseReleased))
-        .await
-        .map(|_| ())
-        .map_err(protocol);
-    press_result.and(release_result)
+    for click_count in 1..=clicks {
+        let event = |event_type| {
+            DispatchMouseEventParams::builder()
+                .r#type(event_type)
+                .x(x)
+                .y(y)
+                .button(MouseButton::Left)
+                .click_count(click_count)
+                .build()
+                .expect("all mandatory mouse event fields are set")
+        };
+        let press_result = page
+            .execute(event(DispatchMouseEventType::MousePressed))
+            .await
+            .map(|_| ())
+            .map_err(protocol);
+        let release_result = page
+            .execute(event(DispatchMouseEventType::MouseReleased))
+            .await
+            .map(|_| ())
+            .map_err(protocol);
+        press_result.and(release_result)?;
+    }
+    Ok(())
 }
 
 async fn assert(page: &Page, assertion: &Assertion, deadline: Instant) -> Result<(), StepError> {
@@ -1184,6 +1193,7 @@ fn operation_name(operation: &Operation) -> &'static str {
     match operation {
         Operation::Open { .. } => "open",
         Operation::Click { .. } => "click",
+        Operation::DoubleClick { .. } => "double_click",
         Operation::Fill { .. } => "fill",
         Operation::Press { .. } => "press",
         Operation::Screenshot { .. } => "screenshot",
@@ -1197,6 +1207,7 @@ fn operation_name(operation: &Operation) -> &'static str {
 fn operation_locator(operation: &Operation) -> Option<&Locator> {
     match operation {
         Operation::Click { target }
+        | Operation::DoubleClick { target }
         | Operation::Fill { target, .. }
         | Operation::Press { target, .. }
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
@@ -1460,6 +1471,20 @@ mod tests {
         .unwrap();
         let context = step_context(&flow.steps[0]);
         assert_eq!(context.locator.unwrap().as_str(), "[REDACTED]");
+    }
+
+    #[test]
+    fn double_click_step_context_uses_its_action_name_and_target() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps: [{ double_click: { target: { css: button } } }]\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let context = step_context(&flow.steps[0]);
+        assert_eq!(context.operation, "double_click");
+        assert_eq!(context.locator.unwrap().as_str(), "css=\"button\"");
     }
 
     #[test]

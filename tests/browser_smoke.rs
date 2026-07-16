@@ -24,6 +24,18 @@ const HTML: &str = r#"<!doctype html>
     <input id="name">
     <button onclick="document.querySelector('#message').textContent = 'Hello, ' + document.querySelector('#name').value; document.querySelector('#message').hidden = false; history.pushState({}, '', '/done')">Submit</button>
     <p id="message" hidden></p>
+    <button data-testid="double">Double</button>
+    <p id="mouse-events"></p>
+    <script>
+      const events = [];
+      const target = document.querySelector('[data-testid="double"]');
+      for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) {
+        target.addEventListener(type, event => {
+          events.push(`${type}:${event.detail}`);
+          document.querySelector('#mouse-events').textContent = events.join(',');
+        });
+      }
+    </script>
   </body>
 </html>
 "#;
@@ -146,6 +158,12 @@ steps:
   - assert:
       url:
         path: /done
+  - double_click:
+      target: {{ test_id: double }}
+  - assert:
+      text:
+        target: {{ css: "#mouse-events" }}
+        equals: "mousedown:1,mouseup:1,click:1,mousedown:2,mouseup:2,click:2,dblclick:2"
 "##,
             server.address
         ),

@@ -159,6 +159,7 @@ pub struct RawStep {
     pub timeout: Option<String>,
     pub open: Option<String>,
     pub click: Option<RawTargetAction>,
+    pub double_click: Option<RawTargetAction>,
     pub fill: Option<RawFill>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
@@ -313,6 +314,9 @@ pub enum Operation {
         url: Resolved<Url>,
     },
     Click {
+        target: Locator,
+    },
+    DoubleClick {
         target: Locator,
     },
     Fill {
@@ -733,6 +737,7 @@ fn compile_operation(
     let operation_count = [
         step.open.is_some(),
         step.click.is_some(),
+        step.double_click.is_some(),
         step.fill.is_some(),
         step.press.is_some(),
         step.screenshot.is_some(),
@@ -775,6 +780,11 @@ fn compile_operation(
     }
     if let Some(raw) = step.click {
         return Ok(Operation::Click {
+            target: compile_locator(raw.target, index, inputs)?,
+        });
+    }
+    if let Some(raw) = step.double_click {
+        return Ok(Operation::DoubleClick {
             target: compile_locator(raw.target, index, inputs)?,
         });
     }
@@ -1400,6 +1410,24 @@ steps:
             .to_string();
         assert!(message.contains("screenshot.name cannot contain a secret"));
         assert!(!message.contains("canary-secret"));
+    }
+
+    #[test]
+    fn compiles_double_click_as_one_target_action() {
+        let flow = compile(
+            "version: 1\nname: x\nsteps:\n  - double_click: { target: { test_id: item } }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            &flow.steps[0].operation,
+            Operation::DoubleClick {
+                target: Locator::TestId(value)
+            } if value.expose() == "item"
+        ));
+        assert!(error(
+            "version: 1\nname: x\nsteps:\n  - click: { target: { css: x } }\n    double_click: { target: { css: x } }\n"
+        )
+        .contains("exactly one operation"));
     }
 
     #[test]
