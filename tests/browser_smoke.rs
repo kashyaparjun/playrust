@@ -19,15 +19,29 @@ use playrust::video::{VideoConfig, preflight_ffmpeg};
 
 const HTML: &str = r#"<!doctype html>
 <html lang="en">
-  <body>
+  <body style="min-height: 2000px">
     <label for="name">Name</label>
-    <input id="name">
+    <input id="name" value="old">
+    <label for="choice">Choice</label>
+    <select id="choice"><option value="">Choose</option><option value="second">Second</option></select>
+    <button id="inspect" onclick="document.querySelector('#controls').textContent = `name=${document.querySelector('#name').value};choice=${document.querySelector('#choice').value};erase=${textEvents.join(',')};select=${selectEvents.join(',')}`">Inspect controls</button>
+    <p id="controls"></p>
     <button onclick="document.querySelector('#message').textContent = 'Hello, ' + document.querySelector('#name').value; document.querySelector('#message').hidden = false; history.pushState({}, '', '/done')">Submit</button>
     <p id="message" hidden></p>
     <button data-testid="double">Double</button>
     <p id="mouse-events"></p>
+    <p id="scroll-status">not scrolled</p>
     <script>
       const events = [];
+      const textEvents = [];
+      const selectEvents = [];
+      for (const type of ['input', 'change']) {
+        document.querySelector('#name').addEventListener(type, () => textEvents.push(type));
+      }
+      for (const type of ['input', 'change']) {
+        document.querySelector('#choice').addEventListener(type, () => selectEvents.push(type));
+      }
+      addEventListener('scroll', () => document.querySelector('#scroll-status').textContent = 'scrolled', { once: true });
       const target = document.querySelector('[data-testid="double"]');
       for (const type of ['mousedown', 'mouseup', 'click', 'dblclick']) {
         target.addEventListener(type, event => {
@@ -154,6 +168,13 @@ settings:
   video: off
 steps:
   - open: /
+  - erase: {{ target: {{ label: Name }} }}
+  - select: {{ target: {{ label: Choice }}, value: second }}
+  - click: {{ target: {{ css: "#inspect" }} }}
+  - assert:
+      text:
+        target: {{ css: "#controls" }}
+        equals: "name=;choice=second;erase=input,change;select=input,change"
   - fill:
       target: {{ label: Name }}
       value: Playrust
@@ -180,6 +201,13 @@ steps:
       text:
         target: {{ css: "#mouse-events" }}
         equals: "mousedown:1,mouseup:1,click:1,mousedown:2,mouseup:2,click:2,dblclick:2"
+  - scroll: {{ y: 600 }}
+  - assert: {{ text: {{ target: {{ css: "#scroll-status" }}, equals: scrolled }} }}
+  - back: {{}}
+  - assert: {{ url: {{ path: / }} }}
+  - open: /other
+  - back: {{}}
+  - assert: {{ url: {{ path: / }} }}
 "##,
             server.address
         ),

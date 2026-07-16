@@ -15,9 +15,9 @@ use chromiumoxide::cdp::browser_protocol::input::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventFrameStartedNavigating, EventLifecycleEvent,
-    EventScreencastFrame, GetFrameTreeParams, NavigateParams, ScreencastFrameAckParams,
-    StartScreencastFormat, StartScreencastParams, StopScreencastParams,
-    Viewport as ScreenshotViewport,
+    EventScreencastFrame, GetFrameTreeParams, GetNavigationHistoryParams, NavigateParams,
+    NavigateToHistoryEntryParams, ScreencastFrameAckParams, StartScreencastFormat,
+    StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::browser_protocol::storage::ClearCookiesParams;
 use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams};
@@ -71,6 +71,38 @@ const PREPARE_FILL_FUNCTION: &str = r#"function() {
         return false;
     }
     return document.activeElement === this;
+}"#;
+
+const ERASE_FUNCTION: &str = r#"function() {
+    if (!this.isConnected) return 'detached';
+    this.focus();
+    if (document.activeElement !== this) return 'focus';
+    if (this instanceof HTMLInputElement) {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(this, '');
+    } else if (this instanceof HTMLTextAreaElement) {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(this, '');
+    } else if (this.isContentEditable) {
+        this.replaceChildren();
+    } else {
+        return 'editable';
+    }
+    this.dispatchEvent(new InputEvent('input', {
+        bubbles: true, inputType: 'deleteContentBackward', data: null
+    }));
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+    return 'ok';
+}"#;
+
+const SELECT_FUNCTION: &str = r#"function(value) {
+    if (!this.isConnected) return 'detached';
+    if (!(this instanceof HTMLSelectElement) || this.multiple) return 'select';
+    if (!Array.from(this.options).some(option => option.value === value)) return 'option';
+    this.focus();
+    if (document.activeElement !== this) return 'focus';
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(this, value);
+    this.dispatchEvent(new Event('input', { bubbles: true }));
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+    return 'ok';
 }"#;
 
 const INNER_TEXT_FUNCTION: &str = r#"function() { return this.innerText; }"#;
@@ -372,6 +404,18 @@ async fn execute_step(
                 .map_err(protocol)?;
             Ok(None)
         }
+        Operation::Erase { target } => {
+            let element = wait_actionable(page, target, Actionability::EDITABLE, deadline).await?;
+            erase(page, element.backend_node_id).await.map(|_| None)
+        }
+        Operation::Select { target, value } => {
+            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            select(page, element.backend_node_id, value.expose())
+                .await
+                .map(|_| None)
+        }
+        Operation::Scroll { x, y } => dispatch_scroll(page, *x, *y).await.map(|_| None),
+        Operation::Back => navigate_back(page, deadline).await.map(|_| None),
         Operation::Press {
             target,
             key,
@@ -545,6 +589,125 @@ async fn prepare_fill(page: &Page, node: BackendNodeId) -> Result<(), StepError>
         ));
     }
     Ok(())
+}
+
+async fn erase(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
+    match call_on_node::<String>(page, node, ERASE_FUNCTION, &[])
+        .await?
+        .as_str()
+    {
+        "ok" => Ok(()),
+        "detached" => Err(StepError::new(
+            FailureCategory::Actionability,
+            "erase target detached before input dispatch",
+        )),
+        "focus" => Err(StepError::new(
+            FailureCategory::Actionability,
+            "erase target could not receive focus",
+        )),
+        _ => Err(StepError::new(
+            FailureCategory::Actionability,
+            "erase target is not editable",
+        )),
+    }
+}
+
+async fn select(page: &Page, node: BackendNodeId, value: &str) -> Result<(), StepError> {
+    match call_on_node::<String>(
+        page,
+        node,
+        SELECT_FUNCTION,
+        &[serde_json::Value::String(value.to_owned())],
+    )
+    .await?
+    .as_str()
+    {
+        "ok" => Ok(()),
+        "detached" => Err(StepError::new(
+            FailureCategory::Actionability,
+            "select target detached before input dispatch",
+        )),
+        "focus" => Err(StepError::new(
+            FailureCategory::Actionability,
+            "select target could not receive focus",
+        )),
+        "option" => Err(StepError::new(
+            FailureCategory::Actionability,
+            "select value did not match an option",
+        )),
+        _ => Err(StepError::new(
+            FailureCategory::Actionability,
+            "select target is not a native single-value select",
+        )),
+    }
+}
+
+async fn dispatch_scroll(page: &Page, x: i64, y: i64) -> Result<(), StepError> {
+    let [width, height]: [f64; 2] = page
+        .evaluate("[innerWidth, innerHeight]")
+        .await
+        .map_err(protocol)?
+        .into_value()
+        .map_err(protocol)?;
+    let event = DispatchMouseEventParams::builder()
+        .r#type(DispatchMouseEventType::MouseWheel)
+        .x(width / 2.0)
+        .y(height / 2.0)
+        .delta_x(x as f64)
+        .delta_y(y as f64)
+        .build()
+        .expect("all mandatory wheel event fields are set");
+    page.execute(event).await.map_err(protocol)?;
+    Ok(())
+}
+
+async fn navigate_back(page: &Page, deadline: Instant) -> Result<(), StepError> {
+    let history = page
+        .execute(GetNavigationHistoryParams::default())
+        .await
+        .map_err(protocol)?
+        .result;
+    let target_index = history
+        .current_index
+        .checked_sub(1)
+        .ok_or_else(|| StepError::new(FailureCategory::Navigation, "no previous history entry"))?;
+    let target = history.entries.get(target_index as usize).ok_or_else(|| {
+        StepError::new(
+            FailureCategory::Protocol,
+            "Chromium navigation history omitted the previous entry",
+        )
+    })?;
+
+    page.execute(NavigateToHistoryEntryParams::new(target.id))
+        .await
+        .map_err(|error| StepError::new(FailureCategory::Navigation, error.to_string()))?;
+
+    loop {
+        match page.execute(GetNavigationHistoryParams::default()).await {
+            Ok(response) if response.result.current_index == target_index => {
+                match page.evaluate("document.readyState !== 'loading'").await {
+                    Ok(value) => {
+                        if value.into_value::<bool>().unwrap_or(false) {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) if retryable_cdp_message(&error.to_string()) => {}
+                    Err(error) => return Err(protocol(error)),
+                }
+            }
+            Ok(_) => {}
+            Err(error) if retryable_cdp_message(&error.to_string()) => {}
+            Err(error) => return Err(protocol(error)),
+        }
+        if Instant::now() >= deadline {
+            return Err(StepError::new(
+                FailureCategory::Timeout,
+                "back navigation deadline expired",
+            )
+            .deadline());
+        }
+        sleep_until_poll(deadline).await;
+    }
 }
 
 async fn dispatch_key(page: &Page, key: &Key, modifiers: &[Modifier]) -> Result<(), StepError> {
@@ -1228,6 +1391,10 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Click { .. } => "click",
         Operation::DoubleClick { .. } => "double_click",
         Operation::Fill { .. } => "fill",
+        Operation::Erase { .. } => "erase",
+        Operation::Select { .. } => "select",
+        Operation::Scroll { .. } => "scroll",
+        Operation::Back => "back",
         Operation::Press { .. } => "press",
         Operation::Screenshot { .. } => "screenshot",
         Operation::Clear(ClearTarget::Cookies) => "clear.cookies",
@@ -1244,10 +1411,14 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         Operation::Click { target }
         | Operation::DoubleClick { target }
         | Operation::Fill { target, .. }
+        | Operation::Erase { target }
+        | Operation::Select { target, .. }
         | Operation::Press { target, .. }
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
         Operation::Open { .. }
+        | Operation::Scroll { .. }
+        | Operation::Back
         | Operation::Screenshot { .. }
         | Operation::Clear(_)
         | Operation::Assert(Assertion::Url(_)) => None,
@@ -1524,6 +1695,27 @@ mod tests {
     }
 
     #[test]
+    fn interaction_step_contexts_include_only_targeted_locators() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps:\n  - erase: { target: { css: input } }\n  - select: { target: { css: select }, value: x }\n  - scroll: { y: 1 }\n  - back: {}\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        for (step, name, locator) in [
+            (&flow.steps[0], "erase", Some("css=\"input\"")),
+            (&flow.steps[1], "select", Some("css=\"select\"")),
+            (&flow.steps[2], "scroll", None),
+            (&flow.steps[3], "back", None),
+        ] {
+            let context = step_context(step);
+            assert_eq!(context.operation, name);
+            assert_eq!(context.locator.as_ref().map(SafeText::as_str), locator);
+        }
+    }
+
+    #[test]
     fn deadline_based_failures_include_timeout_for_all_automation_categories() {
         for error in [
             locator_error(LocatorError::Timeout {
@@ -1590,6 +1782,17 @@ mod tests {
         assert!(PREPARE_FILL_FUNCTION.contains("range.selectNodeContents(this)"));
         assert!(!PREPARE_FILL_FUNCTION.contains("this.select()"));
         assert!(!PREPARE_FILL_FUNCTION.contains("dispatchEvent"));
+    }
+
+    #[test]
+    fn erase_and_select_dispatch_native_form_events_once() {
+        assert_eq!(ERASE_FUNCTION.matches("dispatchEvent").count(), 2);
+        assert!(ERASE_FUNCTION.contains("HTMLInputElement.prototype, 'value'"));
+        assert!(ERASE_FUNCTION.contains("this.replaceChildren()"));
+        assert_eq!(SELECT_FUNCTION.matches("dispatchEvent").count(), 2);
+        assert!(SELECT_FUNCTION.contains("this instanceof HTMLSelectElement"));
+        assert!(SELECT_FUNCTION.contains("this.multiple"));
+        assert!(SELECT_FUNCTION.contains("option.value === value"));
     }
 
     #[tokio::test(flavor = "current_thread")]

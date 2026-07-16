@@ -161,6 +161,10 @@ pub struct RawStep {
     pub click: Option<RawTargetAction>,
     pub double_click: Option<RawTargetAction>,
     pub fill: Option<RawFill>,
+    pub erase: Option<RawTargetAction>,
+    pub select: Option<RawSelect>,
+    pub scroll: Option<RawScroll>,
+    pub back: Option<RawEmpty>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
     pub clear: Option<ClearTarget>,
@@ -196,6 +200,26 @@ pub struct RawFill {
     pub target: RawLocator,
     pub value: String,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSelect {
+    pub target: RawLocator,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawScroll {
+    #[serde(default)]
+    pub x: i64,
+    #[serde(default)]
+    pub y: i64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawEmpty {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +355,18 @@ pub enum Operation {
         target: Locator,
         value: Resolved<String>,
     },
+    Erase {
+        target: Locator,
+    },
+    Select {
+        target: Locator,
+        value: Resolved<String>,
+    },
+    Scroll {
+        x: i64,
+        y: i64,
+    },
+    Back,
     Press {
         target: Locator,
         key: Key,
@@ -748,6 +784,10 @@ fn compile_operation(
         step.click.is_some(),
         step.double_click.is_some(),
         step.fill.is_some(),
+        step.erase.is_some(),
+        step.select.is_some(),
+        step.scroll.is_some(),
+        step.back.is_some(),
         step.press.is_some(),
         step.screenshot.is_some(),
         step.clear.is_some(),
@@ -805,6 +845,27 @@ fn compile_operation(
             target: compile_locator(raw.target, index, inputs)?,
             value,
         });
+    }
+    if let Some(raw) = step.erase {
+        return Ok(Operation::Erase {
+            target: compile_locator(raw.target, index, inputs)?,
+        });
+    }
+    if let Some(raw) = step.select {
+        let value = interpolate(&format!("step {index} select.value"), &raw.value, inputs)?;
+        return Ok(Operation::Select {
+            target: compile_locator(raw.target, index, inputs)?,
+            value,
+        });
+    }
+    if let Some(raw) = step.scroll {
+        if raw.x == 0 && raw.y == 0 {
+            return invalid(format!("step {index} scroll requires a non-zero x or y"));
+        }
+        return Ok(Operation::Scroll { x: raw.x, y: raw.y });
+    }
+    if step.back.is_some() {
+        return Ok(Operation::Back);
     }
     if let Some(raw) = step.press {
         let key = interpolate_non_secret(&format!("step {index} press.key"), &raw.key, inputs)?;
@@ -1470,6 +1531,41 @@ steps:
             "version: 1\nname: x\nsteps:\n  - click: { target: { css: x } }\n    double_click: { target: { css: x } }\n"
         )
         .contains("exactly one operation"));
+    }
+
+    #[test]
+    fn compiles_erase_select_scroll_and_back_as_strict_single_operations() {
+        let flow = compile(
+            "version: 1\nname: interactions\nsteps:\n  - erase: { target: { label: Search } }\n  - select: { target: { css: select }, value: '' }\n  - scroll: { y: 500 }\n  - back: {}\n",
+        )
+        .unwrap();
+        assert!(matches!(flow.steps[0].operation, Operation::Erase { .. }));
+        assert!(matches!(
+            &flow.steps[1].operation,
+            Operation::Select { value, .. } if value.expose().is_empty()
+        ));
+        assert!(matches!(
+            flow.steps[2].operation,
+            Operation::Scroll { x: 0, y: 500 }
+        ));
+        assert!(matches!(flow.steps[3].operation, Operation::Back));
+
+        for (source, expected) in [
+            (
+                "version: 1\nname: x\nsteps: [{ scroll: {} }]\n",
+                "non-zero x or y",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ back: { target: x } }]\n",
+                "unknown field",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ erase: { target: { css: x } }, back: {} }]\n",
+                "exactly one operation",
+            ),
+        ] {
+            assert!(error(source).contains(expected), "missing {expected:?}");
+        }
     }
 
     #[test]
