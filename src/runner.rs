@@ -19,6 +19,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     StartScreencastFormat, StartScreencastParams, StopScreencastParams,
     Viewport as ScreenshotViewport,
 };
+use chromiumoxide::cdp::browser_protocol::storage::ClearCookiesParams;
 use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams};
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
@@ -29,8 +30,8 @@ use tokio::sync::{Notify, oneshot};
 
 use crate::browser::{BrowserHost, BrowserStatus, Viewport};
 use crate::flow::{
-    Assertion, CompiledFlow, CompiledStep, Crop, Key, Locator, Modifier, NamedKey, Operation,
-    TextMatch, UrlExpectation, VideoMode,
+    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, Modifier, NamedKey,
+    Operation, TextMatch, UrlExpectation, VideoMode,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -73,6 +74,7 @@ const PREPARE_FILL_FUNCTION: &str = r#"function() {
 }"#;
 
 const INNER_TEXT_FUNCTION: &str = r#"function() { return this.innerText; }"#;
+const CLEAR_STORAGE_EXPRESSION: &str = "localStorage.clear(); sessionStorage.clear()";
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
@@ -241,7 +243,14 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             }
             result = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                execute_step(&page, step, deadline, &options.artifact_directory),
+                execute_step(
+                    host,
+                    context.id(),
+                    &page,
+                    step,
+                    deadline,
+                    &options.artifact_directory,
+                ),
             ) => result,
         };
         let succeeded = matches!(&result, Ok(Ok(_)));
@@ -332,6 +341,8 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
 }
 
 async fn execute_step(
+    host: &BrowserHost,
+    context_id: &chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
     page: &Page,
     step: &CompiledStep,
     deadline: Instant,
@@ -374,6 +385,23 @@ async fn execute_step(
             capture_screenshot(page, artifact_directory, &format!("{name}.png"), *crop)
                 .await
                 .map(Some)
+        }
+        Operation::Clear(ClearTarget::Cookies) => {
+            host.browser()
+                .execute(
+                    ClearCookiesParams::builder()
+                        .browser_context_id(context_id.clone())
+                        .build(),
+                )
+                .await
+                .map_err(protocol)?;
+            Ok(None)
+        }
+        Operation::Clear(ClearTarget::Storage) => {
+            page.evaluate(CLEAR_STORAGE_EXPRESSION)
+                .await
+                .map_err(protocol)?;
+            Ok(None)
         }
         Operation::Assert(assertion) => assert(page, assertion, deadline).await.map(|_| None),
     }
@@ -1197,6 +1225,8 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Fill { .. } => "fill",
         Operation::Press { .. } => "press",
         Operation::Screenshot { .. } => "screenshot",
+        Operation::Clear(ClearTarget::Cookies) => "clear.cookies",
+        Operation::Clear(ClearTarget::Storage) => "clear.storage",
         Operation::Assert(Assertion::Visible(_)) => "assert.visible",
         Operation::Assert(Assertion::Hidden(_)) => "assert.hidden",
         Operation::Assert(Assertion::Text { .. }) => "assert.text",
@@ -1214,6 +1244,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
         Operation::Open { .. }
         | Operation::Screenshot { .. }
+        | Operation::Clear(_)
         | Operation::Assert(Assertion::Url(_)) => None,
     }
 }
@@ -1639,6 +1670,8 @@ steps:
 
         for step in &flow.steps {
             execute_step(
+                &host,
+                context.id(),
                 &page,
                 step,
                 Instant::now() + Duration::from_secs(2),

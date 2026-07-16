@@ -70,6 +70,8 @@ settings:
 | Fill | `fill: { target: { label: Email }, value: "${username}" }` |
 | Press | `press: { target: { label: Search }, key: Enter, modifiers: [Control] }` |
 | Screenshot | `screenshot: { name: dashboard }` |
+| Clear cookies | `clear: cookies` |
+| Clear storage | `clear: storage` |
 
 Click, double click, fill, and press wait for one unique, visible, stable, enabled, uncovered target; fill also requires an editable target. Click actions are not retried after pointer event dispatch begins. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
 
@@ -80,6 +82,8 @@ Screenshots are PNG files written atomically to the flow artifact directory as `
     name: dashboard-panel
     crop: { x: 40, y: 80, width: 640, height: 360 }
 ```
+
+`clear: cookies` clears every cookie in the active flow's isolated browser context only. `clear: storage` clears `localStorage` and `sessionStorage` for the active page origin only; it does not clear storage for other origins or other browser storage types. Both commands use the step timeout and produce the same cancellation and failure diagnostics as other actions.
 
 ### Selectors
 

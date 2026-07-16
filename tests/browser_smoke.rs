@@ -56,6 +56,22 @@ const VIDEO_HTML: &str = r#"<!doctype html>
 </html>
 "#;
 
+const STATE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+  <body>
+    <button id="inspect-cookies" onclick="document.querySelector('#cookies').textContent = document.cookie || 'none'">Inspect cookies</button>
+    <button id="inspect-storage" onclick="document.querySelector('#storage').textContent = `${localStorage.getItem('local') ?? 'none'}/${sessionStorage.getItem('session') ?? 'none'}`">Inspect storage</button>
+    <p id="cookies">pending</p>
+    <p id="storage">pending</p>
+    <script>
+      document.cookie = 'flow=present; path=/';
+      localStorage.setItem('local', 'present');
+      sessionStorage.setItem('session', 'present');
+    </script>
+  </body>
+</html>
+"#;
+
 struct FixtureServer {
     address: std::net::SocketAddr,
     stop: Arc<AtomicBool>,
@@ -192,6 +208,65 @@ steps:
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 100);
     assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 80);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn clear_state_is_scoped_to_the_active_flow() {
+    let chrome = PathBuf::from(
+        env::var_os("PLAYRUST_CHROME")
+            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
+    );
+    let server = FixtureServer::start(STATE_HTML);
+    let url = format!("http://{}", server.address);
+    let flow = compile_yaml(
+        &format!(
+            r##"version: 1
+name: clear-state
+base_url: {url}
+steps:
+  - open: /
+  - clear: cookies
+  - click: {{ target: {{ css: "#inspect-cookies" }} }}
+  - assert: {{ text: {{ target: {{ css: "#cookies" }}, equals: none }} }}
+  - clear: storage
+  - click: {{ target: {{ css: "#inspect-storage" }} }}
+  - assert: {{ text: {{ target: {{ css: "#storage" }}, equals: none/none }} }}
+"##
+        ),
+        "clear-state.yaml",
+        &BTreeMap::new(),
+    )
+    .expect("compile clear-state flow");
+    let artifacts = tempfile::tempdir().expect("create artifact directory");
+    let host = BrowserHost::launch(&chrome, false)
+        .await
+        .expect("launch pinned Chrome");
+    let other_context = host
+        .create_context(playrust::browser::Viewport::new(800, 600).unwrap())
+        .await
+        .expect("create second isolated context");
+    other_context
+        .page()
+        .goto(url.as_str())
+        .await
+        .expect("initialize second context");
+
+    let report = run_flow(&host, &flow, &RunOptions::new(artifacts.path())).await;
+    let other_cookie: String = other_context
+        .page()
+        .evaluate("document.cookie")
+        .await
+        .expect("read second context cookie")
+        .into_value()
+        .expect("decode second context cookie");
+    host.dispose_context(other_context).await.unwrap();
+    let shutdown = host.shutdown().await;
+    server.shutdown();
+
+    shutdown.expect("shut down Chrome cleanly");
+    assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+    assert_eq!(other_cookie, "flow=present");
 }
 
 #[tokio::test(flavor = "current_thread")]

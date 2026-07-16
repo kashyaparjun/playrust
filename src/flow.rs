@@ -163,6 +163,7 @@ pub struct RawStep {
     pub fill: Option<RawFill>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
+    pub clear: Option<ClearTarget>,
     #[serde(rename = "assert")]
     pub assertion: Option<RawAssertion>,
 }
@@ -276,6 +277,13 @@ pub enum TextMatch {
     Contains,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClearTarget {
+    Cookies,
+    Storage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledFlow {
     pub source: PathBuf,
@@ -332,6 +340,7 @@ pub enum Operation {
         name: String,
         crop: Option<Crop>,
     },
+    Clear(ClearTarget),
     Assert(Assertion),
 }
 
@@ -741,6 +750,7 @@ fn compile_operation(
         step.fill.is_some(),
         step.press.is_some(),
         step.screenshot.is_some(),
+        step.clear.is_some(),
         step.assertion.is_some(),
     ]
     .into_iter()
@@ -829,6 +839,9 @@ fn compile_operation(
             .map(|crop| validate_crop(index, crop, viewport))
             .transpose()?;
         return Ok(Operation::Screenshot { name, crop });
+    }
+    if let Some(target) = step.clear {
+        return Ok(Operation::Clear(target));
     }
     Ok(Operation::Assert(compile_assertion(
         step.assertion.expect("operation count checked"),
@@ -1303,6 +1316,8 @@ steps:
   - screenshot:
       name: search-results
       crop: { x: 10, y: 20, width: 400, height: 300 }
+  - clear: cookies
+  - clear: storage
   - click:
       target:
         text: { value: Welcome, match: contains }
@@ -1330,7 +1345,7 @@ steps:
         let flow = compile(source).unwrap();
         assert_eq!(flow.settings.timeout, Duration::from_secs(2));
         assert_eq!(flow.settings.video, VideoMode::RetainOnFailure);
-        assert_eq!(flow.steps.len(), 13);
+        assert_eq!(flow.steps.len(), 15);
         assert!(matches!(
             &flow.steps[0].operation,
             Operation::Open { url } if url.expose().as_str() == "https://example.test/home"
@@ -1348,7 +1363,7 @@ steps:
             } if name == "search-results"
         ));
         assert!(matches!(
-            &flow.steps[5].operation,
+            &flow.steps[7].operation,
             Operation::Click {
                 target: Locator::Text {
                     match_kind: TextMatch::Contains,
@@ -1357,7 +1372,7 @@ steps:
             }
         ));
         assert!(matches!(
-            &flow.steps[12].operation,
+            &flow.steps[14].operation,
             Operation::Assert(Assertion::Url(UrlExpectation::Path(path)))
                 if path.expose() == "/dashboard?q=a%20b"
         ));
@@ -1428,6 +1443,31 @@ steps:
             "version: 1\nname: x\nsteps:\n  - click: { target: { css: x } }\n    double_click: { target: { css: x } }\n"
         )
         .contains("exactly one operation"));
+    }
+
+    #[test]
+    fn clear_accepts_only_cookies_or_storage_as_a_scalar() {
+        let flow =
+            compile("version: 1\nname: clear\nsteps:\n  - clear: cookies\n  - clear: storage\n")
+                .unwrap();
+        assert!(matches!(
+            flow.steps[0].operation,
+            Operation::Clear(ClearTarget::Cookies)
+        ));
+        assert!(matches!(
+            flow.steps[1].operation,
+            Operation::Clear(ClearTarget::Storage)
+        ));
+
+        for value in ["cache", "Cookies", "{ cookies: true }"] {
+            assert!(
+                parse_yaml(&format!(
+                    "version: 1\nname: clear\nsteps: [{{ clear: {value} }}]\n"
+                ))
+                .is_err(),
+                "accepted clear value {value:?}"
+            );
+        }
     }
 
     #[test]
