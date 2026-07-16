@@ -854,6 +854,7 @@ fn validate_screenshot_name(index: usize, name: &str) -> Result<(), FlowError> {
     let valid = !name.is_empty()
         && name.len() <= 64
         && !name.eq_ignore_ascii_case("failure")
+        && !is_windows_reserved_name(name)
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -867,10 +868,20 @@ fn validate_screenshot_name(index: usize, name: &str) -> Result<(), FlowError> {
             .is_some_and(u8::is_ascii_alphanumeric);
     if !valid {
         return invalid(format!(
-            "step {index} screenshot.name must be 1-64 ASCII letters, numbers, '-' or '_', starting and ending with a letter or number, and cannot be 'failure'"
+            "step {index} screenshot.name must be 1-64 ASCII letters, numbers, '-' or '_', starting and ending with a letter or number, and cannot be 'failure' or a reserved filename"
         ));
     }
     Ok(())
+}
+
+fn is_windows_reserved_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
+            })
+        })
 }
 
 fn validate_crop(index: usize, crop: RawCrop, viewport: Viewport) -> Result<Crop, FlowError> {
@@ -1413,6 +1424,10 @@ steps:
             (
                 "version: 1\nname: x\nsteps: [{ screenshot: { name: Failure } }]\n",
                 "cannot be 'failure'",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ screenshot: { name: NUL } }]\n",
+                "screenshot.name must be",
             ),
         ] {
             assert!(error(source).contains(expected), "missing {expected:?}");

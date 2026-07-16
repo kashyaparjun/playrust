@@ -1175,6 +1175,11 @@ async fn capture_screenshot(
         .await
         .map_err(|error| protocol(format!("flush screenshot: {error}")))?;
     drop(writer);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(protocol(format!("replace screenshot: {error}"))),
+    }
     // Keep publication await-free so cancellation cannot publish an unreported screenshot.
     temporary
         .persist(&path)

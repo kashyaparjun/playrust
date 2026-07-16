@@ -27,6 +27,8 @@ fn junit_is_opt_in() {
     let flow = directory.path().join("invalid.yaml");
     let artifacts = directory.path().join("artifacts");
     fs::write(&flow, "not: [valid").unwrap();
+    fs::create_dir(&artifacts).unwrap();
+    fs::write(artifacts.join("junit.xml"), "stale").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_playrust"))
         .args(["run", flow.to_str().unwrap(), "--artifacts"])

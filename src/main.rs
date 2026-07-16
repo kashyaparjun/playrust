@@ -569,15 +569,22 @@ fn finish_report(
     );
     let exit_code = report.exit_code();
     print_results(&report);
-    match write_aggregate_report(artifacts, &report) {
-        Ok(path) => println!("Report: {}", path.display()),
-        Err(error) => {
-            eprintln!("error: {error}");
-            return if exit_code == ExitCode::Interrupted {
-                ExitCode::Interrupted
-            } else {
-                ExitCode::Infrastructure
-            };
+    for name in ["report.json", "junit.xml"] {
+        let path = artifacts.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!(
+                    "error: could not remove stale report {}: {error}",
+                    path.display()
+                );
+                return if exit_code == ExitCode::Interrupted {
+                    ExitCode::Interrupted
+                } else {
+                    ExitCode::Infrastructure
+                };
+            }
         }
     }
     if junit {
@@ -591,6 +598,20 @@ fn finish_report(
                     ExitCode::Infrastructure
                 };
             }
+        }
+    }
+    match write_aggregate_report(artifacts, &report) {
+        Ok(path) => println!("Report: {}", path.display()),
+        Err(error) => {
+            if junit {
+                let _ = fs::remove_file(artifacts.join("junit.xml"));
+            }
+            eprintln!("error: {error}");
+            return if exit_code == ExitCode::Interrupted {
+                ExitCode::Interrupted
+            } else {
+                ExitCode::Infrastructure
+            };
         }
     }
     exit_code
