@@ -1,0 +1,60 @@
+version: 1
+name: local-login
+base_url: http://127.0.0.1:8000
+
+settings:
+  timeout: 10s
+  viewport:
+    width: 1280
+    height: 720
+  video: off
+
+vars:
+  username: guest
+
+secrets:
+  password:
+    env: PLAYRUST_EXAMPLE_PASSWORD
+
+steps:
+  - id: open-example
+    open: /example.html
+
+  - fill:
+      target: { label: Username }
+      value: "${username}"
+
+  - fill:
+      target: { label: Password }
+      value: "${password}"
+
+  - press:
+      target: { label: Search }
+      key: Enter
+
+  - assert:
+      text:
+        target: { test_id: search-result }
+        contains: Rust
+
+  - click:
+      target:
+        role:
+          value: button
+          name: Sign in
+
+  - timeout: 5s
+    assert:
+      url:
+        path: /dashboard
+
+  - assert:
+      visible: { text: "Welcome, ${username}" }
+
+  - assert:
+      hidden: { css: .spinner }
+
+  - assert:
+      text:
+        target: { test_id: status }
+        equals: Signed in

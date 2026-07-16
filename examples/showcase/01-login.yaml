@@ -1,0 +1,22 @@
+version: 1
+name: showcase-login
+base_url: http://127.0.0.1:8765
+settings:
+  timeout: 10s
+  viewport: { width: 960, height: 720 }
+  video: on
+steps:
+  - open: /showcase.html
+  - fill:
+      target: { label: Email }
+      value: ada@example.test
+  - fill:
+      target: { label: Password }
+      value: correct-horse
+  - click:
+      target: { role: { value: button, name: Enter workspace } }
+  - assert: { url: { path: /welcome } }
+  - assert:
+      text:
+        target: { test_id: login-status }
+        equals: Signed in as ada@example.test

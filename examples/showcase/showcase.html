@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Playrust showcase</title>
+    <style>
+      :root { color-scheme: light; --ink: #15231d; --paper: #f3efe4; --card: #fffdf5; --accent: #e3562a; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+      body.night { color-scheme: dark; --ink: #f6f0df; --paper: #111816; --card: #1b2521; --accent: #ff784d; }
+      main { width: min(880px, calc(100% - 40px)); margin: 36px auto; }
+      header { display: flex; align-items: end; justify-content: space-between; border-bottom: 3px solid var(--ink); padding-bottom: 18px; }
+      h1 { margin: 0; font: 800 48px/0.9 Georgia, serif; letter-spacing: -2px; }
+      header p { margin: 0; color: var(--accent); text-transform: uppercase; letter-spacing: 2px; }
+      .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 22px; }
+      section { min-height: 470px; padding: 20px; background: var(--card); border: 1px solid color-mix(in srgb, var(--ink) 35%, transparent); box-shadow: 6px 6px 0 color-mix(in srgb, var(--ink) 16%, transparent); }
+      h2 { margin: 0 0 18px; font: 700 24px Georgia, serif; }
+      label { display: grid; gap: 6px; margin: 12px 0; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; }
+      input, button { width: 100%; border: 1px solid var(--ink); background: transparent; color: inherit; padding: 10px; font: inherit; }
+      button { cursor: pointer; margin-top: 8px; background: var(--ink); color: var(--card); font-weight: 700; }
+      button:hover { background: var(--accent); }
+      .status { min-height: 48px; margin-top: 18px; padding: 10px; border-left: 4px solid var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+      ul { padding: 0; list-style: none; }
+      li label { grid-template-columns: 20px 1fr; align-items: center; text-transform: none; letter-spacing: 0; }
+      li input { width: auto; }
+      .counter { margin: 32px 0 10px; text-align: center; font: 700 72px/1 Georgia, serif; }
+      @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } section { min-height: auto; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Playrust<br>Field Notes</h1>
+        <p>Three live browser flows</p>
+      </header>
+      <div class="grid">
+        <section>
+          <h2>01 / Sign in</h2>
+          <form id="login-form">
+            <label>Email <input name="email" type="email"></label>
+            <label>Password <input name="password" type="password"></label>
+            <button type="submit">Enter workspace</button>
+          </form>
+          <p class="status" data-testid="login-status">Waiting for credentials</p>
+        </section>
+
+        <section>
+          <h2>02 / Task list</h2>
+          <form id="task-form">
+            <label>New task <input name="task"></label>
+            <button type="submit">Add task</button>
+          </form>
+          <ul id="tasks"></ul>
+          <p class="status" data-testid="task-status">Completed: 0</p>
+        </section>
+
+        <section>
+          <h2>03 / Controls</h2>
+          <button id="theme-button" type="button">Switch to night</button>
+          <div class="counter" data-testid="counter">0</div>
+          <button id="count-button" type="button">Increase count</button>
+          <p class="status" data-testid="control-status">Theme: day</p>
+        </section>
+      </div>
+    </main>
+    <script>
+      document.querySelector('#login-form').addEventListener('submit', event => {
+        event.preventDefault();
+        const email = new FormData(event.target).get('email');
+        document.querySelector('[data-testid="login-status"]').textContent = 'Checking credentials...';
+        setTimeout(() => {
+          document.querySelector('[data-testid="login-status"]').textContent = `Signed in as ${email}`;
+          history.pushState({}, '', '/welcome');
+        }, 3500);
+      });
+
+      const tasks = document.querySelector('#tasks');
+      const updateTasks = () => {
+        const complete = tasks.querySelectorAll('input:checked').length;
+        document.querySelector('[data-testid="task-status"]').textContent = `Completed: ${complete}`;
+      };
+      let taskSequence = 0;
+      document.querySelector('#task-form').addEventListener('submit', event => {
+        event.preventDefault();
+        const input = event.target.elements.task;
+        const value = input.value;
+        const delay = ++taskSequence * 1800;
+        setTimeout(() => {
+          const item = document.createElement('li');
+          const label = document.createElement('label');
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.addEventListener('change', updateTasks);
+          label.append(checkbox, document.createTextNode(value));
+          item.append(label);
+          tasks.append(item);
+        }, delay);
+        input.value = '';
+      });
+
+      document.querySelector('#theme-button').addEventListener('click', event => {
+        document.querySelector('[data-testid="control-status"]').textContent = 'Applying theme...';
+        setTimeout(() => {
+          document.body.classList.toggle('night');
+          const night = document.body.classList.contains('night');
+          event.target.textContent = night ? 'Switch to day' : 'Switch to night';
+          document.querySelector('[data-testid="control-status"]').textContent = `Theme: ${night ? 'night' : 'day'}`;
+        }, 1800);
+      });
+      let countSequence = 0;
+      document.querySelector('#count-button').addEventListener('click', () => {
+        const delay = ++countSequence * 700;
+        setTimeout(() => {
+          const counter = document.querySelector('[data-testid="counter"]');
+          counter.textContent = String(Number(counter.textContent) + 1);
+        }, delay);
+      });
+    </script>
+  </body>
+</html>

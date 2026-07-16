@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Playrust example</title>
+    <style>
+      body { max-width: 32rem; margin: 4rem auto; font: 16px system-ui, sans-serif; }
+      form { display: grid; gap: 1rem; }
+      label { display: grid; gap: 0.35rem; }
+      input, button { box-sizing: border-box; padding: 0.7rem; font: inherit; }
+      .spinner, [hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Local sign in</h1>
+      <form id="login-form">
+        <label>Username <input name="username" autocomplete="username"></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password"></label>
+        <label>Search <input id="search" value="Rust documentation"></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p data-testid="search-result"></p>
+      <p class="spinner">Loading</p>
+      <p data-testid="status">Signed out</p>
+      <p id="welcome" hidden></p>
+    </main>
+    <script>
+      document.querySelector('#search').addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          document.querySelector('[data-testid="search-result"]').textContent = `Found: ${event.target.value}`;
+        }
+      });
+
+      document.querySelector('#login-form').addEventListener('submit', event => {
+        event.preventDefault();
+        const username = new FormData(event.target).get('username');
+        document.querySelector('[data-testid="status"]').textContent = 'Signed in';
+        const welcome = document.querySelector('#welcome');
+        welcome.textContent = `Welcome, ${username}`;
+        welcome.hidden = false;
+        history.pushState({}, '', '/dashboard');
+      });
+    </script>
+  </body>
+</html>

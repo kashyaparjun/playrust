@@ -1,0 +1,1588 @@
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use base64::Engine as _;
+use chromiumoxide::Page;
+use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, ResolveNodeParams};
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    InsertTextParams, MouseButton,
+};
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, EventFrameStartedNavigating, EventLifecycleEvent,
+    EventScreencastFrame, GetFrameTreeParams, NavigateParams, ScreencastFrameAckParams,
+    StartScreencastFormat, StartScreencastParams, StopScreencastParams,
+};
+use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams};
+use chromiumoxide::keys::get_key_definition;
+use chromiumoxide::page::ScreenshotParams;
+use futures_util::StreamExt;
+use serde::de::DeserializeOwned;
+use tokio::sync::{Notify, oneshot};
+
+use crate::browser::{BrowserHost, BrowserStatus, Viewport};
+use crate::flow::{
+    Assertion, CompiledFlow, CompiledStep, Key, Locator, Modifier, NamedKey, Operation, TextMatch,
+    UrlExpectation, VideoMode,
+};
+use crate::locator::{
+    Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
+    retryable, retryable_cdp_message, text_matches,
+};
+use crate::report::{
+    ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, SafeText, StepContext,
+};
+use crate::video::{VideoConfig, VideoRecorder};
+
+const SCREENSHOT_NAME: &str = "failure.png";
+const RECORDING_NAME: &str = "recording.webm";
+const SECONDARY_TIMEOUT: Duration = Duration::from_secs(2);
+const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(7);
+
+const FOCUS_FUNCTION: &str = r#"function() {
+    if (!this.isConnected) return false;
+    this.focus();
+    return document.activeElement === this;
+}"#;
+
+const PREPARE_FILL_FUNCTION: &str = r#"function() {
+    if (!this.isConnected) return false;
+    this.focus();
+    if (this instanceof HTMLInputElement) {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(this, '');
+    } else if (this instanceof HTMLTextAreaElement) {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(this, '');
+    } else if (this.isContentEditable) {
+        const range = document.createRange();
+        range.selectNodeContents(this);
+        const selection = getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+    } else {
+        return false;
+    }
+    return document.activeElement === this;
+}"#;
+
+const INNER_TEXT_FUNCTION: &str = r#"function() { return this.innerText; }"#;
+
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    inner: Arc<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.inner.cancelled.swap(true, Ordering::AcqRel) {
+            self.inner.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.inner.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Per-flow resources. Give each concurrent flow a distinct artifact directory.
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    pub artifact_directory: PathBuf,
+    pub ffmpeg_path: Option<PathBuf>,
+    pub cancellation: Option<CancellationToken>,
+}
+
+impl RunOptions {
+    pub fn new(artifact_directory: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact_directory: artifact_directory.into(),
+            ffmpeg_path: None,
+            cancellation: None,
+        }
+    }
+
+    pub fn with_ffmpeg(mut self, ffmpeg_path: impl Into<PathBuf>) -> Self {
+        self.ffmpeg_path = Some(ffmpeg_path.into());
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+}
+
+/// Runs one compiled flow in a fresh incognito browser context.
+pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOptions) -> FlowReport {
+    let started = Instant::now();
+    let mut artifacts = ArtifactPaths {
+        directory: path_text(&options.artifact_directory),
+        ..ArtifactPaths::default()
+    };
+    let viewport = match Viewport::new(flow.settings.viewport.width, flow.settings.viewport.height)
+    {
+        Ok(viewport) => viewport,
+        Err(error) => {
+            return report(
+                flow,
+                started,
+                artifacts,
+                vec![failure(
+                    flow,
+                    FailureCategory::Protocol,
+                    error.to_string(),
+                    None,
+                )],
+                false,
+            );
+        }
+    };
+    if is_cancelled(options.cancellation.as_ref()) {
+        return report(flow, started, artifacts, Vec::new(), true);
+    }
+    // Context creation must run to completion so a late response cannot orphan its context.
+    let context = match host.create_context(viewport).await {
+        Ok(context) => context,
+        Err(error) => {
+            if is_cancelled(options.cancellation.as_ref()) {
+                return report(flow, started, artifacts, Vec::new(), true);
+            }
+            let category = browser_error_category(host);
+            return report(
+                flow,
+                started,
+                artifacts,
+                vec![failure(flow, category, error.to_string(), None)],
+                false,
+            );
+        }
+    };
+    let page = context.page().clone();
+
+    let mut primary = None;
+    let mut interrupted = is_cancelled(options.cancellation.as_ref());
+    let mut recording_error = None;
+    let mut video = None;
+    if !interrupted {
+        match start_video(&page, flow, options, flow.settings.timeout).await {
+            Ok(VideoStartup::Ready(session)) => {
+                video = session;
+                interrupted = is_cancelled(options.cancellation.as_ref());
+            }
+            Ok(VideoStartup::Cancelled(finish)) => {
+                interrupted = true;
+                if let Some(finish) = finish {
+                    apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                }
+            }
+            Err(error) => {
+                recording_error = Some(error);
+                interrupted = is_cancelled(options.cancellation.as_ref());
+            }
+        }
+    }
+
+    let mut video_stop_at = None;
+    for (offset, step) in flow.steps.iter().enumerate().filter(|_| !interrupted) {
+        let Some(deadline) = Instant::now().checked_add(step.timeout) else {
+            video_stop_at = Some(Instant::now());
+            artifacts.failure_screenshot =
+                capture_failure_screenshot(&page, &options.artifact_directory)
+                    .await
+                    .map(|path| path_text(&path));
+            primary = Some(
+                step_failure(
+                    host,
+                    flow,
+                    &page,
+                    step,
+                    StepError::new(FailureCategory::Protocol, "step timeout is too large"),
+                )
+                .await,
+            );
+            break;
+        };
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(options.cancellation.as_ref()) => {
+                interrupted = true;
+                video_stop_at = Some(Instant::now());
+                break;
+            }
+            result = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                execute_step(&page, step, deadline),
+            ) => result,
+        };
+        let succeeded = matches!(&result, Ok(Ok(())));
+        if offset + 1 == flow.steps.len() || !succeeded {
+            video_stop_at = Some(Instant::now());
+        }
+        let error = match result {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => error,
+            Err(_) => StepError::new(FailureCategory::Timeout, "step deadline expired").deadline(),
+        };
+        artifacts.failure_screenshot =
+            capture_failure_screenshot(&page, &options.artifact_directory)
+                .await
+                .map(|path| path_text(&path));
+        primary = Some(step_failure(host, flow, &page, step, error).await);
+        break;
+    }
+
+    if let Some(session) = video.take() {
+        let flow_failed = primary.is_some() || interrupted;
+        let finish = session
+            .finish(
+                &page,
+                flow_failed,
+                video_stop_at.unwrap_or_else(Instant::now),
+            )
+            .await;
+        apply_video_finish(finish, &mut artifacts, &mut recording_error);
+    }
+
+    let mut failures = primary.into_iter().collect::<Vec<_>>();
+    if let Some(error) = recording_error {
+        failures.push(failure(flow, FailureCategory::Recording, error, None));
+    }
+    if !failures.is_empty() && artifacts.failure_screenshot.is_none() {
+        artifacts.failure_screenshot =
+            capture_failure_screenshot(&page, &options.artifact_directory)
+                .await
+                .map(|path| path_text(&path));
+    }
+
+    match tokio::time::timeout(SECONDARY_TIMEOUT, host.dispose_context(context)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => failures.push(failure(
+            flow,
+            browser_error_category(host),
+            error.to_string(),
+            None,
+        )),
+        Err(_) => failures.push(failure(
+            flow,
+            FailureCategory::Protocol,
+            "dispose browser context timed out",
+            None,
+        )),
+    }
+
+    report(flow, started, artifacts, failures, interrupted)
+}
+
+async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation.is_some_and(CancellationToken::is_cancelled)
+}
+
+async fn execute_step(
+    page: &Page,
+    step: &CompiledStep,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    match &step.operation {
+        Operation::Open { url } => navigate(page, url.expose().as_str(), deadline).await,
+        Operation::Click { target } => {
+            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            dispatch_click(page, element.center.x, element.center.y).await
+        }
+        Operation::Fill { target, value } => {
+            let element = wait_actionable(page, target, Actionability::EDITABLE, deadline).await?;
+            prepare_fill(page, element.backend_node_id).await?;
+            page.execute(InsertTextParams::new(value.expose()))
+                .await
+                .map_err(protocol)?;
+            Ok(())
+        }
+        Operation::Press {
+            target,
+            key,
+            modifiers,
+        } => {
+            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            focus(page, element.backend_node_id).await?;
+            dispatch_key(page, key, modifiers).await
+        }
+        Operation::Assert(assertion) => assert(page, assertion, deadline).await,
+    }
+}
+
+async fn navigate(page: &Page, url: &str, deadline: Instant) -> Result<(), StepError> {
+    let frame = page
+        .execute(GetFrameTreeParams::default())
+        .await
+        .map_err(protocol)?
+        .result
+        .frame_tree
+        .frame;
+    let main_frame_id = frame.id;
+    let previous_loader_id = frame.loader_id;
+    let mut started = page
+        .event_listener::<EventFrameStartedNavigating>()
+        .await
+        .map_err(protocol)?;
+    let mut events = page
+        .event_listener::<EventLifecycleEvent>()
+        .await
+        .map_err(protocol)?;
+    let navigation = page
+        .command_future(NavigateParams::new(url))
+        .map_err(|error| StepError::new(FailureCategory::Navigation, error.to_string()))?;
+    tokio::pin!(navigation);
+    let mut navigation_loader = None;
+    let mut dom_content_loaded = std::collections::HashSet::new();
+    loop {
+        let selected = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            tokio::select! {
+                response = &mut navigation => NavigationCompletion::Intercepted(response),
+                event = started.next() => NavigationCompletion::Started(event),
+                event = events.next() => NavigationCompletion::Lifecycle(event),
+            }
+        })
+        .await
+        .map_err(|_| {
+            StepError::new(FailureCategory::Timeout, "navigation deadline expired").deadline()
+        })?;
+        match selected {
+            NavigationCompletion::Intercepted(response) => {
+                let response = response
+                    .map_err(|error| {
+                        StepError::new(FailureCategory::Navigation, error.to_string())
+                    })?
+                    .result;
+                if let Some(error) = response.error_text {
+                    return Err(StepError::new(FailureCategory::Navigation, error));
+                }
+                if response.is_download == Some(true) {
+                    return Err(StepError::new(
+                        FailureCategory::Navigation,
+                        "navigation resulted in a download",
+                    ));
+                }
+                if response.frame_id != main_frame_id {
+                    return Err(StepError::new(
+                        FailureCategory::Protocol,
+                        "navigation completed for an unexpected frame",
+                    ));
+                }
+                // chromiumoxide releases this future only for same-document navigation
+                // or after its full-load watcher completes.
+                return Ok(());
+            }
+            NavigationCompletion::Started(Some(event)) => {
+                if event.frame_id == main_frame_id
+                    && event.url == url
+                    && event.loader_id != previous_loader_id
+                {
+                    navigation_loader = Some(event.loader_id.clone());
+                    if dom_content_loaded.contains(&event.loader_id) {
+                        return Ok(());
+                    }
+                }
+            }
+            NavigationCompletion::Started(None) => {
+                return Err(StepError::new(
+                    FailureCategory::Protocol,
+                    "navigation start event stream closed",
+                ));
+            }
+            NavigationCompletion::Lifecycle(Some(event)) => {
+                if event.frame_id == main_frame_id
+                    && event.loader_id != previous_loader_id
+                    && event.name == "DOMContentLoaded"
+                {
+                    dom_content_loaded.insert(event.loader_id.clone());
+                    if navigation_loader.as_ref() == Some(&event.loader_id) {
+                        return Ok(());
+                    }
+                }
+            }
+            NavigationCompletion::Lifecycle(None) => {
+                return Err(StepError::new(
+                    FailureCategory::Protocol,
+                    "navigation event stream closed",
+                ));
+            }
+        }
+    }
+}
+
+enum NavigationCompletion<C, S, L> {
+    Intercepted(C),
+    Started(Option<Arc<S>>),
+    Lifecycle(Option<Arc<L>>),
+}
+
+async fn wait_actionable(
+    page: &Page,
+    locator: &Locator,
+    requirements: Actionability,
+    deadline: Instant,
+) -> Result<ResolvedElement, StepError> {
+    LocatorEngine::new(page)
+        .wait_unique(locator, requirements, deadline)
+        .await
+        .map_err(locator_error)
+}
+
+async fn focus(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
+    let focused: bool = call_on_node(page, node, FOCUS_FUNCTION, &[]).await?;
+    if !focused {
+        return Err(StepError::new(
+            FailureCategory::Actionability,
+            "target could not receive focus",
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_fill(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
+    let focused: bool = call_on_node(page, node, PREPARE_FILL_FUNCTION, &[]).await?;
+    if !focused {
+        return Err(StepError::new(
+            FailureCategory::Actionability,
+            "target could not be prepared for fill",
+        ));
+    }
+    Ok(())
+}
+
+async fn dispatch_key(page: &Page, key: &Key, modifiers: &[Modifier]) -> Result<(), StepError> {
+    let character = match key {
+        Key::Character(character) => Some(character_text(*character, modifiers)),
+        Key::Named(_) => None,
+    };
+    let name = character
+        .as_ref()
+        .map_or_else(|| key_name(key), |(text, _)| text.clone());
+    let definition = get_key_definition(&name);
+    if definition.is_none() && !matches!(key, Key::Character(_)) {
+        return Err(StepError::new(
+            FailureCategory::Protocol,
+            format!("Chromium has no key definition for {name:?}"),
+        ));
+    }
+    let code = definition.map_or("", |definition| definition.code);
+    let key_code = definition.map_or(0, |definition| definition.key_code);
+    let modifier_bits = modifier_mask(modifiers);
+    let command = |event_type| {
+        DispatchKeyEventParams::builder()
+            .r#type(event_type)
+            .modifiers(modifier_bits)
+            .key(&name)
+            .code(code)
+            .windows_virtual_key_code(key_code)
+            .native_virtual_key_code(key_code)
+            .build()
+            .expect("all mandatory key event fields are set")
+    };
+    page.execute(command(DispatchKeyEventType::RawKeyDown))
+        .await
+        .map_err(protocol)?;
+
+    let character_result = if let Some((text, unmodified_text)) = character
+        && !modifiers
+            .iter()
+            .any(|value| matches!(value, Modifier::Alt | Modifier::Control | Modifier::Meta))
+    {
+        let mut character_event = command(DispatchKeyEventType::Char);
+        character_event.text = Some(text);
+        character_event.unmodified_text = Some(unmodified_text);
+        page.execute(character_event)
+            .await
+            .map(|_| ())
+            .map_err(protocol)
+    } else {
+        Ok(())
+    };
+
+    let release_result = page
+        .execute(command(DispatchKeyEventType::KeyUp))
+        .await
+        .map(|_| ())
+        .map_err(protocol);
+    character_result.and(release_result)
+}
+
+fn character_text(character: char, modifiers: &[Modifier]) -> (String, String) {
+    let unmodified = character.to_string();
+    if !modifiers.contains(&Modifier::Shift) {
+        return (unmodified.clone(), unmodified);
+    }
+    let shifted = match character {
+        'a'..='z' => character.to_ascii_uppercase(),
+        '`' => '~',
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        _ => character,
+    };
+    (shifted.to_string(), unmodified)
+}
+
+async fn dispatch_click(page: &Page, x: f64, y: f64) -> Result<(), StepError> {
+    page.move_mouse(chromiumoxide::layout::Point::new(x, y))
+        .await
+        .map_err(protocol)?;
+    let event = |event_type| {
+        DispatchMouseEventParams::builder()
+            .r#type(event_type)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .click_count(1)
+            .build()
+            .expect("all mandatory mouse event fields are set")
+    };
+    let press_result = page
+        .execute(event(DispatchMouseEventType::MousePressed))
+        .await
+        .map(|_| ())
+        .map_err(protocol);
+    let release_result = page
+        .execute(event(DispatchMouseEventType::MouseReleased))
+        .await
+        .map(|_| ())
+        .map_err(protocol);
+    press_result.and(release_result)
+}
+
+async fn assert(page: &Page, assertion: &Assertion, deadline: Instant) -> Result<(), StepError> {
+    match assertion {
+        Assertion::Visible(locator) => LocatorEngine::new(page)
+            .wait_unique(locator, Actionability::VISIBLE, deadline)
+            .await
+            .map(|_| ())
+            .map_err(assertion_locator_error),
+        Assertion::Hidden(locator) => assert_hidden(page, locator, deadline).await,
+        Assertion::Text {
+            target,
+            expected,
+            match_kind,
+        } => assert_text(page, target, expected.expose(), *match_kind, deadline).await,
+        Assertion::Url(expectation) => assert_url(page, expectation, deadline).await,
+    }
+}
+
+async fn assert_hidden(page: &Page, locator: &Locator, deadline: Instant) -> Result<(), StepError> {
+    loop {
+        let observation = match LocatorEngine::new(page).observe_any_visible(locator).await {
+            Ok(observation) => observation,
+            Err(error) if retryable(&error) => Observation::Unavailable {
+                message: error.to_string(),
+            },
+            Err(error) => return Err(assertion_locator_error(error)),
+        };
+        match observation {
+            Observation::NoMatch | Observation::Detached | Observation::Hidden => return Ok(()),
+            other => {
+                if Instant::now() >= deadline {
+                    return Err(StepError::assertion("target remained visible")
+                        .deadline()
+                        .observed(other.to_string()));
+                }
+            }
+        }
+        sleep_until_poll(deadline).await;
+    }
+}
+
+async fn assert_text(
+    page: &Page,
+    locator: &Locator,
+    expected: &str,
+    match_kind: TextMatch,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    let engine = LocatorEngine::new(page);
+    loop {
+        let observation = match engine.observe_unique(locator, Actionability::VISIBLE).await {
+            Ok(observation) => observation,
+            Err(error) if retryable(&error) => Observation::Unavailable {
+                message: error.to_string(),
+            },
+            Err(error) => return Err(assertion_locator_error(error)),
+        };
+        match observation {
+            Observation::Ready(element) => {
+                let actual: String =
+                    match call_on_node(page, element.backend_node_id, INNER_TEXT_FUNCTION, &[])
+                        .await
+                    {
+                        Ok(actual) => actual,
+                        Err(error)
+                            if error.category == FailureCategory::Protocol
+                                && retryable_cdp_message(&error.message) =>
+                        {
+                            if Instant::now() >= deadline {
+                                return Err(StepError::assertion("text target was unavailable")
+                                    .deadline()
+                                    .observed(error.message));
+                            }
+                            sleep_until_poll(deadline).await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if text_matches(&actual, expected, match_kind) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(StepError::assertion("text assertion did not match")
+                        .deadline()
+                        .observed(format!("expected {expected:?}; text was {actual:?}")));
+                }
+            }
+            observation => {
+                if Instant::now() >= deadline {
+                    return Err(StepError::assertion("text target was not visible")
+                        .deadline()
+                        .observed(observation.to_string()));
+                }
+            }
+        }
+        sleep_until_poll(deadline).await;
+    }
+}
+
+async fn assert_url(
+    page: &Page,
+    expectation: &UrlExpectation,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    loop {
+        let actual = page.url().await.map_err(protocol)?.unwrap_or_default();
+        if url_matches(&actual, expectation) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(StepError::assertion("URL assertion did not match")
+                .deadline()
+                .observed(format!("expected {expectation:?}; URL was {actual:?}")));
+        }
+        sleep_until_poll(deadline).await;
+    }
+}
+
+fn url_matches(actual: &str, expectation: &UrlExpectation) -> bool {
+    match expectation {
+        UrlExpectation::Equals(expected) => actual == expected.expose().as_str(),
+        UrlExpectation::Path(expected) => url::Url::parse(actual).is_ok_and(|actual| {
+            let mut path = actual.path().to_owned();
+            if let Some(query) = actual.query() {
+                path.push('?');
+                path.push_str(query);
+            }
+            path == *expected.expose()
+        }),
+    }
+}
+
+async fn sleep_until_poll(deadline: Instant) {
+    tokio::time::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
+}
+
+async fn call_on_node<T: DeserializeOwned>(
+    page: &Page,
+    node: BackendNodeId,
+    function: &str,
+    arguments: &[serde_json::Value],
+) -> Result<T, StepError> {
+    let object = page
+        .execute(ResolveNodeParams::builder().backend_node_id(node).build())
+        .await
+        .map_err(protocol)?
+        .result
+        .object;
+    let object_id = object.object_id.ok_or_else(|| {
+        StepError::new(
+            FailureCategory::Protocol,
+            "resolved DOM node had no object id",
+        )
+    })?;
+    let params = CallFunctionOnParams::builder()
+        .function_declaration(function)
+        .object_id(object_id.clone())
+        .arguments(arguments.iter().cloned().map(|value| {
+            chromiumoxide::cdp::js_protocol::runtime::CallArgument::builder()
+                .value(value)
+                .build()
+        }))
+        .return_by_value(true)
+        .await_promise(false)
+        .build()
+        .map_err(|error| StepError::new(FailureCategory::Protocol, error))?;
+    let response = page.execute(params).await.map_err(protocol)?.result;
+    let _ = page.execute(ReleaseObjectParams::new(object_id)).await;
+    if let Some(exception) = response.exception_details {
+        return Err(StepError::new(
+            FailureCategory::Protocol,
+            format!("page function threw: {}", exception.text),
+        ));
+    }
+    let value = response.result.value.ok_or_else(|| {
+        StepError::new(FailureCategory::Protocol, "page function returned no value")
+    })?;
+    serde_json::from_value(value)
+        .map_err(|error| StepError::new(FailureCategory::Protocol, error.to_string()))
+}
+
+struct VideoSession {
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<(VideoRecorder, Result<(), String>)>,
+    partial_path: PathBuf,
+}
+
+enum VideoStartup {
+    Ready(Option<VideoSession>),
+    Cancelled(Option<Result<Option<PathBuf>, VideoFinishError>>),
+}
+
+impl VideoSession {
+    async fn finish(
+        mut self,
+        page: &Page,
+        flow_failed: bool,
+        stop_at: Instant,
+    ) -> Result<Option<PathBuf>, VideoFinishError> {
+        let mut errors = Vec::new();
+        if let Some(error) = stop_screencast(page).await {
+            errors.push(error);
+        }
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let (recorder, stream_result) =
+            match tokio::time::timeout(SECONDARY_TIMEOUT, &mut self.task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    return Err(VideoFinishError::Complete {
+                        error: format!("screencast task failed: {error}"),
+                        partial: self.partial_path.clone(),
+                        recording: None,
+                    });
+                }
+                Err(_) => {
+                    self.task.abort();
+                    let _ = (&mut self.task).await;
+                    return Err(VideoFinishError::Complete {
+                        error: "screencast task shutdown timed out".to_owned(),
+                        partial: self.partial_path.clone(),
+                        recording: None,
+                    });
+                }
+            };
+        if let Err(error) = stream_result {
+            errors.push(error);
+        }
+        let recording = match tokio::time::timeout(
+            VIDEO_FINALIZE_TIMEOUT,
+            recorder.finalize(stop_at, should_retain_video(flow_failed, &errors)),
+        )
+        .await
+        {
+            Ok(Ok(recording)) => recording,
+            Ok(Err(error)) => {
+                return Err(VideoFinishError::Complete {
+                    error: error.to_string(),
+                    partial: self.partial_path.clone(),
+                    recording: None,
+                });
+            }
+            Err(_) => {
+                return Err(VideoFinishError::Complete {
+                    error: "video finalization timed out".to_owned(),
+                    partial: self.partial_path.clone(),
+                    recording: None,
+                });
+            }
+        };
+        if !errors.is_empty() {
+            return Err(VideoFinishError::Complete {
+                error: errors.join("; "),
+                partial: self.partial_path.clone(),
+                recording,
+            });
+        }
+        Ok(recording)
+    }
+}
+
+impl Drop for VideoSession {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn should_retain_video(flow_failed: bool, screencast_errors: &[String]) -> bool {
+    flow_failed || !screencast_errors.is_empty()
+}
+
+enum VideoFinishError {
+    Complete {
+        error: String,
+        partial: PathBuf,
+        recording: Option<PathBuf>,
+    },
+}
+
+fn apply_video_finish(
+    finish: Result<Option<PathBuf>, VideoFinishError>,
+    artifacts: &mut ArtifactPaths,
+    recording_error: &mut Option<String>,
+) {
+    match finish {
+        Ok(Some(path)) => artifacts.recording = Some(path_text(&path)),
+        Ok(None) => {}
+        Err(VideoFinishError::Complete {
+            error,
+            partial,
+            recording,
+        }) => {
+            if let Some(recording) = recording.filter(|path| path.exists()) {
+                artifacts.recording = Some(path_text(&recording));
+            }
+            if partial.exists() {
+                artifacts.partial_recording = Some(path_text(&partial));
+            }
+            *recording_error = Some(error);
+        }
+    }
+}
+
+async fn start_video(
+    page: &Page,
+    flow: &CompiledFlow,
+    options: &RunOptions,
+    first_frame_timeout: Duration,
+) -> Result<VideoStartup, String> {
+    if is_cancelled(options.cancellation.as_ref()) {
+        return Ok(VideoStartup::Cancelled(None));
+    }
+    if flow.settings.video == VideoMode::Off {
+        return Ok(VideoStartup::Ready(None));
+    }
+    let ffmpeg_path = options
+        .ffmpeg_path
+        .as_ref()
+        .ok_or_else(|| "video is enabled but no FFmpeg path was provided".to_owned())?;
+    tokio::fs::create_dir_all(&options.artifact_directory)
+        .await
+        .map_err(|error| format!("create artifact directory: {error}"))?;
+    if is_cancelled(options.cancellation.as_ref()) {
+        return Ok(VideoStartup::Cancelled(None));
+    }
+    let config = VideoConfig {
+        mode: flow.settings.video,
+        ffmpeg_path: ffmpeg_path.clone(),
+        output_path: options.artifact_directory.join(RECORDING_NAME),
+        viewport_width: flow.settings.viewport.width,
+        viewport_height: flow.settings.viewport.height,
+    };
+    let partial_path = config.partial_path();
+    let mut events = page
+        .event_listener::<EventScreencastFrame>()
+        .await
+        .map_err(|error| error.to_string())?;
+    if is_cancelled(options.cancellation.as_ref()) {
+        return Ok(VideoStartup::Cancelled(None));
+    }
+    if let Err(error) = page
+        .execute(
+            StartScreencastParams::builder()
+                .format(StartScreencastFormat::Jpeg)
+                .quality(80)
+                .max_width(i64::from(flow.settings.viewport.width))
+                .max_height(i64::from(flow.settings.viewport.height))
+                .every_nth_frame(1)
+                .build(),
+        )
+        .await
+    {
+        let cleanup = stop_screencast(page).await;
+        return Err(match cleanup {
+            Some(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+            None => error.to_string(),
+        });
+    }
+    if is_cancelled(options.cancellation.as_ref()) {
+        let cleanup = stop_screencast(page).await.map(|error| {
+            Err(VideoFinishError::Complete {
+                error,
+                partial: partial_path,
+                recording: None,
+            })
+        });
+        return Ok(VideoStartup::Cancelled(cleanup));
+    }
+    let recorder = match VideoRecorder::start(&config).await {
+        Ok(recorder) => recorder,
+        Err(error) => {
+            let cleanup = stop_screencast(page).await;
+            return Err(match cleanup {
+                Some(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
+                None => error.to_string(),
+            });
+        }
+    };
+    let task_page = page.clone();
+    let (stop, mut stop_rx) = oneshot::channel();
+    let (first_frame, first_frame_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut first_frame = Some(first_frame);
+        let result = loop {
+            tokio::select! {
+                _ = &mut stop_rx => break Ok(()),
+                event = events.next() => {
+                    let Some(event) = event else {
+                        break Err("screencast event stream closed".to_owned());
+                    };
+                    if let Err(error) = task_page.execute(ScreencastFrameAckParams::new(event.session_id)).await {
+                        break Err(format!("acknowledge screencast frame: {error}"));
+                    }
+                    match base64::engine::general_purpose::STANDARD.decode(event.data.as_ref() as &[u8]) {
+                        Ok(jpeg) => {
+                            recorder.push_frame(jpeg);
+                            if let Some(first_frame) = first_frame.take() {
+                                let _ = first_frame.send(());
+                            }
+                        }
+                        Err(error) => break Err(format!("decode screencast frame: {error}")),
+                    }
+                }
+            }
+        };
+        (recorder, result)
+    });
+    let session = VideoSession {
+        stop: Some(stop),
+        task,
+        partial_path,
+    };
+    let first_frame = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(options.cancellation.as_ref()) => None,
+        result = tokio::time::timeout(first_frame_timeout, first_frame_rx) => Some(result),
+    };
+    let Some(first_frame) = first_frame else {
+        return Ok(VideoStartup::Cancelled(Some(
+            session.finish(page, true, Instant::now()).await,
+        )));
+    };
+    let first_frame_error = match first_frame {
+        Ok(Ok(())) => return Ok(VideoStartup::Ready(Some(session))),
+        Ok(Err(_)) => "screencast ended before the first frame".to_owned(),
+        Err(_) => format!(
+            "timed out after {} ms waiting for the first screencast frame",
+            duration_ms(first_frame_timeout)
+        ),
+    };
+    let cleanup_error = session
+        .finish(page, true, Instant::now())
+        .await
+        .err()
+        .map(|VideoFinishError::Complete { error, .. }| error);
+    Err(match cleanup_error {
+        Some(cleanup) => format!("{first_frame_error}; cleanup failed: {cleanup}"),
+        None => first_frame_error,
+    })
+}
+
+async fn stop_screencast(page: &Page) -> Option<String> {
+    match tokio::time::timeout(
+        SECONDARY_TIMEOUT,
+        page.execute(StopScreencastParams::default()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(format!("stop screencast: {error}")),
+        Err(_) => Some("stop screencast timed out".to_owned()),
+    }
+}
+
+async fn capture_failure_screenshot(page: &Page, directory: &Path) -> Option<PathBuf> {
+    let path = directory.join(SCREENSHOT_NAME);
+    let capture = async {
+        tokio::fs::create_dir_all(directory).await?;
+        let bytes = page
+            .screenshot(
+                ScreenshotParams::builder()
+                    .format(CaptureScreenshotFormat::Png)
+                    .build(),
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+        tokio::fs::write(&path, bytes).await?;
+        Ok::<_, std::io::Error>(())
+    };
+    match tokio::time::timeout(SECONDARY_TIMEOUT, capture).await {
+        Ok(Ok(())) => Some(path),
+        _ => None,
+    }
+}
+
+async fn step_failure(
+    host: &BrowserHost,
+    flow: &CompiledFlow,
+    page: &Page,
+    step: &CompiledStep,
+    error: StepError,
+) -> Failure {
+    let current_url = tokio::time::timeout(SECONDARY_TIMEOUT, page.url())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .map(|url| safe(flow, url));
+    let category = match host.status() {
+        BrowserStatus::Running => error.category,
+        BrowserStatus::Failed(_) | BrowserStatus::Closed => FailureCategory::BrowserCrash,
+    };
+    let timeout_ms = deadline_timeout_ms(&error, step.timeout);
+    let mut failure = Failure::new(category, safe(flow, error.message));
+    failure.step = Some(step_context(step));
+    failure.current_url = current_url;
+    failure.timeout_ms = timeout_ms;
+    failure.last_observed = error.last_observed.map(|value| safe(flow, value));
+    failure
+}
+
+fn step_context(step: &CompiledStep) -> StepContext {
+    StepContext {
+        number: step.index,
+        id: step.id.clone(),
+        operation: operation_name(&step.operation).to_owned(),
+        locator: operation_locator(&step.operation).map(locator_text),
+    }
+}
+
+fn operation_name(operation: &Operation) -> &'static str {
+    match operation {
+        Operation::Open { .. } => "open",
+        Operation::Click { .. } => "click",
+        Operation::Fill { .. } => "fill",
+        Operation::Press { .. } => "press",
+        Operation::Assert(Assertion::Visible(_)) => "assert.visible",
+        Operation::Assert(Assertion::Hidden(_)) => "assert.hidden",
+        Operation::Assert(Assertion::Text { .. }) => "assert.text",
+        Operation::Assert(Assertion::Url(_)) => "assert.url",
+    }
+}
+
+fn operation_locator(operation: &Operation) -> Option<&Locator> {
+    match operation {
+        Operation::Click { target }
+        | Operation::Fill { target, .. }
+        | Operation::Press { target, .. }
+        | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
+        Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
+        Operation::Open { .. } | Operation::Assert(Assertion::Url(_)) => None,
+    }
+}
+
+fn locator_text(locator: &Locator) -> SafeText {
+    let (kind, value, secret) = match locator {
+        Locator::Css(value) => ("css", value.expose().as_str(), value.is_secret()),
+        Locator::TestId(value) => ("test_id", value.expose().as_str(), value.is_secret()),
+        Locator::Text { value, .. } => ("text", value.expose().as_str(), value.is_secret()),
+        Locator::Label(value) => ("label", value.expose().as_str(), value.is_secret()),
+        Locator::Role { value, name } => {
+            if value.is_secret() || name.as_ref().is_some_and(|name| name.is_secret()) {
+                return SafeText::secret();
+            }
+            return SafeText::public(match name {
+                Some(name) => format!("role={:?} name={:?}", value.expose(), name.expose()),
+                None => format!("role={:?}", value.expose()),
+            });
+        }
+    };
+    if secret {
+        SafeText::secret()
+    } else {
+        SafeText::public(format!("{kind}={value:?}"))
+    }
+}
+
+fn report(
+    flow: &CompiledFlow,
+    started: Instant,
+    artifacts: ArtifactPaths,
+    failures: Vec<Failure>,
+    interrupted: bool,
+) -> FlowReport {
+    FlowReport {
+        name: flow.name.clone(),
+        path: path_text(&flow.source),
+        duration_ms: duration_ms(started.elapsed()),
+        status: if interrupted {
+            FlowStatus::Interrupted
+        } else if failures.is_empty() {
+            FlowStatus::Passed
+        } else {
+            FlowStatus::Failed
+        },
+        failures,
+        artifacts,
+    }
+}
+
+fn failure(
+    flow: &CompiledFlow,
+    category: FailureCategory,
+    message: impl AsRef<str>,
+    step: Option<StepContext>,
+) -> Failure {
+    let mut failure = Failure::new(category, safe(flow, message.as_ref()));
+    failure.step = step;
+    failure
+}
+
+fn safe(flow: &CompiledFlow, value: impl AsRef<str>) -> SafeText {
+    SafeText::public(flow.redactor.redact(value.as_ref()))
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn deadline_timeout_ms(error: &StepError, timeout: Duration) -> Option<u64> {
+    error.deadline_based.then(|| duration_ms(timeout))
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn browser_error_category(host: &BrowserHost) -> FailureCategory {
+    match host.status() {
+        BrowserStatus::Failed(_) | BrowserStatus::Closed => FailureCategory::BrowserCrash,
+        BrowserStatus::Running => FailureCategory::Protocol,
+    }
+}
+
+fn protocol(error: impl fmt::Display) -> StepError {
+    StepError::new(FailureCategory::Protocol, error.to_string())
+}
+
+fn locator_error(error: LocatorError) -> StepError {
+    match error {
+        LocatorError::Timeout { last } => {
+            let category = match last {
+                Observation::NoMatch | Observation::Multiple { .. } => FailureCategory::Locator,
+                Observation::Unavailable { .. } => FailureCategory::Protocol,
+                _ => FailureCategory::Actionability,
+            };
+            StepError::new(category, "target did not become actionable")
+                .deadline()
+                .observed(last.to_string())
+        }
+        LocatorError::Protocol(message) | LocatorError::InvalidResponse(message) => {
+            StepError::new(FailureCategory::Protocol, message)
+        }
+    }
+}
+
+fn assertion_locator_error(error: LocatorError) -> StepError {
+    match error {
+        LocatorError::Timeout { last } => StepError::assertion("assertion deadline expired")
+            .deadline()
+            .observed(last.to_string()),
+        LocatorError::Protocol(message) | LocatorError::InvalidResponse(message) => {
+            StepError::new(FailureCategory::Protocol, message)
+        }
+    }
+}
+
+struct StepError {
+    category: FailureCategory,
+    message: String,
+    last_observed: Option<String>,
+    deadline_based: bool,
+}
+
+impl StepError {
+    fn new(category: FailureCategory, message: impl Into<String>) -> Self {
+        Self {
+            category,
+            message: message.into(),
+            last_observed: None,
+            deadline_based: false,
+        }
+    }
+
+    fn assertion(message: impl Into<String>) -> Self {
+        Self::new(FailureCategory::Assertion, message)
+    }
+
+    fn observed(mut self, value: impl Into<String>) -> Self {
+        self.last_observed = Some(value.into());
+        self
+    }
+
+    fn deadline(mut self) -> Self {
+        self.deadline_based = true;
+        self
+    }
+}
+
+fn modifier_mask(modifiers: &[Modifier]) -> i64 {
+    modifiers.iter().fold(0, |mask, modifier| {
+        mask | match modifier {
+            Modifier::Alt => 1,
+            Modifier::Control => 2,
+            Modifier::Meta => 4,
+            Modifier::Shift => 8,
+        }
+    })
+}
+
+fn key_name(key: &Key) -> String {
+    match key {
+        Key::Character(character) => character.to_string(),
+        Key::Named(named) => match named {
+            NamedKey::Enter => "Enter",
+            NamedKey::Tab => "Tab",
+            NamedKey::Escape => "Escape",
+            NamedKey::Space => " ",
+            NamedKey::Backspace => "Backspace",
+            NamedKey::Delete => "Delete",
+            NamedKey::ArrowUp => "ArrowUp",
+            NamedKey::ArrowDown => "ArrowDown",
+            NamedKey::ArrowLeft => "ArrowLeft",
+            NamedKey::ArrowRight => "ArrowRight",
+            NamedKey::Home => "Home",
+            NamedKey::End => "End",
+            NamedKey::PageUp => "PageUp",
+            NamedKey::PageDown => "PageDown",
+        }
+        .to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::env;
+
+    use super::*;
+    use crate::flow::compile_yaml_with_env;
+
+    #[test]
+    fn modifier_bits_follow_cdp() {
+        assert_eq!(modifier_mask(&[]), 0);
+        assert_eq!(
+            modifier_mask(&[
+                Modifier::Alt,
+                Modifier::Control,
+                Modifier::Meta,
+                Modifier::Shift
+            ]),
+            15
+        );
+    }
+
+    #[test]
+    fn every_v1_named_key_has_a_chromium_definition() {
+        for key in [
+            NamedKey::Enter,
+            NamedKey::Tab,
+            NamedKey::Escape,
+            NamedKey::Space,
+            NamedKey::Backspace,
+            NamedKey::Delete,
+            NamedKey::ArrowUp,
+            NamedKey::ArrowDown,
+            NamedKey::ArrowLeft,
+            NamedKey::ArrowRight,
+            NamedKey::Home,
+            NamedKey::End,
+            NamedKey::PageUp,
+            NamedKey::PageDown,
+        ] {
+            assert!(get_key_definition(key_name(&Key::Named(key))).is_some());
+        }
+    }
+
+    #[test]
+    fn url_expectations_compare_exact_urls_or_path_and_query() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps: [{ assert: { url: { path: '/a?q=1' } } }]\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let Operation::Assert(Assertion::Url(expectation)) = &flow.steps[0].operation else {
+            panic!("expected URL assertion");
+        };
+        assert!(url_matches(
+            "https://example.test/a?q=1#fragment",
+            expectation
+        ));
+        assert!(!url_matches("https://example.test/a?q=2", expectation));
+    }
+
+    #[test]
+    fn secret_locators_are_never_rendered_in_step_context() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ click: { target: { css: '${token}' } } }]\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]),
+        )
+        .unwrap();
+        let context = step_context(&flow.steps[0]);
+        assert_eq!(context.locator.unwrap().as_str(), "[REDACTED]");
+    }
+
+    #[test]
+    fn deadline_based_failures_include_timeout_for_all_automation_categories() {
+        for error in [
+            locator_error(LocatorError::Timeout {
+                last: Observation::NoMatch,
+            }),
+            locator_error(LocatorError::Timeout {
+                last: Observation::Hidden,
+            }),
+            assertion_locator_error(LocatorError::Timeout {
+                last: Observation::NoMatch,
+            }),
+        ] {
+            assert_eq!(
+                deadline_timeout_ms(&error, Duration::from_millis(321)),
+                Some(321)
+            );
+        }
+    }
+
+    #[test]
+    fn report_preserves_failure_order_and_uses_infrastructure_precedence() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps: [{ open: https://x.test }]\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let failures = vec![
+            failure(&flow, FailureCategory::Assertion, "automation", None),
+            failure(&flow, FailureCategory::Recording, "cleanup", None),
+        ];
+        let report = report(
+            &flow,
+            Instant::now(),
+            ArtifactPaths::default(),
+            failures,
+            false,
+        );
+
+        assert_eq!(report.failures[0].category, FailureCategory::Assertion);
+        assert_eq!(report.failures[1].category, FailureCategory::Recording);
+        assert_eq!(report.exit_code(), crate::report::ExitCode::Infrastructure);
+    }
+
+    #[test]
+    fn shifted_character_events_use_shifted_and_unmodified_text() {
+        assert_eq!(
+            character_text('a', &[Modifier::Shift]),
+            ("A".to_owned(), "a".to_owned())
+        );
+        assert_eq!(
+            character_text('1', &[Modifier::Shift]),
+            ("!".to_owned(), "1".to_owned())
+        );
+        assert_eq!(character_text('a', &[]), ("a".to_owned(), "a".to_owned()));
+    }
+
+    #[test]
+    fn fill_clears_text_controls_without_unsupported_select_or_change_events() {
+        assert!(PREPARE_FILL_FUNCTION.contains("HTMLInputElement.prototype, 'value'"));
+        assert!(PREPARE_FILL_FUNCTION.contains("HTMLTextAreaElement.prototype, 'value'"));
+        assert!(PREPARE_FILL_FUNCTION.contains("this.isContentEditable"));
+        assert!(PREPARE_FILL_FUNCTION.contains("range.selectNodeContents(this)"));
+        assert!(!PREPARE_FILL_FUNCTION.contains("this.select()"));
+        assert!(!PREPARE_FILL_FUNCTION.contains("dispatchEvent"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+    async fn fill_replaces_all_supported_text_controls_in_chrome() {
+        let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+        let host = BrowserHost::launch(chrome, false).await.unwrap();
+        let context = host
+            .create_context(Viewport::new(800, 600).unwrap())
+            .await
+            .unwrap();
+        let page = context.page().clone();
+        page.set_content(
+            r#"<input id="text" value="old"><input id="search" type="search" value="old">
+                <input id="email" type="email" value="old@example.test">
+                <input id="url" type="url" value="https://old.test"><input id="tel" type="tel" value="old">
+                <input id="password" type="password" value="old"><textarea id="textarea">old</textarea>
+                <div id="editable" contenteditable>old</div>"#,
+        )
+        .await
+        .unwrap();
+
+        for id in [
+            "text", "search", "email", "url", "tel", "password", "textarea", "editable",
+        ] {
+            let element = page.find_element(format!("#{id}")).await.unwrap();
+            prepare_fill(&page, element.backend_node_id)
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.message));
+            page.execute(InsertTextParams::new("replacement"))
+                .await
+                .unwrap();
+            let value: String = call_on_node(
+                &page,
+                element.backend_node_id,
+                "function() { return this.isContentEditable ? this.innerText : this.value; }",
+                &[],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(value, "replacement", "failed to replace #{id}");
+        }
+
+        host.dispose_context(context).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+    async fn labels_resolve_native_wrapping_and_aria_names_in_chrome() {
+        let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+        let host = BrowserHost::launch(chrome, false).await.unwrap();
+        let context = host
+            .create_context(Viewport::new(800, 600).unwrap())
+            .await
+            .unwrap();
+        let page = context.page().clone();
+        page.set_content(
+            r#"<style>label { text-transform: uppercase }</style>
+                <label>Email <input id="wrapped"></label>
+                <label>Ignored aria <input id="aria" aria-label="Alias"></label>
+                <span id="account">Account</span><span id="owner"> owner</span>
+                <label>Ignored labelled <input id="labelled" aria-labelledby="account owner"></label>"#,
+        )
+        .await
+        .unwrap();
+        let flow = compile_yaml_with_env(
+            r#"version: 1
+name: labels
+steps:
+  - fill: { target: { label: Email }, value: wrapped }
+  - fill: { target: { label: Alias }, value: aria }
+  - fill: { target: { label: Account owner }, value: labelled }
+  - assert: { hidden: { label: Ignored aria } }
+  - assert: { hidden: { label: Ignored labelled } }
+  - assert: { hidden: { label: email } }
+"#,
+            "labels.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        for step in &flow.steps {
+            execute_step(&page, step, Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|error| panic!("{}: {:?}", error.message, error.last_observed));
+        }
+        for (id, expected) in [
+            ("wrapped", "wrapped"),
+            ("aria", "aria"),
+            ("labelled", "labelled"),
+        ] {
+            let element = page.find_element(format!("#{id}")).await.unwrap();
+            let value: String = call_on_node(
+                &page,
+                element.backend_node_id,
+                "function() { return this.value; }",
+                &[],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.message));
+            assert_eq!(value, expected);
+        }
+
+        host.dispose_context(context).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_wakes_existing_and_future_waiters() {
+        let token = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let token = token.clone();
+            async move { token.cancelled().await }
+        });
+
+        token.cancel();
+        waiter.await.unwrap();
+        token.cancelled().await;
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn screencast_errors_retain_failure_only_video() {
+        assert!(should_retain_video(false, &["stream failed".to_owned()]));
+        assert!(should_retain_video(true, &[]));
+        assert!(!should_retain_video(false, &[]));
+    }
+}

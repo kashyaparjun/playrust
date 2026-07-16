@@ -1,0 +1,27 @@
+version: 1
+name: showcase-tasks
+base_url: http://127.0.0.1:8765
+settings:
+  timeout: 10s
+  viewport: { width: 960, height: 720 }
+  video: on
+steps:
+  - open: /showcase.html
+  - fill:
+      target: { label: New task }
+      value: Write browser tests
+  - click:
+      target: { role: { value: button, name: Add task } }
+  - fill:
+      target: { label: New task }
+      value: Review recording
+  - click:
+      target: { role: { value: button, name: Add task } }
+  - assert:
+      visible: { text: Review recording }
+  - click:
+      target: { role: { value: checkbox, name: Write browser tests } }
+  - assert:
+      text:
+        target: { test_id: task-status }
+        equals: "Completed: 1"

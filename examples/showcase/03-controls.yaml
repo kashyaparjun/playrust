@@ -1,0 +1,25 @@
+version: 1
+name: showcase-controls
+base_url: http://127.0.0.1:8765
+settings:
+  timeout: 10s
+  viewport: { width: 960, height: 720 }
+  video: on
+steps:
+  - open: /showcase.html
+  - click:
+      target: { role: { value: button, name: Switch to night } }
+  - assert:
+      text:
+        target: { test_id: control-status }
+        equals: "Theme: night"
+  - click:
+      target: { role: { value: button, name: Increase count } }
+  - click:
+      target: { role: { value: button, name: Increase count } }
+  - click:
+      target: { role: { value: button, name: Increase count } }
+  - assert:
+      text:
+        target: { test_id: counter }
+        equals: "3"
