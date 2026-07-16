@@ -21,7 +21,7 @@ use tokio::{
 pub use crate::flow::VideoMode;
 
 const FRAME_RATE: u32 = 15;
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STDERR_BYTES: u64 = 64 * 1024;
 
 impl VideoMode {

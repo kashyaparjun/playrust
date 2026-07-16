@@ -45,7 +45,7 @@ use crate::video::{VideoConfig, VideoRecorder};
 const SCREENSHOT_NAME: &str = "failure.png";
 const RECORDING_NAME: &str = "recording.webm";
 const SECONDARY_TIMEOUT: Duration = Duration::from_secs(2);
-const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(7);
+const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 const FINAL_FRAME_DELAY: Duration = Duration::from_millis(250);
 
 const FOCUS_FUNCTION: &str = r#"function() {
