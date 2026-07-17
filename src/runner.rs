@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chromiumoxide::Page;
+use chromiumoxide::cdp::browser_protocol::accessibility::GetFullAxTreeParams;
 use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, GetContentQuadsParams, GetFrameOwnerParams,
     ResolveNodeParams,
@@ -32,12 +33,13 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot};
 
-use crate::browser::{BrowserHost, BrowserStatus, Geolocation, Viewport};
+use crate::browser::{BrowserContext, BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
     Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey, Operation,
@@ -60,6 +62,11 @@ const RECORDING_NAME: &str = "recording.webm";
 const SECONDARY_TIMEOUT: Duration = Duration::from_secs(2);
 const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 const FINAL_FRAME_DELAY: Duration = Duration::from_millis(250);
+const INSPECT_AX_DEPTH: i64 = 8;
+const INSPECT_AX_NODES: usize = 500;
+const INSPECT_AX_BYTES: usize = 256 * 1024;
+const INSPECT_PAGES: usize = 100;
+const INSPECT_TEXT_CHARS: usize = 16 * 1024;
 
 const FOCUS_FUNCTION: &str = r#"function() {
     if (!this.isConnected) return false;
@@ -293,86 +300,248 @@ impl RunOptions {
     }
 }
 
+/// A persistent isolated browser context with stable page selection and runtime outputs.
+pub(crate) struct SessionRuntime {
+    context: Option<BrowserContext>,
+    active: ActiveContext,
+    page_settings: PageSettings,
+    outputs: BTreeMap<String, Resolved<Value>>,
+    redactor: Redactor,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionPage {
+    pub url: String,
+    pub title: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionInspection {
+    pub url: String,
+    pub title: String,
+    pub pages: Vec<SessionPage>,
+    pub active_frame: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<String>,
+}
+
+impl SessionRuntime {
+    pub(crate) async fn open(host: &BrowserHost, flow: &CompiledFlow) -> anyhow::Result<Self> {
+        let viewport = Viewport::new(flow.settings.viewport.width, flow.settings.viewport.height)?;
+        let context = host
+            .create_context(viewport, flow.settings.geolocation)
+            .await?;
+        let router =
+            match OopifRouter::connect(host.browser().websocket_address(), context.id().as_ref())
+                .await
+            {
+                Ok(router) => router,
+                Err(error) => {
+                    let _ = host.dispose_context(context).await;
+                    return Err(error);
+                }
+            };
+        Ok(Self {
+            active: ActiveContext::with_router(context.page().clone(), router),
+            context: Some(context),
+            page_settings: PageSettings {
+                viewport,
+                geolocation: flow.settings.geolocation,
+            },
+            outputs: BTreeMap::new(),
+            redactor: flow.redactor.clone(),
+        })
+    }
+
+    pub(crate) fn settings_match(&self, flow: &CompiledFlow) -> bool {
+        self.page_settings.viewport.width == flow.settings.viewport.width
+            && self.page_settings.viewport.height == flow.settings.viewport.height
+            && self.page_settings.geolocation == flow.settings.geolocation
+    }
+
+    pub(crate) fn output(&self, name: &str) -> Option<&Value> {
+        self.outputs.get(name).map(Resolved::expose)
+    }
+
+    pub(crate) fn output_names(&self) -> BTreeSet<String> {
+        self.outputs.keys().cloned().collect()
+    }
+
+    pub(crate) async fn inspect(
+        &self,
+        host: &BrowserHost,
+        accessibility: bool,
+        screenshot_directory: Option<&Path>,
+    ) -> anyhow::Result<SessionInspection> {
+        let context = self.context.as_ref().expect("open session context");
+        let target_id = self.active.page.target_id();
+        let targets = host
+            .browser()
+            .execute(GetTargetsParams::default())
+            .await?
+            .result
+            .target_infos;
+        let pages = targets
+            .into_iter()
+            .filter(|target| {
+                target.r#type == "page" && target.browser_context_id.as_ref() == Some(context.id())
+            })
+            .take(INSPECT_PAGES)
+            .map(|target| SessionPage {
+                active: &target.target_id == target_id,
+                url: bounded_inspection_text(target.url),
+                title: bounded_inspection_text(target.title),
+            })
+            .collect();
+        let url = bounded_inspection_text(self.active.url().await?.unwrap_or_default());
+        let title = bounded_inspection_text(
+            evaluate_value(&self.active, "document.title")
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message))?,
+        );
+        let active_frame = match self.active.frame() {
+            Some(_) => self.active.url().await?,
+            None => None,
+        };
+        let accessibility = if accessibility {
+            let mut params = GetFullAxTreeParams::builder().depth(INSPECT_AX_DEPTH);
+            if let Some(frame) = self.active.local_frame() {
+                params = params.frame_id(frame.clone());
+            }
+            let nodes = self.active.target().execute(params.build()).await?.nodes;
+            let mut bounded = Vec::new();
+            let mut bytes = 2;
+            for node in nodes.into_iter().take(INSPECT_AX_NODES) {
+                let node_bytes = serde_json::to_vec(&node)?.len() + 1;
+                if bytes + node_bytes > INSPECT_AX_BYTES {
+                    break;
+                }
+                bytes += node_bytes;
+                bounded.push(node);
+            }
+            Some(serde_json::to_value(bounded)?)
+        } else {
+            None
+        };
+        let screenshot = match screenshot_directory {
+            Some(directory) => Some(path_text(
+                &capture_screenshot(&self.active, directory, "inspect.png", None)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.message))?,
+            )),
+            None => None,
+        };
+        Ok(SessionInspection {
+            url,
+            title,
+            pages,
+            active_frame,
+            accessibility,
+            screenshot,
+        })
+    }
+
+    pub(crate) async fn execute(
+        &mut self,
+        host: &BrowserHost,
+        flow: &CompiledFlow,
+        options: &RunOptions,
+    ) -> FlowReport {
+        execute_flow(host, self, flow, options).await
+    }
+
+    pub(crate) async fn close(mut self, host: &BrowserHost) -> anyhow::Result<()> {
+        if let Some(router) = self.active.router.take() {
+            let _ = tokio::time::timeout(SECONDARY_TIMEOUT, router.close()).await;
+        }
+        host.dispose_context(self.context.take().expect("open session context"))
+            .await
+    }
+}
+
+fn bounded_inspection_text(value: String) -> String {
+    value.chars().take(INSPECT_TEXT_CHARS).collect()
+}
+
 /// Runs one compiled flow in a fresh incognito browser context.
 pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOptions) -> FlowReport {
     let started = Instant::now();
-    let mut artifacts = ArtifactPaths {
+    let artifacts = ArtifactPaths {
         directory: path_text(&options.artifact_directory),
         ..ArtifactPaths::default()
-    };
-    let viewport = match Viewport::new(flow.settings.viewport.width, flow.settings.viewport.height)
-    {
-        Ok(viewport) => viewport,
-        Err(error) => {
-            return report(
-                flow,
-                started,
-                artifacts,
-                vec![failure(
-                    flow,
-                    FailureCategory::Protocol,
-                    error.to_string(),
-                    None,
-                )],
-                false,
-            );
-        }
     };
     if is_cancelled(options.cancellation.as_ref()) {
         return report(flow, started, artifacts, Vec::new(), true);
     }
-    // Context creation must run to completion so a late response cannot orphan its context.
-    let context = match host
-        .create_context(viewport, flow.settings.geolocation)
-        .await
-    {
-        Ok(context) => context,
+    let mut session = match SessionRuntime::open(host, flow).await {
+        Ok(session) => session,
         Err(error) => {
-            if is_cancelled(options.cancellation.as_ref()) {
-                return report(flow, started, artifacts, Vec::new(), true);
-            }
             let category = browser_error_category(host);
             return report(
                 flow,
                 started,
                 artifacts,
                 vec![failure(flow, category, error.to_string(), None)],
-                false,
+                is_cancelled(options.cancellation.as_ref()),
             );
         }
     };
-    let page = context.page().clone();
-    let router =
-        match OopifRouter::connect(host.browser().websocket_address(), context.id().as_ref()).await
-        {
-            Ok(router) => router,
-            Err(error) => {
-                let _ = host.dispose_context(context).await;
-                return report(
-                    flow,
-                    started,
-                    artifacts,
-                    vec![failure(
-                        flow,
-                        FailureCategory::Protocol,
-                        error.to_string(),
-                        None,
-                    )],
-                    false,
-                );
-            }
-        };
-    let mut active = ActiveContext::with_router(page.clone(), Arc::clone(&router));
-    let page_settings = PageSettings {
-        viewport,
-        geolocation: flow.settings.geolocation,
+    let mut result = session.execute(host, flow, options).await;
+    match tokio::time::timeout(SECONDARY_TIMEOUT * 2, session.close(host)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => result.failures.push(failure(
+            flow,
+            browser_error_category(host),
+            error.to_string(),
+            None,
+        )),
+        Err(_) => result.failures.push(failure(
+            flow,
+            FailureCategory::Protocol,
+            "dispose browser context timed out",
+            None,
+        )),
+    }
+    if !result.failures.is_empty() && result.status == FlowStatus::Passed {
+        result.status = FlowStatus::Failed;
+    }
+    result
+}
+
+async fn execute_flow(
+    host: &BrowserHost,
+    session: &mut SessionRuntime,
+    flow: &CompiledFlow,
+    options: &RunOptions,
+) -> FlowReport {
+    let started = Instant::now();
+    let mut artifacts = ArtifactPaths {
+        directory: path_text(&options.artifact_directory),
+        ..ArtifactPaths::default()
     };
+    if is_cancelled(options.cancellation.as_ref()) {
+        return report(flow, started, artifacts, Vec::new(), true);
+    }
+    let context_id = session
+        .context
+        .as_ref()
+        .expect("open session context")
+        .id()
+        .clone();
+    let placeholder = ActiveContext::new(session.active.page.clone());
+    let mut active = std::mem::replace(&mut session.active, placeholder);
+    let page = active.page.clone();
 
     let mut primary = None;
+    let mut redactor = std::mem::take(&mut session.redactor);
+    redactor.extend(&flow.redactor);
     let mut runtime = RuntimeState {
-        outputs: BTreeMap::new(),
-        redactor: flow.redactor.clone(),
-        page_settings,
+        outputs: std::mem::take(&mut session.outputs),
+        redactor,
+        page_settings: session.page_settings,
         guard_results: BTreeMap::new(),
         stopped_loops: BTreeSet::new(),
     };
@@ -530,7 +699,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                     tokio::time::Instant::from_std(deadline),
                     execute_step(
                         host,
-                        context.id(),
+                        &context_id,
                         &mut active,
                         step,
                         deadline,
@@ -605,23 +774,6 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                 .map(|path| path_text(&path));
     }
 
-    let _ = tokio::time::timeout(SECONDARY_TIMEOUT, router.close()).await;
-    match tokio::time::timeout(SECONDARY_TIMEOUT, host.dispose_context(context)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => failures.push(failure(
-            flow,
-            browser_error_category(host),
-            error.to_string(),
-            None,
-        )),
-        Err(_) => failures.push(failure(
-            flow,
-            FailureCategory::Protocol,
-            "dispose browser context timed out",
-            None,
-        )),
-    }
-
     if manual_recording
         && flow.settings.video == VideoMode::RetainOnFailure
         && failures.is_empty()
@@ -638,6 +790,9 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         ));
     }
 
+    session.active = active;
+    session.outputs = runtime.outputs;
+    session.redactor = runtime.redactor;
     report(flow, started, artifacts, failures, interrupted)
 }
 

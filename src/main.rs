@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use playrust::browser::BrowserHost;
 use playrust::flow::{
@@ -19,6 +19,7 @@ use playrust::report::{
     write_html_report, write_junit_report,
 };
 use playrust::runner::{CancellationToken, RunOptions, run_flow};
+use playrust::session_protocol::{self, SessionOptions};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
 
 const DEFAULT_ARTIFACTS: &str = "playrust-artifacts";
@@ -37,6 +38,8 @@ enum Command {
     Check(CheckArgs),
     /// Run flows in Chromium.
     Run(RunArgs),
+    /// Keep one isolated browser session open and accept foreground commands.
+    Session(SessionArgs),
     /// Manage the pinned Chrome for Testing installation.
     Browser(BrowserArgs),
 }
@@ -81,6 +84,30 @@ struct RunArgs {
     /// Write an HTML report to <artifacts>/report.html.
     #[arg(long)]
     html: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionArgs {
+    /// Machine protocol spoken over stdin/stdout.
+    #[arg(long, value_enum)]
+    protocol: SessionProtocol,
+    /// Show the Chromium window.
+    #[arg(long)]
+    headed: bool,
+    /// Path to the pinned Chrome for Testing executable.
+    #[arg(long)]
+    browser: Option<PathBuf>,
+    /// Path to FFmpeg when inline submissions enable video.
+    #[arg(long)]
+    ffmpeg_path: Option<PathBuf>,
+    /// Root directory for session artifacts.
+    #[arg(long, default_value = DEFAULT_ARTIFACTS)]
+    artifacts: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SessionProtocol {
+    Ndjson,
 }
 
 #[derive(Debug, Args)]
@@ -134,6 +161,7 @@ async fn main() {
     let exit_code = match Cli::parse().command {
         Command::Check(args) => check(args),
         Command::Run(args) => run(args).await,
+        Command::Session(args) => session(args).await,
         Command::Browser(BrowserArgs {
             command: BrowserCommand::Install,
         }) => match install_browser().await {
@@ -151,6 +179,27 @@ async fn main() {
         },
     };
     std::process::exit(exit_code.as_i32());
+}
+
+async fn session(args: SessionArgs) -> ExitCode {
+    let browser = match resolve_or_install_browser(args.browser.as_deref()).await {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::Infrastructure;
+        }
+    };
+    match args.protocol {
+        SessionProtocol::Ndjson => {
+            session_protocol::run(SessionOptions {
+                browser,
+                headed: args.headed,
+                artifacts: args.artifacts,
+                ffmpeg_path: args.ffmpeg_path,
+            })
+            .await
+        }
+    }
 }
 
 fn check(args: CheckArgs) -> ExitCode {

@@ -43,9 +43,33 @@ playrust check <path> [--var NAME=VALUE]
 playrust run <path> [--headed] [--jobs N] [--browser PATH]
                     [--var NAME=VALUE] [--video MODE]
                     [--ffmpeg-path PATH] [--artifacts DIR] [--junit] [--html]
+playrust session --protocol ndjson [--headed] [--browser PATH]
+                    [--ffmpeg-path PATH] [--artifacts DIR]
 ```
 
 `run` defaults to headless mode, retained video recording, up to four concurrent flows, and `./playrust-artifacts`. Use `--video off` to disable recording or `--jobs 1` for sequential execution. Exit codes are `0` for success, `2` for invalid input/specification, `3` for an automation or assertion failure, `4` for infrastructure/recording failure, and `130` when interrupted.
+
+## Persistent sessions
+
+`playrust session --protocol ndjson` keeps one isolated Chromium context open in the foreground. It reads one JSON command per stdin line and writes one JSON response per stdout line; diagnostics go only to stderr. Every response contains the command `id`, `ok`, stable `session_id`, monotonically increasing `revision`, and either `result` or a structured `error`.
+
+Commands use these forms:
+
+```json
+{"id":"1","command":"submit","flow":"version: 1\nname: open\nsettings: { video: off }\nsteps: [{ open: https://example.com }]\n","variables":{}}
+{"id":"2","command":"inspect","accessibility":true,"screenshot":true}
+{"id":"3","command":"output","name":"saved_value"}
+{"id":"4","command":"cancel"}
+{"id":"5","command":"close"}
+```
+
+`submit` accepts one complete inline YAML V1 flow. Browser storage, tabs, active tab/frame, page JavaScript state, and saved runtime outputs persist into later submissions. Guards, loop state, retries, recording, and artifacts are new for each submission. The first valid submission fixes viewport and geolocation; a later conflict is rejected before execution. A later flow may consume an earlier saved output with `${name}`, and `output` explicitly returns its JSON value.
+
+Only one submission mutates the session at a time. While it runs, `cancel` and `close` are accepted; other commands return `busy`. Validation and ordinary automation failures leave the session available. Cancellation, malformed protocol input, browser/protocol failures, recording failures, and inspection failures close it conservatively. Accessibility inspection is bounded to depth 8, 500 nodes, and 256 KiB; page listings are bounded to 100. An optional inspection screenshot returns its artifact path rather than embedding image bytes.
+
+Session artifacts are written under `<artifacts>/session-<id>/`, with separate `submission-NNNNNN/` and `inspection-NNNNNN/` directories. The session-level `report.json` is atomically replaced after every completed submission and aggregates all submission reports.
+
+The first session slice accepts inline flows only. `run` subflows and screenshot assertions with workspace baseline files are explicitly rejected. Other filesystem-backed flow discovery remains available through `playrust run`.
 
 ## YAML V1
 

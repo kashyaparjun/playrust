@@ -1,9 +1,11 @@
 pub mod browser;
+pub mod browser_session;
 pub mod flow;
 pub mod install;
 pub mod locator;
 mod oopif;
 pub mod report;
 pub mod runner;
+pub mod session_protocol;
 pub mod video;
 pub mod visual;

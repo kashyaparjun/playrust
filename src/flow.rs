@@ -117,7 +117,7 @@ impl Redactor {
         self.secrets.is_empty()
     }
 
-    fn extend(&mut self, other: &Self) {
+    pub(crate) fn extend(&mut self, other: &Self) {
         self.secrets.extend(other.secrets.iter().cloned());
         self.secrets
             .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
@@ -945,6 +945,50 @@ pub fn compile_yaml(
     compile_yaml_with_env(source, source_path, cli_vars, &environment)
 }
 
+pub fn compile_inline_yaml(
+    source: &str,
+    source_path: impl Into<PathBuf>,
+    cli_vars: &BTreeMap<String, String>,
+    available_outputs: &BTreeSet<String>,
+) -> Result<CompiledFlow, FlowError> {
+    let environment = std::env::vars().collect();
+    require_source_size(source.len())?;
+    let raw = parse_yaml(source)?;
+    if let Some((index, _)) = raw
+        .steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| step.run.is_some())
+    {
+        return invalid(format!(
+            "step {} run subflows are unavailable for inline session submissions",
+            index + 1
+        ));
+    }
+    if let Some((index, _)) = raw.steps.iter().enumerate().find(|(_, step)| {
+        step.assertion
+            .as_ref()
+            .is_some_and(|assertion| assertion.screenshot.is_some())
+    }) {
+        return invalid(format!(
+            "step {} visual baselines are unavailable for inline session submissions",
+            index + 1
+        ));
+    }
+    let mut flow = compile_raw_inner(
+        raw,
+        source_path.into(),
+        cli_vars,
+        &environment,
+        &BTreeMap::new(),
+        true,
+        false,
+    )?;
+    validate_expanded_steps_with_outputs(&mut flow.steps, available_outputs)?;
+    validate_page_switching_video(&flow)?;
+    Ok(flow)
+}
+
 pub fn compile_yaml_with_env(
     source: &str,
     source_path: impl Into<PathBuf>,
@@ -1555,9 +1599,19 @@ fn validate_subflow_path(run: &str, source: &Path, index: usize) -> Result<(), F
 }
 
 fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> {
+    validate_expanded_steps_with_outputs(steps, &BTreeSet::new())
+}
+
+fn validate_expanded_steps_with_outputs(
+    steps: &mut [CompiledStep],
+    available_outputs: &BTreeSet<String>,
+) -> Result<(), FlowError> {
     let mut ids = BTreeSet::new();
     let mut screenshots = BTreeSet::new();
-    let mut outputs = BTreeMap::new();
+    let mut outputs = available_outputs
+        .iter()
+        .map(|name| (name.clone(), None))
+        .collect::<BTreeMap<_, Option<(PathBuf, usize)>>>();
     let mut next_guard_id = 0;
     let mut next_loop_id = 0;
     let mut active_guards = Vec::<usize>::new();
@@ -1629,7 +1683,7 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
         }
         if let Some(name) = operation_save_as(&step.operation) {
             let producer = (step.source.clone(), step.source_index);
-            if let Some(existing) = outputs.insert(name.to_owned(), producer.clone())
+            if let Some(Some(existing)) = outputs.insert(name.to_owned(), Some(producer.clone()))
                 && existing != producer
             {
                 return invalid(format!("duplicate runtime output {name:?}"));
@@ -3137,6 +3191,34 @@ mod tests {
 
     fn error(source: &str) -> String {
         compile(source).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn inline_flows_can_consume_prior_outputs_but_not_workspace_files() {
+        let available = BTreeSet::from(["prior".to_owned()]);
+        let flow = compile_inline_yaml(
+            "version: 1\nname: next\nsettings: { video: off }\nsteps:\n  - evaluate: { script: 'return args[0]', args: ['${prior}'], save_as: next }\n",
+            "submission.yaml",
+            &BTreeMap::new(),
+            &available,
+        )
+        .expect("compile with persistent output");
+        assert_eq!(flow.steps.len(), 1);
+
+        for source in [
+            "version: 1\nname: x\nsteps: [{ run: child.subflow.yaml }]\n",
+            "version: 1\nname: x\nsettings: { video: off }\nsteps: [{ assert: { screenshot: { baseline: home.png } } }]\n",
+        ] {
+            assert!(
+                compile_inline_yaml(
+                    source,
+                    "submission.yaml",
+                    &BTreeMap::new(),
+                    &BTreeSet::new()
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
