@@ -25,6 +25,10 @@ pub const MAX_SUBFLOW_DEPTH: usize = 32;
 pub const MAX_SCALAR_BYTES: usize = 64 * 1024;
 /// Maximum timeout accepted for flow settings or an individual step.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+pub const MAX_GESTURE_DELTA: i32 = 10_000;
+pub const MAX_GESTURE_DURATION: Duration = Duration::from_secs(10);
+pub const DEFAULT_SWIPE_DURATION: Duration = Duration::from_millis(300);
+pub const DEFAULT_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
 pub enum FlowError {
@@ -187,6 +191,11 @@ pub struct RawStep {
     pub erase: Option<RawTargetAction>,
     pub select: Option<RawSelect>,
     pub scroll: Option<RawScroll>,
+    pub scroll_until_visible: Option<RawScrollUntilVisible>,
+    pub swipe: Option<RawSwipe>,
+    pub long_press: Option<RawLongPress>,
+    pub wait_until_visible: Option<RawTargetAction>,
+    pub wait_until_stable: Option<RawTargetAction>,
     pub back: Option<RawEmpty>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
@@ -238,6 +247,34 @@ pub struct RawScroll {
     pub x: i64,
     #[serde(default)]
     pub y: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawScrollUntilVisible {
+    pub target: RawLocator,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSwipe {
+    pub target: RawLocator,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    pub duration: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawLongPress {
+    pub target: RawLocator,
+    pub duration: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -405,6 +442,27 @@ pub enum Operation {
     Scroll {
         x: i64,
         y: i64,
+    },
+    ScrollUntilVisible {
+        target: Locator,
+        x: i32,
+        y: i32,
+    },
+    Swipe {
+        target: Locator,
+        x: i32,
+        y: i32,
+        duration: Duration,
+    },
+    LongPress {
+        target: Locator,
+        duration: Duration,
+    },
+    WaitUntilVisible {
+        target: Locator,
+    },
+    WaitUntilStable {
+        target: Locator,
     },
     Back,
     Press {
@@ -827,6 +885,15 @@ fn compile_raw_expanded(
                 step.click.is_some(),
                 step.double_click.is_some(),
                 step.fill.is_some(),
+                step.erase.is_some(),
+                step.select.is_some(),
+                step.scroll.is_some(),
+                step.scroll_until_visible.is_some(),
+                step.swipe.is_some(),
+                step.long_press.is_some(),
+                step.wait_until_visible.is_some(),
+                step.wait_until_stable.is_some(),
+                step.back.is_some(),
                 step.press.is_some(),
                 step.screenshot.is_some(),
                 step.clear.is_some(),
@@ -1121,6 +1188,11 @@ fn compile_operation(
         step.erase.is_some(),
         step.select.is_some(),
         step.scroll.is_some(),
+        step.scroll_until_visible.is_some(),
+        step.swipe.is_some(),
+        step.long_press.is_some(),
+        step.wait_until_visible.is_some(),
+        step.wait_until_stable.is_some(),
         step.back.is_some(),
         step.press.is_some(),
         step.screenshot.is_some(),
@@ -1198,6 +1270,51 @@ fn compile_operation(
         }
         return Ok(Operation::Scroll { x: raw.x, y: raw.y });
     }
+    if let Some(raw) = step.scroll_until_visible {
+        validate_gesture_delta(index, "scroll_until_visible", raw.x, raw.y)?;
+        return Ok(Operation::ScrollUntilVisible {
+            target: compile_locator(raw.target, index, inputs)?,
+            x: raw.x,
+            y: raw.y,
+        });
+    }
+    if let Some(raw) = step.swipe {
+        validate_gesture_delta(index, "swipe", raw.x, raw.y)?;
+        return Ok(Operation::Swipe {
+            target: compile_locator(raw.target, index, inputs)?,
+            x: raw.x,
+            y: raw.y,
+            duration: compile_gesture_duration(
+                index,
+                "swipe",
+                raw.duration.as_deref(),
+                DEFAULT_SWIPE_DURATION,
+                inputs,
+            )?,
+        });
+    }
+    if let Some(raw) = step.long_press {
+        return Ok(Operation::LongPress {
+            target: compile_locator(raw.target, index, inputs)?,
+            duration: compile_gesture_duration(
+                index,
+                "long_press",
+                raw.duration.as_deref(),
+                DEFAULT_LONG_PRESS_DURATION,
+                inputs,
+            )?,
+        });
+    }
+    if let Some(raw) = step.wait_until_visible {
+        return Ok(Operation::WaitUntilVisible {
+            target: compile_locator(raw.target, index, inputs)?,
+        });
+    }
+    if let Some(raw) = step.wait_until_stable {
+        return Ok(Operation::WaitUntilStable {
+            target: compile_locator(raw.target, index, inputs)?,
+        });
+    }
     if step.back.is_some() {
         return Ok(Operation::Back);
     }
@@ -1245,6 +1362,43 @@ fn compile_operation(
         viewport,
         inputs,
     )?))
+}
+
+fn validate_gesture_delta(index: usize, operation: &str, x: i32, y: i32) -> Result<(), FlowError> {
+    if x == 0 && y == 0 {
+        return invalid(format!(
+            "step {index} {operation} requires a non-zero x or y"
+        ));
+    }
+    if x.unsigned_abs() > MAX_GESTURE_DELTA as u32 || y.unsigned_abs() > MAX_GESTURE_DELTA as u32 {
+        return invalid(format!(
+            "step {index} {operation} x and y must be between -{MAX_GESTURE_DELTA} and {MAX_GESTURE_DELTA}"
+        ));
+    }
+    Ok(())
+}
+
+fn compile_gesture_duration(
+    index: usize,
+    operation: &str,
+    raw: Option<&str>,
+    default: Duration,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<Duration, FlowError> {
+    let context = format!("step {index} {operation}.duration");
+    let duration = raw
+        .map(|value| interpolate(&context, value, inputs))
+        .transpose()?
+        .map(|value| parse_duration(&context, value.expose()))
+        .transpose()?
+        .unwrap_or(default);
+    if duration > MAX_GESTURE_DURATION {
+        return invalid(format!(
+            "{context} must not exceed {} seconds",
+            MAX_GESTURE_DURATION.as_secs()
+        ));
+    }
+    Ok(duration)
 }
 
 fn validate_screenshot_name(index: usize, name: &str) -> Result<(), FlowError> {
@@ -2057,6 +2211,66 @@ steps:
             ),
         ] {
             assert!(error(source).contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn compiles_advanced_interactions_and_waits_with_bounded_defaults() {
+        let flow = compile(
+            "version: 1\nname: advanced\nsteps:\n  - scroll_until_visible: { target: { text: Last }, y: 400 }\n  - swipe: { target: { css: .card }, x: -120 }\n  - long_press: { target: { test_id: menu }, duration: 750ms }\n  - timeout: 30s\n    wait_until_visible: { target: { css: .late } }\n  - wait_until_stable: { target: { css: .animated } }\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            flow.steps[0].operation,
+            Operation::ScrollUntilVisible { x: 0, y: 400, .. }
+        ));
+        assert!(matches!(
+            flow.steps[1].operation,
+            Operation::Swipe {
+                x: -120,
+                y: 0,
+                duration: DEFAULT_SWIPE_DURATION,
+                ..
+            }
+        ));
+        assert!(matches!(
+            flow.steps[2].operation,
+            Operation::LongPress { duration, .. } if duration == Duration::from_millis(750)
+        ));
+        assert_eq!(flow.steps[3].timeout, Duration::from_secs(30));
+        assert!(matches!(
+            flow.steps[3].operation,
+            Operation::WaitUntilVisible { .. }
+        ));
+        assert!(matches!(
+            flow.steps[4].operation,
+            Operation::WaitUntilStable { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_unbounded_or_empty_advanced_gestures() {
+        for (step, expected) in [
+            (
+                "scroll_until_visible: { target: { css: x } }",
+                "non-zero x or y",
+            ),
+            (
+                "swipe: { target: { css: x }, x: 10001 }",
+                "between -10000 and 10000",
+            ),
+            (
+                "long_press: { target: { css: x }, duration: 11s }",
+                "must not exceed 10 seconds",
+            ),
+            (
+                "swipe: { target: { css: x }, y: 1, duration: 0ms }",
+                "outside the supported range",
+            ),
+        ] {
+            let source = format!("version: 1\nname: x\nsteps:\n  - {step}\n");
+            assert!(error(&source).contains(expected), "accepted {step}");
         }
     }
 

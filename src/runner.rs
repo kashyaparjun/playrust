@@ -423,6 +423,38 @@ async fn execute_step(
                 .map(|_| None)
         }
         Operation::Scroll { x, y } => dispatch_scroll(page, *x, *y).await.map(|_| None),
+        Operation::ScrollUntilVisible { target, x, y } => {
+            scroll_until_visible(page, target, *x, *y, deadline)
+                .await
+                .map(|_| None)
+        }
+        Operation::Swipe {
+            target,
+            x,
+            y,
+            duration,
+        } => {
+            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            dispatch_swipe(page, &element, *x, *y, *duration, deadline)
+                .await
+                .map(|_| None)
+        }
+        Operation::LongPress { target, duration } => {
+            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            dispatch_long_press(page, &element, *duration, deadline)
+                .await
+                .map(|_| None)
+        }
+        Operation::WaitUntilVisible { target } => {
+            wait_actionable(page, target, Actionability::VISIBLE, deadline)
+                .await
+                .map(|_| None)
+        }
+        Operation::WaitUntilStable { target } => {
+            wait_actionable(page, target, Actionability::STABLE, deadline)
+                .await
+                .map(|_| None)
+        }
         Operation::Back => navigate_back(page, deadline).await.map(|_| None),
         Operation::Press {
             target,
@@ -671,6 +703,140 @@ async fn dispatch_scroll(page: &Page, x: i64, y: i64) -> Result<(), StepError> {
         .build()
         .expect("all mandatory wheel event fields are set");
     page.execute(event).await.map_err(protocol)?;
+    Ok(())
+}
+
+async fn scroll_until_visible(
+    page: &Page,
+    target: &Locator,
+    x: i32,
+    y: i32,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    let engine = LocatorEngine::new(page);
+    loop {
+        let observation = match engine.observe_unique(target, Actionability::VISIBLE).await {
+            Ok(Observation::Ready(_)) => return Ok(()),
+            Ok(observation) => observation,
+            Err(error) if retryable(&error) => Observation::Unavailable {
+                message: error.to_string(),
+            },
+            Err(error) => return Err(locator_error(error)),
+        };
+        if Instant::now() >= deadline {
+            return Err(StepError::new(
+                FailureCategory::Timeout,
+                "scroll_until_visible deadline expired",
+            )
+            .deadline()
+            .observed(observation.to_string()));
+        }
+        dispatch_scroll(page, i64::from(x), i64::from(y)).await?;
+        sleep_until_poll(deadline).await;
+    }
+}
+
+async fn dispatch_swipe(
+    page: &Page,
+    element: &ResolvedElement,
+    x: i32,
+    y: i32,
+    duration: Duration,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    let end_x = element.center.x + f64::from(x);
+    let end_y = element.center.y + f64::from(y);
+    let [width, height]: [f64; 2] = page
+        .evaluate("[innerWidth, innerHeight]")
+        .await
+        .map_err(protocol)?
+        .into_value()
+        .map_err(protocol)?;
+    if end_x < 0.0 || end_y < 0.0 || end_x >= width || end_y >= height {
+        return Err(StepError::new(
+            FailureCategory::Actionability,
+            "swipe endpoint is outside the viewport",
+        ));
+    }
+    require_gesture_time(duration, deadline, "swipe")?;
+    dispatch_pointer(
+        page,
+        DispatchMouseEventType::MousePressed,
+        element.center.x,
+        element.center.y,
+        1,
+    )
+    .await?;
+    tokio::time::sleep(duration).await;
+    let moved = dispatch_pointer(page, DispatchMouseEventType::MouseMoved, end_x, end_y, 1).await;
+    let released =
+        dispatch_pointer(page, DispatchMouseEventType::MouseReleased, end_x, end_y, 0).await;
+    moved.and(released)
+}
+
+async fn dispatch_long_press(
+    page: &Page,
+    element: &ResolvedElement,
+    duration: Duration,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    require_gesture_time(duration, deadline, "long_press")?;
+    dispatch_pointer(
+        page,
+        DispatchMouseEventType::MousePressed,
+        element.center.x,
+        element.center.y,
+        1,
+    )
+    .await?;
+    tokio::time::sleep(duration).await;
+    dispatch_pointer(
+        page,
+        DispatchMouseEventType::MouseReleased,
+        element.center.x,
+        element.center.y,
+        0,
+    )
+    .await
+}
+
+fn require_gesture_time(
+    duration: Duration,
+    deadline: Instant,
+    operation: &str,
+) -> Result<(), StepError> {
+    if Instant::now()
+        .checked_add(duration)
+        .is_none_or(|finished| finished >= deadline)
+    {
+        return Err(StepError::new(
+            FailureCategory::Timeout,
+            format!("{operation} duration exceeds the remaining step deadline"),
+        )
+        .deadline());
+    }
+    Ok(())
+}
+
+async fn dispatch_pointer(
+    page: &Page,
+    event_type: DispatchMouseEventType,
+    x: f64,
+    y: f64,
+    buttons: i64,
+) -> Result<(), StepError> {
+    page.execute(
+        DispatchMouseEventParams::builder()
+            .r#type(event_type)
+            .x(x)
+            .y(y)
+            .button(MouseButton::Left)
+            .buttons(buttons)
+            .build()
+            .expect("all mandatory pointer event fields are set"),
+    )
+    .await
+    .map_err(protocol)?;
     Ok(())
 }
 
@@ -1469,6 +1635,11 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Erase { .. } => "erase",
         Operation::Select { .. } => "select",
         Operation::Scroll { .. } => "scroll",
+        Operation::ScrollUntilVisible { .. } => "scroll_until_visible",
+        Operation::Swipe { .. } => "swipe",
+        Operation::LongPress { .. } => "long_press",
+        Operation::WaitUntilVisible { .. } => "wait_until_visible",
+        Operation::WaitUntilStable { .. } => "wait_until_stable",
         Operation::Back => "back",
         Operation::Press { .. } => "press",
         Operation::Screenshot { .. } => "screenshot",
@@ -1489,6 +1660,11 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::Fill { target, .. }
         | Operation::Erase { target }
         | Operation::Select { target, .. }
+        | Operation::ScrollUntilVisible { target, .. }
+        | Operation::Swipe { target, .. }
+        | Operation::LongPress { target, .. }
+        | Operation::WaitUntilVisible { target }
+        | Operation::WaitUntilStable { target }
         | Operation::Press { target, .. }
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
@@ -1812,7 +1988,7 @@ mod tests {
     #[test]
     fn interaction_step_contexts_include_only_targeted_locators() {
         let flow = compile_yaml_with_env(
-            "version: 1\nname: x\nsteps:\n  - erase: { target: { css: input } }\n  - select: { target: { css: select }, value: x }\n  - scroll: { y: 1 }\n  - back: {}\n",
+            "version: 1\nname: x\nsteps:\n  - erase: { target: { css: input } }\n  - select: { target: { css: select }, value: x }\n  - scroll: { y: 1 }\n  - scroll_until_visible: { target: { css: .item }, y: 100 }\n  - swipe: { target: { css: .card }, x: 1 }\n  - long_press: { target: { css: button } }\n  - wait_until_visible: { target: { css: .late } }\n  - wait_until_stable: { target: { css: .moving } }\n  - back: {}\n",
             "x.yaml",
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1822,7 +1998,16 @@ mod tests {
             (&flow.steps[0], "erase", Some("css=\"input\"")),
             (&flow.steps[1], "select", Some("css=\"select\"")),
             (&flow.steps[2], "scroll", None),
-            (&flow.steps[3], "back", None),
+            (
+                &flow.steps[3],
+                "scroll_until_visible",
+                Some("css=\".item\""),
+            ),
+            (&flow.steps[4], "swipe", Some("css=\".card\"")),
+            (&flow.steps[5], "long_press", Some("css=\"button\"")),
+            (&flow.steps[6], "wait_until_visible", Some("css=\".late\"")),
+            (&flow.steps[7], "wait_until_stable", Some("css=\".moving\"")),
+            (&flow.steps[8], "back", None),
         ] {
             let context = step_context(&flow, step);
             assert_eq!(context.operation, name);

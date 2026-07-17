@@ -89,15 +89,22 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 | Erase | `erase: { target: { label: Search } }` |
 | Select option | `select: { target: { label: Region }, value: us-east }` |
 | Scroll viewport | `scroll: { x: 0, y: 600 }` |
+| Scroll until visible | `scroll_until_visible: { target: { text: "Last item" }, y: 400 }` |
+| Swipe from target | `swipe: { target: { test_id: card }, x: -240, duration: 300ms }` |
+| Long press | `long_press: { target: { test_id: menu }, duration: 500ms }` |
+| Wait until visible | `wait_until_visible: { target: { css: .late } }` |
+| Wait until stable | `wait_until_stable: { target: { css: .animated } }` |
 | Navigate back | `back: {}` |
 | Press | `press: { target: { label: Search }, key: Enter, modifiers: [Control] }` |
 | Screenshot | `screenshot: { name: dashboard }` |
 | Clear cookies | `clear: cookies` |
 | Clear storage | `clear: storage` |
 
-Click, double click, fill, erase, select, and press wait for one unique, visible, stable, enabled, uncovered target; fill and erase also require an editable target. Erase supports the same text inputs, textareas, and content-editable elements as fill. Select accepts an option value (including an empty value) on a native, non-`multiple` `<select>` and dispatches one bubbling `input` event followed by one `change` event. Input actions are not retried after pointer, keyboard, wheel, or form event dispatch begins.
+Click, double click, fill, erase, select, swipe, long press, and press wait for one unique, visible, stable, enabled, uncovered target; fill and erase also require an editable target. Erase supports the same text inputs, textareas, and content-editable elements as fill. Select accepts an option value (including an empty value) on a native, non-`multiple` `<select>` and dispatches one bubbling `input` event followed by one `change` event. Swipe and long press dispatch one mouse gesture after actionability succeeds; an input sequence is never retried after its first event.
 
-Scroll sends one wheel input at the viewport center; positive values move right/down and negative values move left/up, and at least one axis must be non-zero. Back navigates one browser-history entry and fails when there is no previous entry. Both use the step timeout and normal cancellation/error reporting. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
+Scroll sends one wheel input at the viewport center; positive values move right/down and negative values move left/up, and at least one axis must be non-zero. `scroll_until_visible` repeats one bounded wheel delta until its unique target is visible or the step deadline expires, allowing a target that is initially absent from a virtualized list. Its `x` and `y` values, and swipe offsets, are limited to `-10000..=10000` CSS pixels and cannot both be zero. A swipe endpoint must remain inside the viewport. Swipe defaults to `300ms`; long press defaults to `500ms`; either duration must be positive and at most `10s`, and must fit within the remaining step deadline.
+
+`wait_until_visible` is the explicit positive visibility wait; set a longer step `timeout` when the normal flow timeout is too short. `wait_until_stable` waits for a unique visible target whose bounding box is unchanged across two polling samples. Both use the same locator polling and deadline diagnostics as actionability. Back navigates one browser-history entry and fails when there is no previous entry. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
 
 Screenshots are PNG files written atomically to the flow artifact directory as `<name>.png`. Names may contain 1-64 ASCII letters, numbers, `-`, or `_`, must start and end with a letter or number, cannot be `failure` or a Windows-reserved filename, cannot contain secrets, and must be case-insensitively unique within a flow. An optional crop uses viewport-relative CSS pixels and must fit within the configured viewport:
 

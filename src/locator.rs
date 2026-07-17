@@ -143,6 +143,12 @@ impl Actionability {
         hit_test: true,
     };
 
+    pub const STABLE: Self = Self {
+        visible: true,
+        stable: true,
+        ..Self::ATTACHED
+    };
+
     pub const EDITABLE: Self = Self {
         editable: true,
         ..Self::CLICK
