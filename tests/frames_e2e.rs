@@ -103,3 +103,30 @@ async fn cross_origin_oopif_is_explicitly_rejected() {
         report.failures
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn back_inside_frame_is_explicitly_rejected() {
+    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let server = FixtureServer::start(&[("/", "text/html", ROOT), ("/child", "text/html", CHILD)]);
+    let source = format!(
+        "version: 1\nname: frame-back\nbase_url: http://{}\nsettings: {{ video: off }}\nsteps:\n  - open: /\n  - switch_frame: {{ target: {{ css: '#child' }} }}\n  - back: {{}}\n",
+        server.address
+    );
+    let flow = compile_yaml(&source, "frame-back.yaml", &BTreeMap::new()).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let host = BrowserHost::launch(&chrome, false).await.unwrap();
+
+    let report = run_flow(&host, &flow, &RunOptions::new(artifacts.path())).await;
+    host.shutdown().await.unwrap();
+
+    assert_eq!(report.status, FlowStatus::Failed);
+    assert!(
+        report.failures[0]
+            .message
+            .as_str()
+            .contains("back navigation is unsupported inside a frame"),
+        "{:#?}",
+        report.failures
+    );
+}

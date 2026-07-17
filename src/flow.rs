@@ -521,6 +521,7 @@ pub struct CompiledFlow {
     pub settings: FlowSettings,
     pub inputs: BTreeMap<String, Resolved<String>>,
     pub steps: Vec<CompiledStep>,
+    pub manual_recording: bool,
     pub redactor: Redactor,
 }
 
@@ -981,6 +982,7 @@ fn compile_raw_inner(
         return invalid(format!("steps must not exceed {MAX_FLOW_STEPS}"));
     }
 
+    let manual_recording = raw.steps.iter().any(|step| step.recording.is_some());
     let inputs = resolve_inputs(
         &raw.vars,
         &raw.secrets,
@@ -1141,6 +1143,7 @@ fn compile_raw_inner(
         settings,
         inputs,
         steps,
+        manual_recording,
         redactor,
     })
 }
@@ -1313,6 +1316,7 @@ fn compile_raw_expanded(
             state.active.pop();
             let child = child?;
             flow.redactor.extend(&child.redactor);
+            flow.manual_recording |= child.manual_recording;
             if *retries > 0
                 && child
                     .steps
@@ -3101,6 +3105,21 @@ steps:
             let source = format!("version: 1\nname: recording\nsteps:\n{steps}");
             assert!(error(&source).contains(expected), "accepted {steps:?}");
         }
+    }
+
+    #[test]
+    fn skipped_recording_controls_still_disable_automatic_recording() {
+        let flow = compile(
+            "version: 1\nname: recording\nvars: { mode: disabled }\nsteps:\n  - open: https://x.test\n  - when: { variable: { name: mode, equals: enabled } }\n    recording: start\n  - when: { variable: { name: mode, equals: enabled } }\n    recording: stop\n",
+        )
+        .unwrap();
+
+        assert!(flow.manual_recording);
+        assert!(
+            flow.steps
+                .iter()
+                .all(|step| !matches!(step.operation, Operation::Recording(_)))
+        );
     }
 
     #[test]

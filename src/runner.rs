@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -299,26 +300,27 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut recording_error = None;
     let mut video = None;
-    let manual_recording = flow
-        .steps
-        .iter()
-        .any(|step| matches!(step.operation, Operation::Recording(_)));
+    let manual_recording = flow.manual_recording;
     if !interrupted && !manual_recording {
-        match start_video(&page, flow, options, flow.settings.timeout).await {
-            Ok(VideoStartup::Ready(session)) => {
-                video = session;
-                interrupted = is_cancelled(options.cancellation.as_ref());
-            }
-            Ok(VideoStartup::Cancelled(finish)) => {
-                interrupted = true;
-                if let Some(finish) = finish {
-                    apply_video_finish(finish, &mut artifacts, &mut recording_error);
+        if let Some(deadline) = Instant::now().checked_add(flow.settings.timeout) {
+            match start_video(&page, flow, options, deadline).await {
+                Ok(VideoStartup::Ready(session)) => {
+                    video = session;
+                    interrupted = is_cancelled(options.cancellation.as_ref());
+                }
+                Ok(VideoStartup::Cancelled(finish)) => {
+                    interrupted = true;
+                    if let Some(finish) = finish {
+                        apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                    }
+                }
+                Err(error) => {
+                    recording_error = Some(error);
+                    interrupted = is_cancelled(options.cancellation.as_ref());
                 }
             }
-            Err(error) => {
-                recording_error = Some(error);
-                interrupted = is_cancelled(options.cancellation.as_ref());
-            }
+        } else {
+            recording_error = Some("recording timeout is too large".to_owned());
         }
     }
 
@@ -381,7 +383,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             }
             match control {
                 RecordingControl::Start => {
-                    match start_video(&active.page, flow, options, step.timeout).await {
+                    match start_video(&active.page, flow, options, deadline).await {
                         Ok(VideoStartup::Ready(session)) => video = session,
                         Ok(VideoStartup::Cancelled(finish)) => {
                             interrupted = true;
@@ -672,6 +674,10 @@ async fn execute_step(
                 .await
                 .map(|_| None)
         }
+        Operation::Back if active.frame().is_some() => Err(StepError::new(
+            FailureCategory::Navigation,
+            "back navigation is unsupported inside a frame; switch_frame to main first",
+        )),
         Operation::Back => navigate_back(&active.page, deadline).await.map(|_| None),
         Operation::SwitchPage(page) => switch_page(
             host,
@@ -2132,7 +2138,7 @@ async fn start_video(
     page: &Page,
     flow: &CompiledFlow,
     options: &RunOptions,
-    first_frame_timeout: Duration,
+    deadline: Instant,
 ) -> Result<VideoStartup, String> {
     if is_cancelled(options.cancellation.as_ref()) {
         return Ok(VideoStartup::Cancelled(None));
@@ -2144,12 +2150,18 @@ async fn start_video(
         .ffmpeg_path
         .as_ref()
         .ok_or_else(|| "video is enabled but no FFmpeg path was provided".to_owned())?;
-    tokio::fs::create_dir_all(&options.artifact_directory)
-        .await
-        .map_err(|error| format!("create artifact directory: {error}"))?;
-    if is_cancelled(options.cancellation.as_ref()) {
-        return Ok(VideoStartup::Cancelled(None));
-    }
+    let result = match await_video_start(
+        options.cancellation.as_ref(),
+        deadline,
+        tokio::fs::create_dir_all(&options.artifact_directory),
+    )
+    .await
+    {
+        VideoStartAwait::Ready(result) => result,
+        VideoStartAwait::Cancelled => return Ok(VideoStartup::Cancelled(None)),
+        VideoStartAwait::Deadline => return Err("recording start deadline expired".to_owned()),
+    };
+    result.map_err(|error| format!("create artifact directory: {error}"))?;
     let config = VideoConfig {
         mode: flow.settings.video,
         ffmpeg_path: ffmpeg_path.clone(),
@@ -2158,42 +2170,79 @@ async fn start_video(
         viewport_height: flow.settings.viewport.height,
     };
     let partial_path = config.partial_path();
-    let mut events = page
-        .event_listener::<EventScreencastFrame>()
-        .await
-        .map_err(|error| error.to_string())?;
-    if is_cancelled(options.cancellation.as_ref()) {
-        return Ok(VideoStartup::Cancelled(None));
-    }
-    if let Err(error) = page
-        .execute(
-            StartScreencastParams::builder()
-                .format(StartScreencastFormat::Jpeg)
-                .quality(80)
-                .max_width(i64::from(flow.settings.viewport.width))
-                .max_height(i64::from(flow.settings.viewport.height))
-                .every_nth_frame(1)
-                .build(),
-        )
-        .await
+    let events = match await_video_start(
+        options.cancellation.as_ref(),
+        deadline,
+        page.event_listener::<EventScreencastFrame>(),
+    )
+    .await
     {
+        VideoStartAwait::Ready(events) => events,
+        VideoStartAwait::Cancelled => return Ok(VideoStartup::Cancelled(None)),
+        VideoStartAwait::Deadline => return Err("recording start deadline expired".to_owned()),
+    };
+    let mut events = events.map_err(|error| error.to_string())?;
+    let command = page.execute(
+        StartScreencastParams::builder()
+            .format(StartScreencastFormat::Jpeg)
+            .quality(80)
+            .max_width(i64::from(flow.settings.viewport.width))
+            .max_height(i64::from(flow.settings.viewport.height))
+            .every_nth_frame(1)
+            .build(),
+    );
+    let started = match await_video_start(options.cancellation.as_ref(), deadline, command).await {
+        VideoStartAwait::Ready(started) => started,
+        VideoStartAwait::Cancelled => {
+            let cleanup = stop_screencast(page).await.map(|error| {
+                Err(VideoFinishError::Complete {
+                    error,
+                    partial: partial_path,
+                    recording: None,
+                })
+            });
+            return Ok(VideoStartup::Cancelled(cleanup));
+        }
+        VideoStartAwait::Deadline => {
+            return Err(video_start_cleanup_error(
+                "recording start deadline expired",
+                stop_screencast(page).await,
+            ));
+        }
+    };
+    if let Err(error) = started {
         let cleanup = stop_screencast(page).await;
         return Err(match cleanup {
             Some(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
             None => error.to_string(),
         });
     }
-    if is_cancelled(options.cancellation.as_ref()) {
-        let cleanup = stop_screencast(page).await.map(|error| {
-            Err(VideoFinishError::Complete {
-                error,
-                partial: partial_path,
-                recording: None,
-            })
-        });
-        return Ok(VideoStartup::Cancelled(cleanup));
-    }
-    let recorder = match VideoRecorder::start(&config).await {
+    let recorder = match await_video_start(
+        options.cancellation.as_ref(),
+        deadline,
+        VideoRecorder::start(&config),
+    )
+    .await
+    {
+        VideoStartAwait::Ready(recorder) => recorder,
+        VideoStartAwait::Cancelled => {
+            let cleanup = stop_screencast(page).await.map(|error| {
+                Err(VideoFinishError::Complete {
+                    error,
+                    partial: partial_path,
+                    recording: None,
+                })
+            });
+            return Ok(VideoStartup::Cancelled(cleanup));
+        }
+        VideoStartAwait::Deadline => {
+            return Err(video_start_cleanup_error(
+                "recording start deadline expired",
+                stop_screencast(page).await,
+            ));
+        }
+    };
+    let recorder = match recorder {
         Ok(recorder) => recorder,
         Err(error) => {
             let cleanup = stop_screencast(page).await;
@@ -2237,23 +2286,29 @@ async fn start_video(
         task,
         partial_path,
     };
-    let first_frame = tokio::select! {
-        biased;
-        _ = wait_for_cancellation(options.cancellation.as_ref()) => None,
-        result = tokio::time::timeout(first_frame_timeout, first_frame_rx) => Some(result),
-    };
-    let Some(first_frame) = first_frame else {
-        return Ok(VideoStartup::Cancelled(Some(
-            session.finish(page, true, Instant::now()).await,
-        )));
-    };
+    let first_frame =
+        match await_video_start(options.cancellation.as_ref(), deadline, first_frame_rx).await {
+            VideoStartAwait::Ready(first_frame) => first_frame,
+            VideoStartAwait::Cancelled => {
+                return Ok(VideoStartup::Cancelled(Some(
+                    session.finish(page, true, Instant::now()).await,
+                )));
+            }
+            VideoStartAwait::Deadline => {
+                let cleanup = session
+                    .finish(page, true, Instant::now())
+                    .await
+                    .err()
+                    .map(|VideoFinishError::Complete { error, .. }| error);
+                return Err(video_start_cleanup_error(
+                    "recording start deadline expired",
+                    cleanup,
+                ));
+            }
+        };
     let first_frame_error = match first_frame {
-        Ok(Ok(())) => return Ok(VideoStartup::Ready(Some(session))),
-        Ok(Err(_)) => "screencast ended before the first frame".to_owned(),
-        Err(_) => format!(
-            "timed out after {} ms waiting for the first screencast frame",
-            duration_ms(first_frame_timeout)
-        ),
+        Ok(()) => return Ok(VideoStartup::Ready(Some(session))),
+        Err(_) => "screencast ended before the first frame".to_owned(),
     };
     let cleanup_error = session
         .finish(page, true, Instant::now())
@@ -2264,6 +2319,36 @@ async fn start_video(
         Some(cleanup) => format!("{first_frame_error}; cleanup failed: {cleanup}"),
         None => first_frame_error,
     })
+}
+
+enum VideoStartAwait<T> {
+    Ready(T),
+    Cancelled,
+    Deadline,
+}
+
+async fn await_video_start<T>(
+    cancellation: Option<&CancellationToken>,
+    deadline: Instant,
+    future: impl Future<Output = T>,
+) -> VideoStartAwait<T> {
+    tokio::select! {
+        biased;
+        _ = wait_for_cancellation(cancellation) => VideoStartAwait::Cancelled,
+        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future) => {
+            match result {
+                Ok(result) => VideoStartAwait::Ready(result),
+                Err(_) => VideoStartAwait::Deadline,
+            }
+        }
+    }
+}
+
+fn video_start_cleanup_error(message: &str, cleanup: Option<String>) -> String {
+    cleanup.map_or_else(
+        || message.to_owned(),
+        |cleanup| format!("{message}; cleanup failed: {cleanup}"),
+    )
 }
 
 async fn stop_screencast(page: &Page) -> Option<String> {
@@ -3242,6 +3327,25 @@ steps:
         waiter.await.unwrap();
         token.cancelled().await;
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn video_start_await_obeys_cancellation_and_deadline() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            await_video_start(
+                Some(&cancellation),
+                Instant::now() + Duration::from_secs(1),
+                std::future::pending::<()>(),
+            )
+            .await,
+            VideoStartAwait::Cancelled
+        ));
+        assert!(matches!(
+            await_video_start(None, Instant::now(), std::future::pending::<()>()).await,
+            VideoStartAwait::Deadline
+        ));
     }
 
     #[test]

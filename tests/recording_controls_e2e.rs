@@ -75,6 +75,21 @@ async fn manual_recording_finalizes_on_stop_failure_and_cancellation() {
     }
 
     let source = format!(
+        "version: 1\nname: skipped\nbase_url: {}\nsettings: {{ video: on }}\nvars: {{ mode: disabled }}\nsteps:\n  - open: /\n  - when: {{ variable: {{ name: mode, equals: enabled }} }}\n    recording: start\n  - when: {{ variable: {{ name: mode, equals: enabled }} }}\n    recording: stop\n",
+        server.url
+    );
+    let flow = compile_yaml(&source, "skipped.yaml", &BTreeMap::new()).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let report = run_flow(
+        &host,
+        &flow,
+        &RunOptions::new(artifacts.path()).with_ffmpeg(&ffmpeg),
+    )
+    .await;
+    assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+    assert!(report.artifacts.recording.is_none());
+
+    let source = format!(
         "version: 1\nname: cancelled\nbase_url: {}\nsettings: {{ timeout: 10s, video: retain-on-failure }}\nsteps:\n  - open: /\n  - recording: start\n  - assert: {{ visible: {{ css: '#missing' }} }}\n  - recording: stop\n",
         server.url
     );
