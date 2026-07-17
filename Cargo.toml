@@ -6,6 +6,7 @@ rust-version = "1.89"
 
 [dependencies]
 anyhow = "1"
+async-tungstenite = { version = "0.32", features = ["tokio-runtime"] }
 base64 = "0.22"
 chrome-for-testing = "=0.4.0"
 chrome-for-testing-manager = { version = "=0.12.0", default-features = false }

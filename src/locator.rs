@@ -6,8 +6,8 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxValueNativeSourceType, QueryAxTreeParams,
 };
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, DescribeNodeParams, GetFrameOwnerParams, NodeId, QuerySelectorAllParams,
-    ResolveNodeParams,
+    BackendNodeId, DescribeNodeParams, GetDocumentParams, GetFrameOwnerParams, NodeId,
+    QuerySelectorAllParams, ResolveNodeParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::{FrameId, GetFrameTreeParams};
 use chromiumoxide::cdp::js_protocol::runtime::{
@@ -20,6 +20,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::flow::{Locator, LocatorStrategy, RelationKind, RelativePoint, TextMatch};
+use crate::oopif::CdpTarget;
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -275,17 +276,27 @@ pub enum LocatorError {
 }
 
 pub struct LocatorEngine<'page> {
-    page: &'page Page,
+    target: CdpTarget<'page>,
     frame: Option<&'page FrameId>,
 }
 
 impl<'page> LocatorEngine<'page> {
     pub fn new(page: &'page Page) -> Self {
-        Self { page, frame: None }
+        Self {
+            target: CdpTarget::Root(page),
+            frame: None,
+        }
     }
 
     pub fn in_frame(page: &'page Page, frame: Option<&'page FrameId>) -> Self {
-        Self { page, frame }
+        Self {
+            target: CdpTarget::Root(page),
+            frame,
+        }
+    }
+
+    pub(crate) fn in_target(target: CdpTarget<'page>, frame: Option<&'page FrameId>) -> Self {
+        Self { target, frame }
     }
 
     pub async fn resolve_all(&self, locator: &Locator) -> Result<CandidateSet, LocatorError> {
@@ -512,11 +523,10 @@ impl<'page> LocatorEngine<'page> {
         let expected_frame = match self.frame {
             Some(frame) => frame.clone(),
             None => {
-                self.page
+                self.target
                     .execute(GetFrameTreeParams::default())
                     .await
                     .map_err(protocol)?
-                    .result
                     .frame_tree
                     .frame
                     .id
@@ -532,11 +542,10 @@ impl<'page> LocatorEngine<'page> {
             query = query.accessible_name(name);
         }
         let nodes = self
-            .page
+            .target
             .execute(query.build())
             .await
             .map_err(protocol)?
-            .result
             .nodes;
         let mut matches = Vec::new();
         for node in nodes {
@@ -580,20 +589,18 @@ impl<'page> LocatorEngine<'page> {
     async fn query_selector_all(&self, selector: &str) -> Result<Vec<BackendNodeId>, LocatorError> {
         let root = self.document_root().await?;
         let nodes = self
-            .page
+            .target
             .execute(QuerySelectorAllParams::new(root, selector))
             .await
             .map_err(protocol)?
-            .result
             .node_ids;
         let mut backend_nodes = Vec::with_capacity(nodes.len());
         for node_id in nodes {
             backend_nodes.push(
-                self.page
+                self.target
                     .execute(DescribeNodeParams::builder().node_id(node_id).build())
                     .await
                     .map_err(protocol)?
-                    .result
                     .node
                     .backend_node_id,
             );
@@ -604,21 +611,23 @@ impl<'page> LocatorEngine<'page> {
     async fn document_root(&self) -> Result<NodeId, LocatorError> {
         let Some(frame) = self.frame else {
             return self
-                .page
-                .get_document()
+                .target
+                .execute(GetDocumentParams::default())
                 .await
-                .map(|document| document.node_id)
+                .map(|document| document.root.node_id)
                 .map_err(protocol);
         };
-        self.page.get_document().await.map_err(protocol)?;
+        self.target
+            .execute(GetDocumentParams::default())
+            .await
+            .map_err(protocol)?;
         let owner = self
-            .page
+            .target
             .execute(GetFrameOwnerParams::new(frame.clone()))
             .await
-            .map_err(protocol)?
-            .result;
+            .map_err(protocol)?;
         let node = self
-            .page
+            .target
             .execute(
                 DescribeNodeParams::builder()
                     .backend_node_id(owner.backend_node_id)
@@ -628,7 +637,6 @@ impl<'page> LocatorEngine<'page> {
             )
             .await
             .map_err(protocol)?
-            .result
             .node;
         node.content_document
             .map(|document| document.node_id)
@@ -724,7 +732,7 @@ impl<'page> LocatorEngine<'page> {
         arguments: &[CallArgument],
     ) -> Result<T, LocatorError> {
         let object = self
-            .page
+            .target
             .execute(
                 ResolveNodeParams::builder()
                     .backend_node_id(backend_node_id)
@@ -732,7 +740,6 @@ impl<'page> LocatorEngine<'page> {
             )
             .await
             .map_err(protocol)?
-            .result
             .object;
         let object_id = object.object_id.ok_or_else(|| {
             LocatorError::InvalidResponse("resolved DOM node had no object id".into())
@@ -745,8 +752,11 @@ impl<'page> LocatorEngine<'page> {
             .await_promise(false)
             .build()
             .map_err(LocatorError::InvalidResponse)?;
-        let response = self.page.execute(params).await.map_err(protocol)?.result;
-        let _ = self.page.execute(ReleaseObjectParams::new(object_id)).await;
+        let response = self.target.execute(params).await.map_err(protocol)?;
+        let _ = self
+            .target
+            .execute(ReleaseObjectParams::new(object_id))
+            .await;
         if let Some(exception) = response.exception_details {
             return Err(LocatorError::Protocol(format!(
                 "page function threw: {}",
@@ -779,9 +789,9 @@ impl<'page> LocatorEngine<'page> {
             .await_promise(false)
             .build()
             .map_err(LocatorError::InvalidResponse)?;
-        let response = self.page.execute(params).await.map_err(protocol)?.result;
-        let _ = self.page.execute(ReleaseObjectParams::new(object)).await;
-        let _ = self.page.execute(ReleaseObjectParams::new(related)).await;
+        let response = self.target.execute(params).await.map_err(protocol)?;
+        let _ = self.target.execute(ReleaseObjectParams::new(object)).await;
+        let _ = self.target.execute(ReleaseObjectParams::new(related)).await;
         if let Some(exception) = response.exception_details {
             return Err(LocatorError::Protocol(format!(
                 "page relation function threw: {}",
@@ -798,7 +808,7 @@ impl<'page> LocatorEngine<'page> {
         &self,
         backend_node_id: BackendNodeId,
     ) -> Result<chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId, LocatorError> {
-        self.page
+        self.target
             .execute(
                 ResolveNodeParams::builder()
                     .backend_node_id(backend_node_id)
@@ -806,7 +816,6 @@ impl<'page> LocatorEngine<'page> {
             )
             .await
             .map_err(protocol)?
-            .result
             .object
             .object_id
             .ok_or_else(|| {

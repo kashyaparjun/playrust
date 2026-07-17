@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, DescribeNodeParams, GetFrameOwnerParams, ResolveNodeParams,
+    BackendNodeId, DescribeNodeParams, GetContentQuadsParams, GetFrameOwnerParams,
+    ResolveNodeParams,
 };
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
@@ -26,7 +27,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
 use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
 use chromiumoxide::cdp::js_protocol::runtime::{
-    CallFunctionOnParams, EvaluateParams, ReleaseObjectParams,
+    CallFunctionOnParams, EvaluateParams, ExecutionContextId, ReleaseObjectParams,
 };
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
@@ -47,6 +48,7 @@ use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
     retryable, retryable_cdp_message, text_matches,
 };
+use crate::oopif::{CdpTarget, OopifRouter};
 use crate::report::{
     ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, SafeText, StepContext,
 };
@@ -129,14 +131,16 @@ const CLEAR_INDEXEDDB_EXPRESSION: &str = r#"indexedDB.databases().then(databases
 ))"#;
 const CLEAR_CACHE_STORAGE_EXPRESSION: &str =
     "caches.keys().then(names => Promise.all(names.map(name => caches.delete(name))))";
-const FRAME_OFFSET_FUNCTION: &str = r#"function() {
-    const rect = this.getBoundingClientRect();
-    return [rect.left + this.clientLeft, rect.top + this.clientTop];
-}"#;
+const FRAME_SIZE_FUNCTION: &str = "function() { return [this.clientWidth, this.clientHeight]; }";
 
 struct ActiveContext {
     page: Page,
-    frames: Vec<FrameId>,
+    router: Option<Arc<OopifRouter>>,
+    frames: Vec<ActiveFrame>,
+}
+
+struct ActiveFrame {
+    id: FrameId,
 }
 
 #[derive(Clone, Copy)]
@@ -149,23 +153,75 @@ impl ActiveContext {
     fn new(page: Page) -> Self {
         Self {
             page,
+            router: None,
             frames: Vec::new(),
         }
     }
 
+    fn with_router(page: Page, router: Arc<OopifRouter>) -> Self {
+        let mut active = Self::new(page);
+        active.router = Some(router);
+        active
+    }
+
     fn frame(&self) -> Option<&FrameId> {
-        self.frames.last()
+        self.frames.last().map(|frame| &frame.id)
+    }
+
+    fn oopif_index(&self) -> Option<usize> {
+        let router = self.router.as_deref()?;
+        self.frames
+            .iter()
+            .rposition(|frame| router.has_target(frame.id.as_ref()))
+    }
+
+    fn target(&self) -> CdpTarget<'_> {
+        self.oopif_index()
+            .map_or(CdpTarget::Root(&self.page), |index| {
+                CdpTarget::Oopif(
+                    self.router.as_deref().expect("OOPIF router missing"),
+                    self.frames[index].id.as_ref(),
+                )
+            })
+    }
+
+    fn target_before(&self, frame_index: usize) -> CdpTarget<'_> {
+        self.frames[..frame_index]
+            .iter()
+            .rposition(|frame| {
+                self.router
+                    .as_deref()
+                    .is_some_and(|router| router.has_target(frame.id.as_ref()))
+            })
+            .map_or(CdpTarget::Root(&self.page), |index| {
+                CdpTarget::Oopif(
+                    self.router.as_deref().expect("OOPIF router missing"),
+                    self.frames[index].id.as_ref(),
+                )
+            })
+    }
+
+    fn local_frame(&self) -> Option<&FrameId> {
+        match self.oopif_index() {
+            Some(index) if index + 1 == self.frames.len() => None,
+            _ => self.frame(),
+        }
     }
 
     fn locator(&self) -> LocatorEngine<'_> {
-        LocatorEngine::in_frame(&self.page, self.frame())
+        LocatorEngine::in_target(self.target(), self.local_frame())
     }
 
-    async fn url(&self) -> chromiumoxide::error::Result<Option<String>> {
-        match self.frame() {
-            Some(frame) => self.page.frame_url(frame.clone()).await,
-            None => self.page.url().await,
-        }
+    async fn url(&self) -> anyhow::Result<Option<String>> {
+        let tree = self
+            .target()
+            .execute(GetFrameTreeParams::default())
+            .await?
+            .frame_tree;
+        Ok(match self.local_frame() {
+            Some(frame) => find_frame(&tree, frame).map(|frame| frame.url.clone()),
+            None => Some(tree.frame.url),
+        })
     }
 }
 
@@ -286,7 +342,27 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         }
     };
     let page = context.page().clone();
-    let mut active = ActiveContext::new(page.clone());
+    let router =
+        match OopifRouter::connect(host.browser().websocket_address(), context.id().as_ref()).await
+        {
+            Ok(router) => router,
+            Err(error) => {
+                let _ = host.dispose_context(context).await;
+                return report(
+                    flow,
+                    started,
+                    artifacts,
+                    vec![failure(
+                        flow,
+                        FailureCategory::Protocol,
+                        error.to_string(),
+                        None,
+                    )],
+                    false,
+                );
+            }
+        };
+    let mut active = ActiveContext::with_router(page.clone(), Arc::clone(&router));
     let page_settings = PageSettings {
         viewport,
         geolocation: flow.settings.geolocation,
@@ -529,6 +605,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                 .map(|path| path_text(&path));
     }
 
+    let _ = tokio::time::timeout(SECONDARY_TIMEOUT, router.close()).await;
     match tokio::time::timeout(SECONDARY_TIMEOUT, host.dispose_context(context)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => failures.push(failure(
@@ -638,7 +715,7 @@ async fn execute_step(
             let value = resolve_runtime(value, &runtime.outputs)?;
             let element =
                 wait_actionable(active, target, Actionability::EDITABLE, None, deadline).await?;
-            prepare_fill(&active.page, element.backend_node_id).await?;
+            prepare_fill(active.target(), element.backend_node_id).await?;
             active
                 .page
                 .execute(InsertTextParams::new(value.expose()))
@@ -649,7 +726,7 @@ async fn execute_step(
         Operation::Erase { target } => {
             let element =
                 wait_actionable(active, target, Actionability::EDITABLE, None, deadline).await?;
-            erase(&active.page, element.backend_node_id)
+            erase(active.target(), element.backend_node_id)
                 .await
                 .map(|_| None)
         }
@@ -657,7 +734,7 @@ async fn execute_step(
             let value = resolve_runtime(value, &runtime.outputs)?;
             let element =
                 wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
-            select(&active.page, element.backend_node_id, value.expose())
+            select(active.target(), element.backend_node_id, value.expose())
                 .await
                 .map(|_| None)
         }
@@ -720,7 +797,7 @@ async fn execute_step(
         } => {
             let element =
                 wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
-            focus(&active.page, element.backend_node_id).await?;
+            focus(active.target(), element.backend_node_id).await?;
             dispatch_key(&active.page, key, modifiers)
                 .await
                 .map(|_| None)
@@ -791,7 +868,7 @@ async fn execute_step(
                         .map(|value| Value::String(value.expose().clone()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let value = evaluate_page(&active.page, script, &args, save_as.is_some()).await?;
+            let value = evaluate_page(active, script, &args, save_as.is_some()).await?;
             if let Some(name) = save_as {
                 let value = value.ok_or_else(|| {
                     StepError::new(
@@ -836,14 +913,6 @@ async fn step_matches(
     step: &CompiledStep,
     runtime: &mut RuntimeState,
 ) -> Result<bool, StepError> {
-    if active.frame().is_some()
-        && !matches!(
-            step.operation,
-            Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
-        )
-    {
-        verify_frame_origin(active).await?;
-    }
     if !guards_match(
         &step.guards,
         &runtime.outputs,
@@ -971,7 +1040,7 @@ fn resolve_runtime(
 }
 
 async fn evaluate_page(
-    page: &Page,
+    active: &ActiveContext,
     script: &str,
     arguments: &[Value],
     capture_result: bool,
@@ -983,7 +1052,7 @@ async fn evaluate_page(
             "async function(...args) {{ await (async function(...args) {{\n{script}\n}})(...args); }}"
         )
     };
-    let params = CallFunctionOnParams::builder()
+    let mut params = CallFunctionOnParams::builder()
         .function_declaration(function)
         .arguments(arguments.iter().cloned().map(|value| {
             chromiumoxide::cdp::js_protocol::runtime::CallArgument::builder()
@@ -994,15 +1063,35 @@ async fn evaluate_page(
         .await_promise(true)
         .build()
         .map_err(protocol)?;
-    match page.evaluate_function(params).await {
-        Ok(result) => match result.into_value::<Value>() {
-            Ok(value) => Ok(Some(value)),
-            Err(_) => Ok(None),
+    let target = active.target();
+    if let CdpTarget::Oopif(_, _) = target
+        && let Some(frame) = active.local_frame()
+    {
+        params.execution_context_id = Some(ExecutionContextId::new(
+            target
+                .execution_context(frame.as_ref())
+                .ok_or_else(|| protocol("active frame has no executable context"))?,
+        ));
+    }
+    match target {
+        CdpTarget::Root(page) => match page.evaluate_function(params).await {
+            Ok(result) => Ok(result.into_value::<Value>().ok()),
+            Err(_) => Err(StepError::new(
+                FailureCategory::Protocol,
+                "page script failed",
+            )),
         },
-        Err(_) => Err(StepError::new(
-            FailureCategory::Protocol,
-            "page script failed",
-        )),
+        CdpTarget::Oopif(_, _) => match target.execute(params).await {
+            Ok(result) if result.exception_details.is_some() => Err(StepError::new(
+                FailureCategory::Protocol,
+                "page script failed",
+            )),
+            Ok(result) => Ok(result.result.value),
+            Err(_) => Err(StepError::new(
+                FailureCategory::Protocol,
+                "page script failed",
+            )),
+        },
     }
 }
 
@@ -1251,7 +1340,7 @@ async fn parent_frame_url(active: &ActiveContext) -> Result<String, StepError> {
             .map(|url| url.unwrap_or_default()),
         length => active
             .page
-            .frame_url(active.frames[length - 2].clone())
+            .frame_url(active.frames[length - 2].id.clone())
             .await
             .map_err(protocol)
             .map(|url| url.unwrap_or_default()),
@@ -1426,7 +1515,7 @@ async fn switch_frame(
             let element =
                 wait_actionable(active, locator, Actionability::ATTACHED, None, deadline).await?;
             let node = active
-                .page
+                .target()
                 .execute(
                     DescribeNodeParams::builder()
                         .backend_node_id(element.backend_node_id)
@@ -1435,7 +1524,6 @@ async fn switch_frame(
                 )
                 .await
                 .map_err(protocol)?
-                .result
                 .node;
             let frame = node.frame_id.ok_or_else(|| {
                 StepError::new(
@@ -1443,26 +1531,17 @@ async fn switch_frame(
                     "switch_frame target is not an iframe or frame element",
                 )
             })?;
-            let parent_url = active.url().await.map_err(protocol)?.unwrap_or_default();
-            let child_url = active
-                .page
-                .frame_url(frame.clone())
-                .await
-                .map_err(protocol)?
-                .unwrap_or_default();
-            if !same_origin_or_inherited(&parent_url, &child_url) {
-                return Err(StepError::new(
-                    FailureCategory::Navigation,
-                    "cross-origin iframe switching is unsupported by chromiumoxide 0.9.1",
-                ));
+            let oopif = node.content_document.is_none();
+            if oopif {
+                active
+                    .router
+                    .as_deref()
+                    .expect("OOPIF router missing")
+                    .wait_for_target(frame.as_ref(), deadline)
+                    .await
+                    .map_err(protocol)?;
             }
-            if node.content_document.is_none() {
-                return Err(StepError::new(
-                    FailureCategory::Navigation,
-                    "iframe is not available in the page CDP session; cross-origin OOPIF switching is unsupported by chromiumoxide 0.9.1",
-                ));
-            }
-            active.frames.push(frame);
+            active.frames.push(ActiveFrame { id: frame });
         }
     }
     Ok(())
@@ -1492,8 +1571,8 @@ async fn wait_actionable(
         .map_err(locator_error)
 }
 
-async fn focus(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
-    let focused: bool = call_on_node(page, node, FOCUS_FUNCTION, &[]).await?;
+async fn focus(target: CdpTarget<'_>, node: BackendNodeId) -> Result<(), StepError> {
+    let focused: bool = call_on_target(target, node, FOCUS_FUNCTION, &[]).await?;
     if !focused {
         return Err(StepError::new(
             FailureCategory::Actionability,
@@ -1503,8 +1582,8 @@ async fn focus(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
     Ok(())
 }
 
-async fn prepare_fill(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
-    let focused: bool = call_on_node(page, node, PREPARE_FILL_FUNCTION, &[]).await?;
+async fn prepare_fill(target: CdpTarget<'_>, node: BackendNodeId) -> Result<(), StepError> {
+    let focused: bool = call_on_target(target, node, PREPARE_FILL_FUNCTION, &[]).await?;
     if !focused {
         return Err(StepError::new(
             FailureCategory::Actionability,
@@ -1514,8 +1593,8 @@ async fn prepare_fill(page: &Page, node: BackendNodeId) -> Result<(), StepError>
     Ok(())
 }
 
-async fn erase(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
-    match call_on_node::<String>(page, node, ERASE_FUNCTION, &[])
+async fn erase(target: CdpTarget<'_>, node: BackendNodeId) -> Result<(), StepError> {
+    match call_on_target::<String>(target, node, ERASE_FUNCTION, &[])
         .await?
         .as_str()
     {
@@ -1535,9 +1614,9 @@ async fn erase(page: &Page, node: BackendNodeId) -> Result<(), StepError> {
     }
 }
 
-async fn select(page: &Page, node: BackendNodeId, value: &str) -> Result<(), StepError> {
-    match call_on_node::<String>(
-        page,
+async fn select(target: CdpTarget<'_>, node: BackendNodeId, value: &str) -> Result<(), StepError> {
+    match call_on_target::<String>(
+        target,
         node,
         SELECT_FUNCTION,
         &[serde_json::Value::String(value.to_owned())],
@@ -1716,20 +1795,61 @@ async fn page_point(
     mut x: f64,
     mut y: f64,
 ) -> Result<(f64, f64), StepError> {
-    for frame in &active.frames {
-        let owner = active
-            .page
-            .execute(GetFrameOwnerParams::new(frame.clone()))
+    let Some(mut index) = active.frames.len().checked_sub(1) else {
+        return Ok((x, y));
+    };
+    loop {
+        let frame = &active.frames[index];
+        let target = active.target_before(index);
+        let owner = target
+            .execute(GetFrameOwnerParams::new(frame.id.clone()))
             .await
             .map_err(protocol)?
-            .result
             .backend_node_id;
-        let [offset_x, offset_y]: [f64; 2] =
-            call_on_node(&active.page, owner, FRAME_OFFSET_FUNCTION, &[]).await?;
-        x += offset_x;
-        y += offset_y;
+        let [width, height]: [f64; 2] =
+            call_on_target(target, owner, FRAME_SIZE_FUNCTION, &[]).await?;
+        let quad = target
+            .execute(
+                GetContentQuadsParams::builder()
+                    .backend_node_id(owner)
+                    .build(),
+            )
+            .await
+            .map_err(protocol)?
+            .quads
+            .into_iter()
+            .next()
+            .ok_or_else(|| protocol("active frame has no content quad"))?;
+        (x, y) = map_frame_point(quad.inner(), width, height, x, y)?;
+        let Some(parent_oopif) = active.frames[..index].iter().rposition(|frame| {
+            active
+                .router
+                .as_deref()
+                .is_some_and(|router| router.has_target(frame.id.as_ref()))
+        }) else {
+            break;
+        };
+        index = parent_oopif;
     }
     Ok((x, y))
+}
+
+fn map_frame_point(
+    quad: &[f64],
+    width: f64,
+    height: f64,
+    x: f64,
+    y: f64,
+) -> Result<(f64, f64), StepError> {
+    if quad.len() != 8 || width <= 0.0 || height <= 0.0 {
+        return Err(protocol("active frame has invalid content geometry"));
+    }
+    let horizontal = x / width;
+    let vertical = y / height;
+    Ok((
+        quad[0] + (quad[2] - quad[0]) * horizontal + (quad[6] - quad[0]) * vertical,
+        quad[1] + (quad[3] - quad[1]) * horizontal + (quad[7] - quad[1]) * vertical,
+    ))
 }
 
 async fn evaluate(active: &ActiveContext, expression: &str) -> Result<(), StepError> {
@@ -1742,14 +1862,55 @@ async fn evaluate_value<T: DeserializeOwned>(
     active: &ActiveContext,
     expression: &str,
 ) -> Result<T, StepError> {
-    if active.frame().is_none() {
-        return active
-            .page
-            .evaluate(expression)
-            .await
-            .map_err(protocol)?
-            .into_value()
-            .map_err(protocol);
+    if active.local_frame().is_none() {
+        let params = EvaluateParams::builder()
+            .expression(expression)
+            .return_by_value(true)
+            .await_promise(true)
+            .build()
+            .map_err(protocol)?;
+        let response = active.target().execute(params).await.map_err(protocol)?;
+        if let Some(exception) = response.exception_details {
+            return Err(protocol(format!(
+                "page expression threw: {}",
+                exception.text
+            )));
+        }
+        return serde_json::from_value(
+            response
+                .result
+                .value
+                .ok_or_else(|| protocol("page expression returned no value"))?,
+        )
+        .map_err(protocol);
+    }
+    if let CdpTarget::Oopif(_, _) = active.target() {
+        let frame = active.local_frame().expect("local frame checked");
+        let context = active
+            .target()
+            .execution_context(frame.as_ref())
+            .ok_or_else(|| protocol("active frame has no executable context"))?;
+        let params = EvaluateParams::builder()
+            .expression(expression)
+            .context_id(ExecutionContextId::new(context))
+            .return_by_value(true)
+            .await_promise(true)
+            .build()
+            .map_err(protocol)?;
+        let response = active.target().execute(params).await.map_err(protocol)?;
+        if let Some(exception) = response.exception_details {
+            return Err(protocol(format!(
+                "page expression threw: {}",
+                exception.text
+            )));
+        }
+        return serde_json::from_value(
+            response
+                .result
+                .value
+                .ok_or_else(|| protocol("page expression returned no value"))?,
+        )
+        .map_err(protocol);
     }
     let context = active
         .page
@@ -2083,8 +2244,8 @@ async fn assert_text(
         };
         match observation {
             Observation::Ready(element) => {
-                let actual: String = match call_on_node(
-                    &active.page,
+                let actual: String = match call_on_target(
+                    active.target(),
                     element.backend_node_id,
                     INNER_TEXT_FUNCTION,
                     &[],
@@ -2164,17 +2325,16 @@ async fn sleep_until_poll(deadline: Instant) {
     tokio::time::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
 }
 
-async fn call_on_node<T: DeserializeOwned>(
-    page: &Page,
+async fn call_on_target<T: DeserializeOwned>(
+    target: CdpTarget<'_>,
     node: BackendNodeId,
     function: &str,
     arguments: &[serde_json::Value],
 ) -> Result<T, StepError> {
-    let object = page
+    let object = target
         .execute(ResolveNodeParams::builder().backend_node_id(node).build())
         .await
         .map_err(protocol)?
-        .result
         .object;
     let object_id = object.object_id.ok_or_else(|| {
         StepError::new(
@@ -2194,8 +2354,8 @@ async fn call_on_node<T: DeserializeOwned>(
         .await_promise(false)
         .build()
         .map_err(|error| StepError::new(FailureCategory::Protocol, error))?;
-    let response = page.execute(params).await.map_err(protocol)?.result;
-    let _ = page.execute(ReleaseObjectParams::new(object_id)).await;
+    let response = target.execute(params).await.map_err(protocol)?;
+    let _ = target.execute(ReleaseObjectParams::new(object_id)).await;
     if let Some(exception) = response.exception_details {
         return Err(StepError::new(
             FailureCategory::Protocol,
@@ -3478,6 +3638,32 @@ mod tests {
     }
 
     #[test]
+    fn frame_points_follow_scaled_and_rotated_content_quads() {
+        assert_eq!(
+            map_frame_point(
+                &[10.0, 20.0, 210.0, 20.0, 210.0, 120.0, 10.0, 120.0],
+                100.0,
+                50.0,
+                25.0,
+                10.0
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message)),
+            (60.0, 40.0)
+        );
+        assert_eq!(
+            map_frame_point(
+                &[100.0, 0.0, 100.0, 100.0, 50.0, 100.0, 50.0, 0.0],
+                100.0,
+                50.0,
+                20.0,
+                10.0
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message)),
+            (90.0, 20.0)
+        );
+    }
+
+    #[test]
     fn fill_clears_text_controls_without_unsupported_select_or_change_events() {
         assert!(PREPARE_FILL_FUNCTION.contains("HTMLInputElement.prototype, 'value'"));
         assert!(PREPARE_FILL_FUNCTION.contains("HTMLTextAreaElement.prototype, 'value'"));
@@ -3522,14 +3708,14 @@ mod tests {
             "text", "search", "email", "url", "tel", "password", "textarea", "editable",
         ] {
             let element = page.find_element(format!("#{id}")).await.unwrap();
-            prepare_fill(&page, element.backend_node_id)
+            prepare_fill(CdpTarget::Root(&page), element.backend_node_id)
                 .await
                 .unwrap_or_else(|error| panic!("{}", error.message));
             page.execute(InsertTextParams::new("replacement"))
                 .await
                 .unwrap();
-            let value: String = call_on_node(
-                &page,
+            let value: String = call_on_target(
+                CdpTarget::Root(&page),
                 element.backend_node_id,
                 "function() { return this.isContentEditable ? this.innerText : this.value; }",
                 &[],
@@ -3609,8 +3795,8 @@ steps:
             ("labelled", "labelled"),
         ] {
             let element = page.find_element(format!("#{id}")).await.unwrap();
-            let value: String = call_on_node(
-                &page,
+            let value: String = call_on_target(
+                CdpTarget::Root(&page),
                 element.backend_node_id,
                 "function() { return this.value; }",
                 &[],

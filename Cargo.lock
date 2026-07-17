@@ -1321,6 +1321,7 @@ name = "playrust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-tungstenite",
  "base64",
  "chrome-for-testing",
  "chrome-for-testing-manager",
