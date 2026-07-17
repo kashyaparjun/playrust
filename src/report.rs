@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const REPORT_VERSION: u32 = 2;
+pub const REPORT_VERSION: u32 = 3;
 pub const REDACTED: &str = "[REDACTED]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -232,6 +232,10 @@ pub struct ArtifactPaths {
     pub screenshots: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_screenshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visual_actual: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visual_diff: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recording: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -631,6 +635,12 @@ fn html_report(report: &AggregateReport) -> String {
         if let Some(path) = &flow.artifacts.failure_screenshot {
             push_html_path(&mut html, "Failure screenshot", path);
         }
+        if let Some(path) = &flow.artifacts.visual_actual {
+            push_html_path(&mut html, "Visual actual", path);
+        }
+        if let Some(path) = &flow.artifacts.visual_diff {
+            push_html_path(&mut html, "Visual diff", path);
+        }
         if let Some(path) = &flow.artifacts.recording {
             push_html_path(&mut html, "Recording", path);
         }
@@ -965,6 +975,8 @@ mod tests {
             directory: "artifacts/<flow>".to_owned(),
             screenshots: vec!["artifacts/a&b.png".to_owned()],
             failure_screenshot: Some("artifacts/failure.png".to_owned()),
+            visual_actual: Some("artifacts/__visual-2-actual.png".to_owned()),
+            visual_diff: Some("artifacts/__visual-2-diff.png".to_owned()),
             recording: Some("artifacts/recording.webm".to_owned()),
             partial_recording: Some("artifacts/recording.partial.webm".to_owned()),
         };
@@ -994,6 +1006,8 @@ mod tests {
         assert!(html.contains("artifacts/&lt;flow&gt;"));
         assert!(html.contains("artifacts/a&amp;b.png"));
         assert!(html.contains("Failure screenshot"));
+        assert!(html.contains("Visual actual"));
+        assert!(html.contains("Visual diff"));
         assert!(html.contains("Partial recording"));
         assert!(!html.contains("<script"));
         assert!(!html.contains("<a "));

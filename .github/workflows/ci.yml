@@ -52,8 +52,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install pinned Chromium
         run: cargo run --locked -- browser install
-      - name: Run browser and video smoke tests
+      - name: Run browser, video, and visual tests
         env:
           PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
           PLAYRUST_FFMPEG: /usr/bin/ffmpeg
-        run: cargo test --locked --test browser_smoke -- --ignored
+        run: cargo test --locked --test browser_smoke --test visual_assertion_e2e -- --ignored

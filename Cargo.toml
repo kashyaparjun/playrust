@@ -13,6 +13,7 @@ chromiumoxide = "0.9.1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "0.0.29"
 serde_json = "1"

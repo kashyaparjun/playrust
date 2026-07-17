@@ -683,6 +683,12 @@ fn print_results(report: &AggregateReport) {
                 if let Some(path) = &report.artifacts.failure_screenshot {
                     println!("  Screenshot: {}", terminal_text(path));
                 }
+                if let Some(path) = &report.artifacts.visual_actual {
+                    println!("  Visual actual: {}", terminal_text(path));
+                }
+                if let Some(path) = &report.artifacts.visual_diff {
+                    println!("  Visual diff: {}", terminal_text(path));
+                }
             }
         }
         for path in &report.artifacts.screenshots {

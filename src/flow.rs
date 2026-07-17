@@ -260,6 +260,16 @@ pub struct RawAssertion {
     pub hidden: Option<RawLocator>,
     pub text: Option<RawTextAssertion>,
     pub url: Option<RawUrlAssertion>,
+    pub screenshot: Option<RawVisualAssertion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawVisualAssertion {
+    pub baseline: String,
+    pub crop: Option<RawCrop>,
+    pub channel_tolerance: Option<u8>,
+    pub max_changed_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -360,7 +370,7 @@ pub struct Viewport {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CompiledStep {
     pub index: usize,
     pub source: PathBuf,
@@ -370,7 +380,7 @@ pub struct CompiledStep {
     pub operation: Operation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Operation {
     Open {
         url: Resolved<Url>,
@@ -418,7 +428,7 @@ pub struct Crop {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Assertion {
     Visible(Locator),
     Hidden(Locator),
@@ -428,6 +438,15 @@ pub enum Assertion {
         match_kind: TextMatch,
     },
     Url(UrlExpectation),
+    Screenshot(VisualExpectation),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisualExpectation {
+    pub baseline: PathBuf,
+    pub crop: Option<Crop>,
+    pub channel_tolerance: u8,
+    pub max_changed_ratio: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,7 +752,14 @@ fn compile_raw_inner(
                 "step {index} subflow includes require compiling a flow file"
             ));
         }
-        let operation = compile_operation(step, index, base_url.as_ref(), viewport, &inputs)?;
+        let operation = compile_operation(
+            step,
+            index,
+            &source_path,
+            base_url.as_ref(),
+            viewport,
+            &inputs,
+        )?;
         if let Operation::Screenshot { name, .. } = &operation
             && !screenshot_names.insert(name.to_ascii_lowercase())
         {
@@ -1082,6 +1108,7 @@ fn resolve_inputs(
 fn compile_operation(
     step: RawStep,
     index: usize,
+    source: &Path,
     base_url: Option<&Resolved<Url>>,
     viewport: Viewport,
     inputs: &BTreeMap<String, Resolved<String>>,
@@ -1214,6 +1241,8 @@ fn compile_operation(
     Ok(Operation::Assert(compile_assertion(
         step.assertion.expect("operation count checked"),
         index,
+        source,
+        viewport,
         inputs,
     )?))
 }
@@ -1283,6 +1312,8 @@ fn validate_crop(index: usize, crop: RawCrop, viewport: Viewport) -> Result<Crop
 fn compile_assertion(
     raw: RawAssertion,
     index: usize,
+    source: &Path,
+    viewport: Viewport,
     inputs: &BTreeMap<String, Resolved<String>>,
 ) -> Result<Assertion, FlowError> {
     let assertion_count = [
@@ -1290,6 +1321,7 @@ fn compile_assertion(
         raw.hidden.is_some(),
         raw.text.is_some(),
         raw.url.is_some(),
+        raw.screenshot.is_some(),
     ]
     .into_iter()
     .filter(|present| *present)
@@ -1331,6 +1363,36 @@ fn compile_assertion(
         });
     }
 
+    if let Some(screenshot) = raw.screenshot {
+        let baseline = interpolate_non_secret(
+            &format!("step {index} screenshot assertion baseline"),
+            &screenshot.baseline,
+            inputs,
+        )?;
+        let baseline = validate_baseline_path(index, source, &baseline)?;
+        let crop = screenshot
+            .crop
+            .map(|crop| validate_crop(index, crop, viewport))
+            .transpose()?;
+        let (width, height) = crop
+            .map(|crop| (crop.width, crop.height))
+            .unwrap_or((viewport.width, viewport.height));
+        crate::visual::validate_dimensions(width, height)
+            .map_err(|message| FlowError::Invalid(format!("step {index} {message}")))?;
+        let max_changed_ratio = screenshot.max_changed_ratio.unwrap_or(0.0);
+        if !max_changed_ratio.is_finite() || !(0.0..=1.0).contains(&max_changed_ratio) {
+            return invalid(format!(
+                "step {index} screenshot assertion max_changed_ratio must be between 0 and 1"
+            ));
+        }
+        return Ok(Assertion::Screenshot(VisualExpectation {
+            baseline,
+            crop,
+            channel_tolerance: screenshot.channel_tolerance.unwrap_or(0),
+            max_changed_ratio,
+        }));
+    }
+
     let url = raw.url.expect("assertion count checked");
     let expectation = match (url.equals, url.path) {
         (Some(value), None) => {
@@ -1351,6 +1413,29 @@ fn compile_assertion(
         }
     };
     Ok(Assertion::Url(expectation))
+}
+
+fn validate_baseline_path(index: usize, source: &Path, value: &str) -> Result<PathBuf, FlowError> {
+    require_non_empty(
+        &format!("step {index} screenshot assertion baseline"),
+        value,
+    )?;
+    let path = Path::new(value);
+    if path.extension().and_then(|value| value.to_str()) != Some("png")
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return invalid(format!(
+            "step {index} screenshot assertion baseline must be a relative .png path without '..'"
+        ));
+    }
+    Ok(source.parent().unwrap_or_else(|| Path::new(".")).join(path))
 }
 
 fn compile_locator(
@@ -1880,6 +1965,43 @@ steps:
             .to_string();
         assert!(message.contains("screenshot.name cannot contain a secret"));
         assert!(!message.contains("canary-secret"));
+    }
+
+    #[test]
+    fn compiles_bounded_visual_assertions_relative_to_the_containing_flow() {
+        let valid = compile(
+            "version: 1\nname: x\nsettings: { viewport: { width: 800, height: 600 }, video: off }\nsteps:\n  - assert:\n      screenshot:\n        baseline: fixtures/home.png\n        crop: { x: 10, y: 20, width: 400, height: 300 }\n        channel_tolerance: 4\n        max_changed_ratio: 0.01\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            &valid.steps[0].operation,
+            Operation::Assert(Assertion::Screenshot(VisualExpectation {
+                baseline,
+                crop: Some(Crop { x: 10, y: 20, width: 400, height: 300 }),
+                channel_tolerance: 4,
+                max_changed_ratio,
+            })) if baseline == Path::new("flows/fixtures/home.png") && *max_changed_ratio == 0.01
+        ));
+
+        for (baseline, ratio, expected) in [
+            ("../home.png", "0", "relative .png path"),
+            ("/home.png", "0", "relative .png path"),
+            ("home.jpg", "0", "relative .png path"),
+            ("home.png", "1.01", "between 0 and 1"),
+            ("home.png", "-.inf", "between 0 and 1"),
+        ] {
+            let source = format!(
+                "version: 1\nname: x\nsettings: {{ video: off }}\nsteps: [{{ assert: {{ screenshot: {{ baseline: '{baseline}', max_changed_ratio: {ratio} }} }} }}]\n"
+            );
+            assert!(
+                error(&source).contains(expected),
+                "accepted {baseline} {ratio}"
+            );
+        }
+        assert!(error(
+            "version: 1\nname: x\nsettings: { viewport: { width: 8192, height: 8192 }, video: off }\nsteps: [{ assert: { screenshot: { baseline: home.png } } }]\n"
+        )
+        .contains("visual image dimensions"));
     }
 
     #[test]

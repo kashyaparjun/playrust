@@ -136,9 +136,19 @@ The optional boolean filters `checked`, `selected`, and `focused` match the corr
     text: { target: { css: .message }, contains: "complete" }
 - assert: { url: { equals: "https://example.test/dashboard" } }
 - assert: { url: { path: "/dashboard?tab=home" } }
+- assert:
+    screenshot:
+      baseline: baselines/dashboard.png
+      crop: { x: 40, y: 80, width: 640, height: 360 }
+      channel_tolerance: 2
+      max_changed_ratio: 0.001
 ```
 
 Positive assertions require one unique visible target. `hidden` passes with no matches or when all matches are hidden. URL `equals` compares the full URL; `path` compares the encoded path and, when supplied, query while ignoring origin and fragment. Actions and assertions retry until their condition passes or the step deadline expires.
+
+Screenshot assertions capture the fixed viewport once and compare RGBA channels against a PNG baseline. `crop` is optional and uses the same viewport-relative bounds as named screenshots. `channel_tolerance` defaults to `0` and permits an absolute difference of up to that value in each channel. A pixel is changed when any channel exceeds the tolerance; `max_changed_ratio` defaults to `0` and accepts a value from `0` through `1`. Dimension mismatches always fail.
+
+Baseline paths must be relative `.png` paths without `..`, resolve from the flow file containing the assertion (including subflows), and cannot contain secrets. Images are limited to 64 MiB encoded, 8192 pixels per axis, and 16,777,216 pixels total, with decoder allocation limits applied before decoding. Playrust does not provide a baseline-update mode. Keep baseline creation and review explicit in your repository workflow.
 
 ## Variables and secrets
 
@@ -160,7 +170,7 @@ Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`
 
 Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libvpx-vp9` encoder. Playrust records the fixed page viewport as silent 15 FPS WebM/VP9; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 
-Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically write `<artifacts>/junit.xml`; automation failures are JUnit failures, while invalid specifications, infrastructure failures, and interruptions are JUnit errors. Pass `--html` to atomically write `<artifacts>/report.html`, a self-contained static summary with inline CSS, no scripts or external resources, and plain-text artifact paths. Optional reports are removed when their flags are omitted, so stale output cannot be mistaken for the current run. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. Per-flow directories may also contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
+Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically write `<artifacts>/junit.xml`; automation failures are JUnit failures, while invalid specifications, infrastructure failures, and interruptions are JUnit errors. Pass `--html` to atomically write `<artifacts>/report.html`, a self-contained static summary with inline CSS, no scripts or external resources, and plain-text artifact paths. Optional reports are removed when their flags are omitted, so stale output cannot be mistaken for the current run. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. A failed screenshot assertion retains `__visual-<step>-actual.png` and a `__visual-<step>-diff.png` whose changed pixels are red, reported as `visual_actual` and `visual_diff`; diagnostics do not expose the baseline path. Per-flow directories may also contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
 
 ## Boundaries
 

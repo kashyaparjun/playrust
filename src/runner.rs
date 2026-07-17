@@ -31,7 +31,7 @@ use tokio::sync::{Notify, oneshot};
 use crate::browser::{BrowserHost, BrowserStatus, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, LocatorStrategy,
-    Modifier, NamedKey, Operation, TextMatch, UrlExpectation, VideoMode,
+    Modifier, NamedKey, Operation, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -41,6 +41,7 @@ use crate::report::{
     ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, SafeText, StepContext,
 };
 use crate::video::{VideoConfig, VideoRecorder};
+use crate::visual;
 
 const SCREENSHOT_NAME: &str = "failure.png";
 const RECORDING_NAME: &str = "recording.webm";
@@ -302,6 +303,10 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             Ok(Err(error)) => error,
             Err(_) => StepError::new(FailureCategory::Timeout, "step deadline expired").deadline(),
         };
+        if let Some((actual, diff)) = &error.visual_artifacts {
+            artifacts.visual_actual = Some(path_text(actual));
+            artifacts.visual_diff = Some(path_text(diff));
+        }
         artifacts.failure_screenshot =
             capture_failure_screenshot(&page, &options.artifact_directory)
                 .await
@@ -449,6 +454,11 @@ async fn execute_step(
                 .await
                 .map_err(protocol)?;
             Ok(None)
+        }
+        Operation::Assert(Assertion::Screenshot(expectation)) => {
+            assert_screenshot(page, expectation, step.index, artifact_directory)
+                .await
+                .map(|_| None)
         }
         Operation::Assert(assertion) => assert(page, assertion, deadline).await.map(|_| None),
     }
@@ -847,7 +857,53 @@ async fn assert(page: &Page, assertion: &Assertion, deadline: Instant) -> Result
             match_kind,
         } => assert_text(page, target, expected.expose(), *match_kind, deadline).await,
         Assertion::Url(expectation) => assert_url(page, expectation, deadline).await,
+        Assertion::Screenshot(_) => unreachable!("visual assertions are executed with artifacts"),
     }
+}
+
+async fn assert_screenshot(
+    page: &Page,
+    expectation: &VisualExpectation,
+    step: usize,
+    artifact_directory: &Path,
+) -> Result<(), StepError> {
+    let actual_png = screenshot_bytes(page, expectation.crop).await?;
+    let baseline = expectation.baseline.clone();
+    let comparison_png = actual_png.clone();
+    let tolerance = expectation.channel_tolerance;
+    let comparison =
+        tokio::task::spawn_blocking(move || visual::compare(&baseline, &comparison_png, tolerance))
+            .await
+            .map_err(|_| protocol("visual comparison task failed"))?
+            .map_err(|error| match error {
+                visual::VisualError::ActualDecode => protocol(error),
+                _ => StepError::assertion(error.to_string()),
+            })?;
+    if comparison.dimensions_match && comparison.ratio() <= expectation.max_changed_ratio {
+        return Ok(());
+    }
+
+    let diff_png = visual::encode_png(&comparison.diff).map_err(protocol)?;
+    let actual_path = artifact_directory.join(format!("__visual-{step}-actual.png"));
+    let diff_path = artifact_directory.join(format!("__visual-{step}-diff.png"));
+    publish_bytes(artifact_directory, &actual_path, &actual_png).await?;
+    publish_bytes(artifact_directory, &diff_path, &diff_png).await?;
+    let observed = if comparison.dimensions_match {
+        format!(
+            "{} of {} pixels changed ({:.6}); maximum changed ratio is {:.6}",
+            comparison.changed_pixels,
+            comparison.total_pixels,
+            comparison.ratio(),
+            expectation.max_changed_ratio
+        )
+    } else {
+        "baseline and actual dimensions differ".to_owned()
+    };
+    Err(
+        StepError::assertion("visual screenshot assertion did not match")
+            .observed(observed)
+            .visual_artifacts(actual_path, diff_path),
+    )
 }
 
 async fn assert_hidden(page: &Page, locator: &Locator, deadline: Instant) -> Result<(), StepError> {
@@ -1305,6 +1361,13 @@ async fn capture_screenshot(
     file_name: &str,
     crop: Option<Crop>,
 ) -> Result<PathBuf, StepError> {
+    let bytes = screenshot_bytes(page, crop).await?;
+    let path = directory.join(file_name);
+    publish_bytes(directory, &path, &bytes).await?;
+    Ok(path)
+}
+
+async fn screenshot_bytes(page: &Page, crop: Option<Crop>) -> Result<Vec<u8>, StepError> {
     let mut params = ScreenshotParams::builder().format(CaptureScreenshotFormat::Png);
     if let Some(crop) = crop {
         let viewport = page
@@ -1321,10 +1384,16 @@ async fn capture_screenshot(
         });
     }
     let bytes = page.screenshot(params.build()).await.map_err(protocol)?;
+    if bytes.len() > visual::MAX_IMAGE_BYTES {
+        return Err(protocol("captured screenshot exceeds the image byte limit"));
+    }
+    Ok(bytes)
+}
+
+async fn publish_bytes(directory: &Path, path: &Path, bytes: &[u8]) -> Result<(), StepError> {
     tokio::fs::create_dir_all(directory)
         .await
         .map_err(|error| protocol(format!("create artifact directory: {error}")))?;
-    let path = directory.join(file_name);
     let temporary = tempfile::NamedTempFile::new_in(directory)
         .map_err(|error| protocol(format!("create temporary screenshot: {error}")))?;
     let mut writer = tokio::fs::File::from_std(
@@ -1333,7 +1402,7 @@ async fn capture_screenshot(
             .map_err(|error| protocol(format!("open temporary screenshot: {error}")))?,
     );
     writer
-        .write_all(&bytes)
+        .write_all(bytes)
         .await
         .map_err(|error| protocol(format!("write screenshot: {error}")))?;
     writer
@@ -1348,9 +1417,9 @@ async fn capture_screenshot(
     }
     // Keep publication await-free so cancellation cannot publish an unreported screenshot.
     temporary
-        .persist(&path)
+        .persist(path)
         .map_err(|error| protocol(format!("publish screenshot: {}", error.error)))?;
-    Ok(path)
+    Ok(())
 }
 
 async fn step_failure(
@@ -1409,6 +1478,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Assert(Assertion::Hidden(_)) => "assert.hidden",
         Operation::Assert(Assertion::Text { .. }) => "assert.text",
         Operation::Assert(Assertion::Url(_)) => "assert.url",
+        Operation::Assert(Assertion::Screenshot(_)) => "assert.screenshot",
     }
 }
 
@@ -1427,7 +1497,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::Back
         | Operation::Screenshot { .. }
         | Operation::Clear(_)
-        | Operation::Assert(Assertion::Url(_)) => None,
+        | Operation::Assert(Assertion::Url(_) | Assertion::Screenshot(_)) => None,
     }
 }
 
@@ -1565,6 +1635,7 @@ struct StepError {
     message: String,
     last_observed: Option<String>,
     deadline_based: bool,
+    visual_artifacts: Option<(PathBuf, PathBuf)>,
 }
 
 impl StepError {
@@ -1574,6 +1645,7 @@ impl StepError {
             message: message.into(),
             last_observed: None,
             deadline_based: false,
+            visual_artifacts: None,
         }
     }
 
@@ -1588,6 +1660,11 @@ impl StepError {
 
     fn deadline(mut self) -> Self {
         self.deadline_based = true;
+        self
+    }
+
+    fn visual_artifacts(mut self, actual: PathBuf, diff: PathBuf) -> Self {
+        self.visual_artifacts = Some((actual, diff));
         self
     }
 }
