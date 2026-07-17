@@ -891,7 +891,10 @@ async fn http_request(
         .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
         .ok_or_else(|| StepError::new(FailureCategory::Protocol, "request URL is invalid"))?;
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("compiled HTTP method");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("static HTTP client configuration");
     let mut request = client.request(method, url);
     for (name, value) in headers {
         let value = resolve_runtime(value, outputs)?;
@@ -967,11 +970,26 @@ fn store_output(
         ));
     }
     redactor.add_secret(serialized);
-    if let Value::String(value) = &value {
-        redactor.add_secret(value.clone());
-    }
+    register_string_secrets(redactor, &value);
     outputs.insert(name.to_owned(), Resolved::new(value, true));
     Ok(())
+}
+
+fn register_string_secrets(redactor: &mut Redactor, value: &Value) {
+    match value {
+        Value::String(value) => redactor.add_secret(value.clone()),
+        Value::Array(values) => {
+            for value in values {
+                register_string_secrets(redactor, value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                register_string_secrets(redactor, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Result<(), StepError> {
@@ -2703,9 +2721,11 @@ fn key_name(key: &Key) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use std::env;
+    use std::time::Duration;
 
     use super::*;
     use crate::flow::compile_yaml_with_env;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn modifier_bits_follow_cdp() {
@@ -2760,6 +2780,106 @@ mod tests {
                 Value::String("x".repeat(MAX_RUNTIME_VALUE_BYTES + 1)),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_runtime_json_strings_are_redacted_from_urls_and_diagnostics() {
+        let mut stored = BTreeMap::new();
+        let mut redactor = Redactor::default();
+        store_output(
+            &mut stored,
+            &mut redactor,
+            "secret",
+            serde_json::json!({
+                "auth": { "token": "object-canary" },
+                "items": ["array-canary", { "value": "nested-array-canary" }]
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+
+        let url = redactor
+            .redact("https://example.test/object-canary/array-canary?nested=nested-array-canary");
+        let diagnostic = redactor
+            .redact("request failed for object-canary, array-canary, and nested-array-canary");
+        for canary in ["object-canary", "array-canary", "nested-array-canary"] {
+            assert!(!url.contains(canary), "secret leaked in URL: {url}");
+            assert!(
+                !diagnostic.contains(canary),
+                "secret leaked in diagnostic: {diagnostic}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_requests_do_not_follow_redirects_with_custom_headers() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/target", target.local_addr().unwrap());
+        let (request_sender, request_receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let length = stream.read(&mut request).await.unwrap();
+            request.truncate(length);
+            let _ = request_sender.send(String::from_utf8_lossy(&request).into_owned());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let redirect = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_url = format!("http://{}/redirect", redirect.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = redirect.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let length = stream.read(&mut request).await.unwrap();
+            assert!(length > 0);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps:\n  - request:\n      method: GET\n      url: http://example.test\n      headers: { x-api-key: redirect-canary }\n      expected_status: 200\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let Operation::Request { headers, .. } = &flow.steps[0].operation else {
+            panic!("expected request");
+        };
+        let response = http_request(
+            "GET",
+            &redirect_url,
+            headers,
+            None,
+            302,
+            false,
+            &BTreeMap::new(),
+        )
+        .await;
+        let redirected_request =
+            tokio::time::timeout(Duration::from_millis(100), request_receiver).await;
+
+        assert!(
+            response.is_ok(),
+            "redirect response was not returned: {}",
+            response
+                .err()
+                .map(|error| error.message)
+                .unwrap_or_default()
+        );
+        assert!(
+            redirected_request.is_err(),
+            "redirect target received x-api-key: {redirected_request:?}"
         );
     }
 
