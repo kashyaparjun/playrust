@@ -131,6 +131,8 @@ Variable equality is resolved at compile time against a declared, immutable, non
 | Clear IndexedDB | `clear: indexeddb` |
 | Clear Cache Storage | `clear: cache-storage` |
 | Unregister service workers | `clear: service-workers` |
+| Evaluate page JavaScript | `evaluate: { script: "return args[0]", args: [value], save_as: result }` |
+| HTTP setup request | `request: { method: POST, url: "https://api.test/setup", expected_status: 201 }` |
 
 Click, double click, fill, erase, select, swipe, long press, and press wait for one unique, visible, stable, enabled, uncovered target; fill and erase also require an editable target. Click and double-click optionally accept `position`, an unsigned CSS-pixel offset from the target's top-left border box. The point must be inside the target, inside the viewport, and hit the target or one of its descendants; hit testing is performed at that exact point. Without `position`, the target center is used. Erase supports the same text inputs, textareas, and content-editable elements as fill. Select accepts an option value (including an empty value) on a native, non-`multiple` `<select>` and dispatches one bubbling `input` event followed by one `change` event. Swipe and long press dispatch one mouse gesture after actionability succeeds. Input actions are not retried after pointer, keyboard, wheel, or form event dispatch begins.
 
@@ -151,6 +153,37 @@ Screenshots are PNG files written atomically to the flow artifact directory as `
 ```
 
 `clear: cookies` clears every cookie in the active flow's isolated browser context only. `clear: storage` clears only `localStorage` and `sessionStorage` for the active page origin. `clear: indexeddb` deletes the active origin's named IndexedDB databases, `clear: cache-storage` deletes its Cache Storage entries, and `clear: service-workers` unregisters its service workers. These targets are deliberately separate: none of the three broader browser-storage commands clears cookies, local storage, or session storage. All clear commands remain inside the active flow's isolated browser context, use the step timeout, and produce normal cancellation and failure diagnostics. IndexedDB deletion fails if an open connection blocks it.
+
+### Scripts, HTTP, and runtime outputs
+
+`evaluate` runs a JavaScript function body in the active page's main frame and optionally stores its return value:
+
+```yaml
+- evaluate:
+    script: return { token: args[0], title: document.title };
+    args: ["${seed}"]
+    save_as: page_result
+```
+
+The script is trusted page code, not a sandbox. It has the page's normal JavaScript access and can change the DOM, read page data, or make network requests. Flow values are never substituted into `script`; positional `args` are resolved and passed separately through the browser protocol as strings. Promises are awaited. A `save_as` result must be representable as JSON and its serialized form must not exceed 64 KiB; `undefined` and other non-JSON results cannot be saved.
+
+Use `request` for bounded HTTP setup without hand-written page networking:
+
+```yaml
+- request:
+    method: POST
+    url: https://api.example.test/setup
+    headers:
+      authorization: "Bearer ${token}"
+      content-type: application/json
+    body: '{"ready":true}'
+    expected_status: 201
+    save_as: setup_response
+```
+
+Methods are limited to `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, and `OPTIONS`; URLs must be absolute HTTP(S), at most 100 headers are accepted, and request/response bodies are limited to 64 KiB. The step deadline bounds the entire request. A status other than `expected_status` fails the step. When saved, an empty response becomes JSON `null`, a valid JSON response keeps its JSON type, and any other response is stored as a string.
+
+Saved values are scoped to one running flow, use input-style names, and are available only to later `fill.value`, `select.value`, `evaluate.args`, and `request` URL/header/body fields as `${name}`. Strings interpolate directly; other JSON values use compact JSON. Repeated expansions of the same source producer replace that producer's previous value; distinct producers cannot share a name. A consumer after a DOM-conditional producer fails at runtime if the producer was skipped. Runtime outputs are always treated as secret, including values derived from apparently public page or HTTP data, and are size-bounded and redacted from diagnostics. They can still appear in screenshots or videos after being rendered by the page.
 
 ### Selectors
 
@@ -210,7 +243,7 @@ secrets:
   password: { env: TEST_PASSWORD }
 ```
 
-Use `${name}` in YAML strings. Variables are immutable literals or environment mappings with an optional default; `--var NAME=VALUE` overrides only names declared under `vars`. Secrets must be environment mappings and cannot have defaults or CLI overrides. Secret-derived values are redacted from terminal diagnostics and `report.json`, but screenshots and videos can contain secrets rendered by the tested page.
+Use `${name}` in YAML strings. Variables are immutable literals or environment mappings with an optional default; `--var NAME=VALUE` overrides only names declared under `vars`. Secrets must be environment mappings and cannot have defaults or CLI overrides. Secret-derived and runtime-output-derived values are redacted from terminal diagnostics and `report.json`, but screenshots and videos can contain secrets rendered by the tested page.
 
 Treat flow files as executable test configuration. They can navigate to private services and transmit environment values whose names are explicitly declared in the flow.
 
@@ -226,6 +259,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports opener-linked popups and same-origin frames as described above. Arbitrary tab selection, cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, mutable variables, general expressions, unbounded loops, transactional subflow retries, dynamic paths, or plugins.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports opener-linked popups and same-origin frames as described above. Arbitrary tab selection, cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, mutable variables, general expressions, unbounded loops, transactional subflow retries, dynamic paths, plugins, or a JavaScript sandbox.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

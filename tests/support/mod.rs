@@ -100,36 +100,53 @@ impl FixtureServer {
                 )
             })
             .collect::<Vec<_>>();
+        Self::start_owned(move |request| {
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            routes
+                .iter()
+                .find(|(route, _, _)| route == path)
+                .map(|(_, content_type, body)| (200, content_type.clone(), body.clone()))
+                .unwrap_or_else(|| (404, "text/plain".to_owned(), "not found".to_owned()))
+        })
+    }
+
+    pub fn start_with(
+        responder: impl Fn(&str) -> (u16, &'static str, &'static str) + Send + Sync + 'static,
+    ) -> Self {
+        Self::start_owned(move |request| {
+            let (status, content_type, body) = responder(request);
+            (status, content_type.to_owned(), body.to_owned())
+        })
+    }
+
+    fn start_owned(
+        responder: impl Fn(&str) -> (u16, String, String) + Send + Sync + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let address = listener.local_addr().expect("read fixture address");
         listener
             .set_nonblocking(true)
-            .expect("make server stoppable");
+            .expect("make fixture server stoppable");
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
+        let responder = Arc::new(responder);
         let thread = thread::spawn(move || -> io::Result<()> {
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                        let mut request = [0; 4096];
+                        let mut request = [0; 8192];
                         let length = stream.read(&mut request)?;
-                        let path = std::str::from_utf8(&request[..length])
-                            .ok()
-                            .and_then(|request| request.lines().next())
-                            .and_then(|line| line.split_whitespace().nth(1))
-                            .unwrap_or("/");
-                        let (status, content_type, body) = routes
-                            .iter()
-                            .find(|(route, _, _)| route == path)
-                            .map(|(_, content_type, body)| {
-                                ("200 OK", content_type.as_str(), body.as_str())
-                            })
-                            .unwrap_or(("404 Not Found", "text/plain", "not found"));
+                        let request = String::from_utf8_lossy(&request[..length]);
+                        let (status, content_type, body) = responder(&request);
                         write!(
                             stream,
-                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         )?;
                     }

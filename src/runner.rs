@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -29,14 +30,16 @@ use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot};
 
 use crate::browser::{BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, FrameSwitch, Key, Locator,
-    LocatorStrategy, Modifier, NamedKey, Operation, PageSwitch, RecordingControl, RelationKind,
-    RelativePoint, TextMatch, UrlExpectation, VideoMode, VisualExpectation, When,
+    LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey, Operation, PageSwitch,
+    RecordingControl, Redactor, RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation,
+    VideoMode, VisualExpectation, When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -288,6 +291,11 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     };
 
     let mut primary = None;
+    let mut runtime = RuntimeState {
+        outputs: BTreeMap::new(),
+        redactor: flow.redactor.clone(),
+        page_settings,
+    };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut recording_error = None;
     let mut video = None;
@@ -325,6 +333,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                     step_failure(
                         host,
                         flow,
+                        &runtime.redactor,
                         &active,
                         step,
                         StepError::new(FailureCategory::Protocol, "step timeout is too large"),
@@ -349,7 +358,9 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                 Ok(Ok(false)) => continue,
                 Ok(Ok(true)) => {}
                 Ok(Err(error)) => {
-                    primary = Some(step_failure(host, flow, &active, step, error).await);
+                    primary = Some(
+                        step_failure(host, flow, &runtime.redactor, &active, step, error).await,
+                    );
                     break;
                 }
                 Err(_) => {
@@ -357,6 +368,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                         step_failure(
                             host,
                             flow,
+                            &runtime.redactor,
                             &active,
                             step,
                             StepError::new(FailureCategory::Timeout, "step deadline expired")
@@ -442,7 +454,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                         step,
                         deadline,
                         &options.artifact_directory,
-                        page_settings,
+                        &mut runtime,
                     ),
                 ) => result,
             };
@@ -475,7 +487,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             capture_failure_screenshot(&active, &options.artifact_directory)
                 .await
                 .map(|path| path_text(&path));
-        primary = Some(step_failure(host, flow, &active, step, error).await);
+        primary = Some(step_failure(host, flow, &runtime.redactor, &active, step, error).await);
         break;
     }
 
@@ -564,6 +576,12 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
     cancellation.is_some_and(CancellationToken::is_cancelled)
 }
 
+struct RuntimeState {
+    outputs: BTreeMap<String, Resolved<Value>>,
+    redactor: Redactor,
+    page_settings: PageSettings,
+}
+
 async fn execute_step(
     host: &BrowserHost,
     context_id: &chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
@@ -571,7 +589,7 @@ async fn execute_step(
     step: &CompiledStep,
     deadline: Instant,
     artifact_directory: &Path,
-    settings: PageSettings,
+    runtime: &mut RuntimeState,
 ) -> Result<Option<PathBuf>, StepError> {
     if !step_matches(active, step).await? {
         return Ok(None);
@@ -593,6 +611,7 @@ async fn execute_step(
             dispatch_click(&active.page, x, y, 2).await.map(|_| None)
         }
         Operation::Fill { target, value } => {
+            let value = resolve_runtime(value, &runtime.outputs)?;
             let element =
                 wait_actionable(active, target, Actionability::EDITABLE, None, deadline).await?;
             prepare_fill(&active.page, element.backend_node_id).await?;
@@ -611,6 +630,7 @@ async fn execute_step(
                 .map(|_| None)
         }
         Operation::Select { target, value } => {
+            let value = resolve_runtime(value, &runtime.outputs)?;
             let element =
                 wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
             select(&active.page, element.backend_node_id, value.expose())
@@ -658,8 +678,8 @@ async fn execute_step(
             active,
             *page,
             deadline,
-            settings.viewport,
-            settings.geolocation,
+            runtime.page_settings.viewport,
+            runtime.page_settings.geolocation,
         )
         .await
         .map(|_| None),
@@ -730,6 +750,54 @@ async fn execute_step(
                 .map_err(protocol)?;
             Ok(None)
         }
+        Operation::Evaluate {
+            script,
+            args,
+            save_as,
+        } => {
+            let args = args
+                .iter()
+                .map(|value| {
+                    resolve_runtime(value, &runtime.outputs)
+                        .map(|value| Value::String(value.expose().clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let value = evaluate_page(&active.page, script, &args, save_as.is_some()).await?;
+            if let Some(name) = save_as {
+                let value = value.ok_or_else(|| {
+                    StepError::new(
+                        FailureCategory::Protocol,
+                        "page script returned no JSON-serializable value",
+                    )
+                })?;
+                store_output(&mut runtime.outputs, &mut runtime.redactor, name, value)?;
+            }
+            Ok(None)
+        }
+        Operation::Request {
+            method,
+            url,
+            headers,
+            body,
+            expected_status,
+            save_as,
+        } => {
+            let url = resolve_runtime(url, &runtime.outputs)?;
+            let value = http_request(
+                method,
+                url.expose(),
+                headers,
+                body.as_ref(),
+                *expected_status,
+                save_as.is_some(),
+                &runtime.outputs,
+            )
+            .await?;
+            if let (Some(name), Some(value)) = (save_as, value) {
+                store_output(&mut runtime.outputs, &mut runtime.redactor, name, value)?;
+            }
+            Ok(None)
+        }
         Operation::Assert(assertion) => assert(active, assertion, deadline).await.map(|_| None),
     }
 }
@@ -762,6 +830,148 @@ async fn when_matches(active: &ActiveContext, predicate: &When) -> Result<bool, 
         When::Visible(_) => visible,
         When::Hidden(_) => !visible,
     })
+}
+
+fn resolve_runtime(
+    value: &crate::flow::RuntimeValue,
+    outputs: &BTreeMap<String, Resolved<Value>>,
+) -> Result<Resolved<String>, StepError> {
+    value
+        .resolve(outputs)
+        .map_err(|error| StepError::new(FailureCategory::Protocol, error.to_string()))
+}
+
+async fn evaluate_page(
+    page: &Page,
+    script: &str,
+    arguments: &[Value],
+    capture_result: bool,
+) -> Result<Option<Value>, StepError> {
+    let function = if capture_result {
+        format!("function(...args) {{\n{script}\n}}")
+    } else {
+        format!(
+            "async function(...args) {{ await (async function(...args) {{\n{script}\n}})(...args); }}"
+        )
+    };
+    let params = CallFunctionOnParams::builder()
+        .function_declaration(function)
+        .arguments(arguments.iter().cloned().map(|value| {
+            chromiumoxide::cdp::js_protocol::runtime::CallArgument::builder()
+                .value(value)
+                .build()
+        }))
+        .return_by_value(true)
+        .await_promise(true)
+        .build()
+        .map_err(protocol)?;
+    match page.evaluate_function(params).await {
+        Ok(result) => match result.into_value::<Value>() {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Err(StepError::new(
+            FailureCategory::Protocol,
+            "page script failed",
+        )),
+    }
+}
+
+async fn http_request(
+    method: &str,
+    url: &str,
+    headers: &BTreeMap<String, crate::flow::RuntimeValue>,
+    body: Option<&crate::flow::RuntimeValue>,
+    expected_status: u16,
+    save_body: bool,
+    outputs: &BTreeMap<String, Resolved<Value>>,
+) -> Result<Option<Value>, StepError> {
+    let url = url::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        .ok_or_else(|| StepError::new(FailureCategory::Protocol, "request URL is invalid"))?;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("compiled HTTP method");
+    let client = reqwest::Client::new();
+    let mut request = client.request(method, url);
+    for (name, value) in headers {
+        let value = resolve_runtime(value, outputs)?;
+        request = request.header(name, value.expose());
+    }
+    if let Some(body) = body {
+        request = request.body(resolve_runtime(body, outputs)?.expose().clone());
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| StepError::new(FailureCategory::Protocol, "HTTP request failed"))?;
+    if response.status().as_u16() != expected_status {
+        return Err(StepError::assertion(format!(
+            "HTTP status was {}, expected {expected_status}",
+            response.status().as_u16()
+        )));
+    }
+    if !save_body {
+        return Ok(None);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RUNTIME_VALUE_BYTES as u64)
+    {
+        return Err(StepError::new(
+            FailureCategory::Protocol,
+            "HTTP response body exceeds the runtime value size limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| StepError::new(FailureCategory::Protocol, "HTTP response body failed"))?
+    {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_RUNTIME_VALUE_BYTES)
+        {
+            return Err(StepError::new(
+                FailureCategory::Protocol,
+                "HTTP response body exceeds the runtime value size limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Ok(Some(Value::Null));
+    }
+    Ok(Some(serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        Value::String(String::from_utf8_lossy(&bytes).into_owned())
+    })))
+}
+
+fn store_output(
+    outputs: &mut BTreeMap<String, Resolved<Value>>,
+    redactor: &mut Redactor,
+    name: &str,
+    value: Value,
+) -> Result<(), StepError> {
+    let serialized = serde_json::to_string(&value).map_err(|_| {
+        StepError::new(
+            FailureCategory::Protocol,
+            "runtime output is not JSON-serializable",
+        )
+    })?;
+    if serialized.len() > MAX_RUNTIME_VALUE_BYTES {
+        return Err(StepError::new(
+            FailureCategory::Protocol,
+            "runtime output exceeds the runtime value size limit",
+        ));
+    }
+    redactor.add_secret(serialized);
+    if let Value::String(value) = &value {
+        redactor.add_secret(value.clone());
+    }
+    outputs.insert(name.to_owned(), Resolved::new(value, true));
+    Ok(())
 }
 
 async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Result<(), StepError> {
@@ -2163,6 +2373,7 @@ async fn publish_bytes(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()
 async fn step_failure(
     host: &BrowserHost,
     flow: &CompiledFlow,
+    redactor: &Redactor,
     active: &ActiveContext,
     step: &CompiledStep,
     error: StepError,
@@ -2172,17 +2383,19 @@ async fn step_failure(
         .ok()
         .and_then(Result::ok)
         .flatten()
-        .map(|url| safe(flow, url));
+        .map(|url| SafeText::public(redactor.redact(&url)));
     let category = match host.status() {
         BrowserStatus::Running => error.category,
         BrowserStatus::Failed(_) | BrowserStatus::Closed => FailureCategory::BrowserCrash,
     };
     let timeout_ms = deadline_timeout_ms(&error, step.timeout);
-    let mut failure = Failure::new(category, safe(flow, error.message));
+    let mut failure = Failure::new(category, SafeText::public(redactor.redact(&error.message)));
     failure.step = Some(step_context(flow, step));
     failure.current_url = current_url;
     failure.timeout_ms = timeout_ms;
-    failure.last_observed = error.last_observed.map(|value| safe(flow, value));
+    failure.last_observed = error
+        .last_observed
+        .map(|value| SafeText::public(redactor.redact(&value)));
     failure
 }
 
@@ -2227,6 +2440,8 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Clear(ClearTarget::Indexeddb) => "clear.indexeddb",
         Operation::Clear(ClearTarget::CacheStorage) => "clear.cache-storage",
         Operation::Clear(ClearTarget::ServiceWorkers) => "clear.service-workers",
+        Operation::Evaluate { .. } => "evaluate",
+        Operation::Request { .. } => "request",
         Operation::Assert(Assertion::Visible(_)) => "assert.visible",
         Operation::Assert(Assertion::Hidden(_)) => "assert.hidden",
         Operation::Assert(Assertion::Text { .. }) => "assert.text",
@@ -2259,6 +2474,8 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::Screenshot { .. }
         | Operation::Recording(_)
         | Operation::Clear(_)
+        | Operation::Evaluate { .. }
+        | Operation::Request { .. }
         | Operation::Assert(Assertion::Url(_) | Assertion::Screenshot(_)) => None,
     }
 }
@@ -2501,6 +2718,48 @@ mod tests {
                 Modifier::Shift
             ]),
             15
+        );
+    }
+
+    #[test]
+    fn runtime_json_is_compact_secret_and_size_bounded() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps:\n  - evaluate: { script: 'return 1', save_as: saved }\n  - fill: { target: { css: input }, value: 'prefix-${saved}' }\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let Operation::Fill { value, .. } = &flow.steps[1].operation else {
+            panic!("expected fill");
+        };
+        let outputs = BTreeMap::from([(
+            "saved".to_owned(),
+            Resolved::new(serde_json::json!({ "token": "canary" }), true),
+        )]);
+        let resolved =
+            resolve_runtime(value, &outputs).unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(resolved.expose(), "prefix-{\"token\":\"canary\"}");
+        assert!(resolved.is_secret());
+
+        let mut stored = BTreeMap::new();
+        let mut redactor = Redactor::default();
+        store_output(
+            &mut stored,
+            &mut redactor,
+            "small",
+            Value::String("canary".to_owned()),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message));
+        assert_eq!(redactor.redact("value=canary"), "value=[REDACTED]");
+        assert!(
+            store_output(
+                &mut stored,
+                &mut redactor,
+                "large",
+                Value::String("x".repeat(MAX_RUNTIME_VALUE_BYTES + 1)),
+            )
+            .is_err()
         );
     }
 
@@ -2809,6 +3068,14 @@ steps:
         .unwrap();
         let mut active = ActiveContext::new(page.clone());
 
+        let mut runtime = RuntimeState {
+            outputs: BTreeMap::new(),
+            redactor: flow.redactor.clone(),
+            page_settings: PageSettings {
+                viewport: Viewport::new(800, 600).unwrap(),
+                geolocation: None,
+            },
+        };
         for step in &flow.steps {
             execute_step(
                 &host,
@@ -2817,10 +3084,7 @@ steps:
                 step,
                 Instant::now() + Duration::from_secs(2),
                 Path::new("."),
-                PageSettings {
-                    viewport: Viewport::new(800, 600).unwrap(),
-                    geolocation: None,
-                },
+                &mut runtime,
             )
             .await
             .unwrap_or_else(|error| panic!("{}: {:?}", error.message, error.last_observed));

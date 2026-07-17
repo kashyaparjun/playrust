@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::Value;
 use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -29,6 +30,10 @@ pub const MAX_REPEAT: usize = 100;
 pub const MAX_RETRIES: usize = 10;
 /// Maximum size of a YAML scalar or interpolated value in bytes (64 KiB).
 pub const MAX_SCALAR_BYTES: usize = 64 * 1024;
+/// Maximum serialized size of one runtime output or HTTP body (64 KiB).
+pub const MAX_RUNTIME_VALUE_BYTES: usize = 64 * 1024;
+/// Maximum number of headers accepted by one HTTP request.
+pub const MAX_HTTP_HEADERS: usize = 100;
 /// Maximum timeout accepted for flow settings or an individual step.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 pub const MAX_GESTURE_DELTA: i32 = 10_000;
@@ -65,7 +70,7 @@ impl<T> Resolved<T> {
         self.secret
     }
 
-    fn new(value: T, secret: bool) -> Self {
+    pub(crate) fn new(value: T, secret: bool) -> Self {
         Self { value, secret }
     }
 }
@@ -111,6 +116,15 @@ impl Redactor {
         self.secrets
             .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         self.secrets.dedup();
+    }
+
+    pub(crate) fn add_secret(&mut self, secret: String) {
+        if !secret.is_empty() {
+            self.secrets.push(secret);
+            self.secrets
+                .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+            self.secrets.dedup();
+        }
     }
 }
 
@@ -212,6 +226,8 @@ pub struct RawStep {
     pub screenshot: Option<RawScreenshot>,
     pub recording: Option<RecordingControl>,
     pub clear: Option<ClearTarget>,
+    pub evaluate: Option<RawEvaluate>,
+    pub request: Option<RawRequest>,
     #[serde(rename = "assert")]
     pub assertion: Option<RawAssertion>,
 }
@@ -244,6 +260,27 @@ pub struct RawWhen {
 pub struct RawVariablePredicate {
     pub name: String,
     pub equals: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawEvaluate {
+    pub script: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub save_as: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRequest {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub body: Option<String>,
+    pub expected_status: u16,
+    pub save_as: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -534,14 +571,14 @@ pub enum Operation {
     },
     Fill {
         target: Locator,
-        value: Resolved<String>,
+        value: RuntimeValue,
     },
     Erase {
         target: Locator,
     },
     Select {
         target: Locator,
-        value: Resolved<String>,
+        value: RuntimeValue,
     },
     Scroll {
         x: i64,
@@ -582,6 +619,19 @@ pub enum Operation {
     },
     Recording(RecordingControl),
     Clear(ClearTarget),
+    Evaluate {
+        script: String,
+        args: Vec<RuntimeValue>,
+        save_as: Option<String>,
+    },
+    Request {
+        method: String,
+        url: RuntimeValue,
+        headers: BTreeMap<String, RuntimeValue>,
+        body: Option<RuntimeValue>,
+        expected_status: u16,
+        save_as: Option<String>,
+    },
     Assert(Assertion),
 }
 
@@ -590,6 +640,71 @@ pub enum FrameSwitch {
     Target(Locator),
     Main,
     Parent,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeValue {
+    template: Resolved<String>,
+    parts: Vec<RuntimeValuePart>,
+    outputs: BTreeSet<String>,
+}
+
+impl fmt::Debug for RuntimeValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_secret() {
+            formatter.write_str(REDACTED)
+        } else {
+            self.template.fmt(formatter)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeValuePart {
+    Literal(Resolved<String>),
+    Output(String),
+}
+
+impl RuntimeValue {
+    pub fn resolve(
+        &self,
+        outputs: &BTreeMap<String, Resolved<Value>>,
+    ) -> Result<Resolved<String>, FlowError> {
+        let mut value = String::new();
+        let mut secret = false;
+        for part in &self.parts {
+            let resolved = match part {
+                RuntimeValuePart::Literal(value) => value.clone(),
+                RuntimeValuePart::Output(name) => {
+                    let output = outputs.get(name).ok_or_else(|| {
+                        FlowError::Invalid(format!("runtime output {name:?} is unavailable"))
+                    })?;
+                    Resolved::new(
+                        match output.expose() {
+                            Value::String(value) => value.clone(),
+                            value => serde_json::to_string(value).expect("JSON value serializes"),
+                        },
+                        true,
+                    )
+                }
+            };
+            push_interpolated("runtime value", &mut value, resolved.expose())?;
+            secret |= resolved.secret;
+        }
+        Ok(Resolved::new(value, secret))
+    }
+
+    pub fn expose(&self) -> &str {
+        self.template.expose()
+    }
+
+    pub fn is_secret(&self) -> bool {
+        self.template.is_secret() || !self.outputs.is_empty()
+    }
+
+    fn output_names(&self) -> impl Iterator<Item = &String> {
+        self.outputs.iter()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1088,6 +1203,8 @@ fn compile_raw_expanded(
                 step.screenshot.is_some(),
                 step.recording.is_some(),
                 step.clear.is_some(),
+                step.evaluate.is_some(),
+                step.request.is_some(),
                 step.assertion.is_some(),
             ]
             .into_iter()
@@ -1262,6 +1379,7 @@ fn validate_subflow_path(run: &str, source: &Path, index: usize) -> Result<(), F
 fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> {
     let mut ids = BTreeSet::new();
     let mut screenshots = BTreeSet::new();
+    let mut outputs = BTreeMap::new();
     for (offset, step) in steps.iter_mut().enumerate() {
         step.index = offset + 1;
         if let Some(id) = &step.id
@@ -1275,6 +1393,22 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
             return invalid(format!(
                 "duplicate screenshot name {name:?} in expanded flow"
             ));
+        }
+        for name in operation_runtime_values(&step.operation).flat_map(RuntimeValue::output_names) {
+            if !outputs.contains_key(name) {
+                return invalid(format!(
+                    "step {} references unknown variable or runtime output {name:?} before it is saved",
+                    step.index
+                ));
+            }
+        }
+        if let Some(name) = operation_save_as(&step.operation) {
+            let producer = (step.source.clone(), step.source_index);
+            if let Some(existing) = outputs.insert(name.to_owned(), producer.clone())
+                && existing != producer
+            {
+                return invalid(format!("duplicate runtime output {name:?}"));
+            }
         }
     }
     if steps.is_empty() {
@@ -1319,6 +1453,32 @@ fn validate_page_switching_video(flow: &CompiledFlow) -> Result<(), FlowError> {
         ));
     }
     Ok(())
+}
+
+fn operation_runtime_values(operation: &Operation) -> Box<dyn Iterator<Item = &RuntimeValue> + '_> {
+    match operation {
+        Operation::Fill { value, .. } | Operation::Select { value, .. } => {
+            Box::new(std::iter::once(value))
+        }
+        Operation::Evaluate { args, .. } => Box::new(args.iter()),
+        Operation::Request {
+            url, headers, body, ..
+        } => Box::new(
+            std::iter::once(url)
+                .chain(headers.values())
+                .chain(body.iter()),
+        ),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+fn operation_save_as(operation: &Operation) -> Option<&str> {
+    match operation {
+        Operation::Evaluate { save_as, .. } | Operation::Request { save_as, .. } => {
+            save_as.as_deref()
+        }
+        _ => None,
+    }
 }
 
 pub fn discover_flow_files(path: impl AsRef<Path>) -> Result<Vec<PathBuf>, FlowError> {
@@ -1596,6 +1756,8 @@ fn compile_operation(
         step.screenshot.is_some(),
         step.recording.is_some(),
         step.clear.is_some(),
+        step.evaluate.is_some(),
+        step.request.is_some(),
         step.assertion.is_some(),
     ]
     .into_iter()
@@ -1646,8 +1808,10 @@ fn compile_operation(
         });
     }
     if let Some(raw) = step.fill {
-        let value = interpolate(&format!("step {index} fill.value"), &raw.value, inputs)?;
-        require_non_empty(&format!("step {index} fill.value"), value.expose())?;
+        let value = compile_runtime_value(&format!("step {index} fill.value"), &raw.value, inputs)?;
+        if value.outputs.is_empty() {
+            require_non_empty(&format!("step {index} fill.value"), value.template.expose())?;
+        }
         return Ok(Operation::Fill {
             target: compile_locator(raw.target, index, inputs)?,
             value,
@@ -1659,7 +1823,8 @@ fn compile_operation(
         });
     }
     if let Some(raw) = step.select {
-        let value = interpolate(&format!("step {index} select.value"), &raw.value, inputs)?;
+        let value =
+            compile_runtime_value(&format!("step {index} select.value"), &raw.value, inputs)?;
         return Ok(Operation::Select {
             target: compile_locator(raw.target, index, inputs)?,
             value,
@@ -1770,6 +1935,78 @@ fn compile_operation(
     }
     if let Some(target) = step.clear {
         return Ok(Operation::Clear(target));
+    }
+    if let Some(raw) = step.evaluate {
+        require_scalar_size(&format!("step {index} evaluate.script"), &raw.script)?;
+        require_non_empty(&format!("step {index} evaluate.script"), &raw.script)?;
+        let save_as = compile_save_as(index, raw.save_as, inputs)?;
+        let args = raw
+            .args
+            .iter()
+            .enumerate()
+            .map(|(offset, value)| {
+                compile_runtime_value(
+                    &format!("step {index} evaluate.args[{offset}]"),
+                    value,
+                    inputs,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok(Operation::Evaluate {
+            script: raw.script,
+            args,
+            save_as,
+        });
+    }
+    if let Some(raw) = step.request {
+        if raw.headers.len() > MAX_HTTP_HEADERS {
+            return invalid(format!(
+                "step {index} request.headers must not exceed {MAX_HTTP_HEADERS} entries"
+            ));
+        }
+        let method = raw.method.to_ascii_uppercase();
+        if !matches!(
+            method.as_str(),
+            "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
+        ) {
+            return invalid(format!("step {index} request.method is unsupported"));
+        }
+        if !(100..=599).contains(&raw.expected_status) {
+            return invalid(format!(
+                "step {index} request.expected_status must be between 100 and 599"
+            ));
+        }
+        let url = compile_runtime_value(&format!("step {index} request.url"), &raw.url, inputs)?;
+        if url.outputs.is_empty() {
+            parse_absolute_url(&format!("step {index} request.url"), url.template.clone())?;
+        }
+        let mut headers = BTreeMap::new();
+        for (name, value) in raw.headers {
+            require_scalar_size(&format!("step {index} request header name"), &name)?;
+            require_non_empty(&format!("step {index} request header name"), &name)?;
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                FlowError::Invalid(format!("step {index} request header name is invalid"))
+            })?;
+            headers.insert(
+                name,
+                compile_runtime_value(&format!("step {index} request header"), &value, inputs)?,
+            );
+        }
+        let body = raw
+            .body
+            .as_deref()
+            .map(|value| {
+                compile_runtime_value(&format!("step {index} request.body"), value, inputs)
+            })
+            .transpose()?;
+        return Ok(Operation::Request {
+            method,
+            url,
+            headers,
+            body,
+            expected_status: raw.expected_status,
+            save_as: compile_save_as(index, raw.save_as, inputs)?,
+        });
     }
     Ok(Operation::Assert(compile_assertion(
         step.assertion.expect("operation count checked"),
@@ -2107,6 +2344,78 @@ fn interpolate_non_empty(
     let value = interpolate(context, source, inputs)?;
     require_non_empty(context, value.expose())?;
     Ok(value)
+}
+
+fn compile_save_as(
+    index: usize,
+    save_as: Option<String>,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<Option<String>, FlowError> {
+    let Some(save_as) = save_as else {
+        return Ok(None);
+    };
+    require_scalar_size(&format!("step {index} save_as"), &save_as)?;
+    validate_input_name(&save_as)
+        .map_err(|_| FlowError::Invalid(format!("step {index} save_as is not a valid name")))?;
+    if inputs.contains_key(&save_as) {
+        return invalid(format!(
+            "step {index} save_as conflicts with an input named {save_as:?}"
+        ));
+    }
+    Ok(Some(save_as))
+}
+
+fn compile_runtime_value(
+    context: &str,
+    source: &str,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<RuntimeValue, FlowError> {
+    require_scalar_size(context, source)?;
+    let mut output = String::with_capacity(source.len());
+    let mut outputs = BTreeSet::new();
+    let mut parts = Vec::new();
+    let mut secret = false;
+    let mut remaining = source;
+    while let Some(start) = remaining.find("${") {
+        let literal = &remaining[..start];
+        push_interpolated(context, &mut output, literal)?;
+        if !literal.is_empty() {
+            parts.push(RuntimeValuePart::Literal(Resolved::new(
+                literal.to_owned(),
+                false,
+            )));
+        }
+        let after_start = &remaining[start + 2..];
+        let end = after_start
+            .find('}')
+            .ok_or_else(|| FlowError::Invalid(format!("{context} has an unterminated variable")))?;
+        let name = &after_start[..end];
+        validate_input_name(name).map_err(|_| {
+            FlowError::Invalid(format!("{context} contains invalid variable reference"))
+        })?;
+        if let Some(value) = inputs.get(name) {
+            push_interpolated(context, &mut output, value.expose())?;
+            secret |= value.secret;
+            parts.push(RuntimeValuePart::Literal(value.clone()));
+        } else {
+            outputs.insert(name.to_owned());
+            push_interpolated(context, &mut output, &format!("${{{name}}}"))?;
+            parts.push(RuntimeValuePart::Output(name.to_owned()));
+        }
+        remaining = &after_start[end + 1..];
+    }
+    push_interpolated(context, &mut output, remaining)?;
+    if !remaining.is_empty() {
+        parts.push(RuntimeValuePart::Literal(Resolved::new(
+            remaining.to_owned(),
+            false,
+        )));
+    }
+    Ok(RuntimeValue {
+        template: Resolved::new(output, secret),
+        parts,
+        outputs,
+    })
 }
 
 fn interpolate_non_secret(
@@ -2792,6 +3101,88 @@ steps:
             let source = format!("version: 1\nname: recording\nsteps:\n{steps}");
             assert!(error(&source).contains(expected), "accepted {steps:?}");
         }
+    }
+
+    #[test]
+    fn compiles_page_evaluation_http_and_later_runtime_values() {
+        let flow = compile(
+            r#"version: 1
+name: runtime
+steps:
+  - evaluate:
+      script: "return { token: args[0], count: 2 };"
+      args: [seed]
+      save_as: page_value
+  - request:
+      method: post
+      url: https://example.test/setup
+      headers: { x-token: "${page_value}" }
+      body: "${page_value}"
+      expected_status: 201
+      save_as: response
+  - fill: { target: { css: input }, value: "${response}" }
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &flow.steps[0].operation,
+            Operation::Evaluate { save_as: Some(name), args, .. }
+                if name == "page_value" && args[0].expose() == "seed"
+        ));
+        assert!(matches!(
+            &flow.steps[1].operation,
+            Operation::Request { method, expected_status: 201, save_as: Some(name), .. }
+                if method == "POST" && name == "response"
+        ));
+        let Operation::Fill { value, .. } = &flow.steps[2].operation else {
+            panic!("expected fill");
+        };
+        assert!(value.is_secret());
+    }
+
+    #[test]
+    fn runtime_outputs_are_ordered_unique_and_bounded_at_compile_time() {
+        for (source, expected) in [
+            (
+                "version: 1\nname: x\nsteps: [{ fill: { target: { css: x }, value: '${later}' } }, { evaluate: { script: 'return 1', save_as: later } }]\n",
+                "before it is saved",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ evaluate: { script: 'return 1', save_as: same } }, { request: { method: GET, url: https://x.test, expected_status: 200, save_as: same } }]\n",
+                "duplicate runtime output",
+            ),
+            (
+                "version: 1\nname: x\nvars: { same: value }\nsteps: [{ evaluate: { script: 'return 1', save_as: same } }]\n",
+                "conflicts with an input",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ request: { method: TRACE, url: https://x.test, expected_status: 200 } }]\n",
+                "method is unsupported",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ request: { method: GET, url: https://x.test, expected_status: 999 } }]\n",
+                "between 100 and 599",
+            ),
+        ] {
+            assert!(error(source).contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_outputs_support_repeated_and_conditional_expansions() {
+        let flow = compile(
+            "version: 1\nname: x\nsteps:\n  - repeat: 2\n    evaluate: { script: 'return 1', save_as: repeated }\n  - when: { visible: { css: .optional } }\n    evaluate: { script: 'return 2', save_as: conditional }\n  - fill: { target: { css: input }, value: '${repeated}-${conditional}' }\n",
+        )
+        .unwrap();
+
+        assert_eq!(flow.steps.len(), 4);
+        assert!(matches!(
+            &flow.steps[3].operation,
+            Operation::Fill { value, .. }
+                if value.output_names().cloned().collect::<Vec<_>>()
+                    == ["conditional", "repeated"]
+        ));
     }
 
     #[test]
