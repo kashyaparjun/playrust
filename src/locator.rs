@@ -67,6 +67,7 @@ const STATE_FILTER_FUNCTION: &str = r#"function(checked, selected, focused, enab
 const RELATION_FUNCTION: &str = r#"function(other, relation) {
     if (!this.isConnected || !other.isConnected || this === other) return false;
     if (relation === 'within') return other.contains(this);
+    if (relation === 'child-of') return this.parentElement === other;
     if (relation === 'has') return this.contains(other);
     const rect = this.getBoundingClientRect();
     const otherRect = other.getBoundingClientRect();
@@ -920,6 +921,7 @@ fn optional_bool(value: Option<bool>) -> CallArgument {
 fn relation_name(relation: RelationKind) -> &'static str {
     match relation {
         RelationKind::Within => "within",
+        RelationKind::ChildOf => "child-of",
         RelationKind::Has => "has",
         RelationKind::Above => "above",
         RelationKind::Below => "below",

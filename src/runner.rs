@@ -611,6 +611,18 @@ async fn execute_step(
             let (x, y) = page_point(active, element.center.x, element.center.y).await?;
             dispatch_click(&active.page, x, y, 1).await.map(|_| None)
         }
+        Operation::ClickPoint { point } => {
+            dispatch_click(&active.page, f64::from(point.x), f64::from(point.y), 1)
+                .await
+                .map_err(|mut error| {
+                    error.message = format!(
+                        "viewport click at ({}, {}) failed: {}",
+                        point.x, point.y, error.message
+                    );
+                    error
+                })
+                .map(|_| None)
+        }
         Operation::DoubleClick { target, position } => {
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
@@ -2539,6 +2551,7 @@ fn operation_name(operation: &Operation) -> &'static str {
     match operation {
         Operation::Open { .. } => "open",
         Operation::Click { .. } => "click",
+        Operation::ClickPoint { .. } => "click.point",
         Operation::DoubleClick { .. } => "double_click",
         Operation::Fill { .. } => "fill",
         Operation::Erase { .. } => "erase",
@@ -2591,6 +2604,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
         Operation::Open { .. }
+        | Operation::ClickPoint { .. }
         | Operation::Scroll { .. }
         | Operation::Back
         | Operation::SwitchPage(_)
@@ -2652,6 +2666,7 @@ fn locator_text_inner(locator: &Locator) -> Option<String> {
 fn relation_name(relation: RelationKind) -> &'static str {
     match relation {
         RelationKind::Within => "within",
+        RelationKind::ChildOf => "child_of",
         RelationKind::Has => "has",
         RelationKind::Above => "above",
         RelationKind::Below => "below",
@@ -3064,7 +3079,7 @@ mod tests {
     #[test]
     fn public_locator_diagnostics_include_modifiers() {
         let flow = compile_yaml_with_env(
-            "version: 1\nname: x\nsteps: [{ click: { target: { css: button, index: 1, checked: false, focused: true, enabled: true, within: { test_id: panel } } } }]\n",
+            "version: 1\nname: x\nsteps: [{ click: { target: { css: button, index: 1, checked: false, focused: true, enabled: true, child_of: { test_id: panel } } } }]\n",
             "x.yaml",
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -3073,8 +3088,22 @@ mod tests {
         let context = step_context(&flow, &flow.steps[0]);
         assert_eq!(
             context.locator.unwrap().as_str(),
-            "css=\"button\" index=1 checked=false focused=true enabled=true within=(test_id=\"panel\")"
+            "css=\"button\" index=1 checked=false focused=true enabled=true child_of=(test_id=\"panel\")"
         );
+    }
+
+    #[test]
+    fn viewport_click_diagnostics_do_not_claim_a_locator() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsettings: { video: off, viewport: { width: 800, height: 600 } }\nsteps: [{ click: { point: { x: 100, y: 200 } } }]\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let context = step_context(&flow, &flow.steps[0]);
+        assert_eq!(context.operation, "click.point");
+        assert!(context.locator.is_none());
     }
 
     #[test]

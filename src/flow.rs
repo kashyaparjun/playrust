@@ -308,8 +308,9 @@ pub struct RawTargetAction {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawClick {
-    pub target: RawLocator,
+    pub target: Option<RawLocator>,
     pub position: Option<RelativePoint>,
+    pub point: Option<ViewportPoint>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -445,6 +446,7 @@ pub struct RawLocator {
     pub focused: Option<bool>,
     pub enabled: Option<bool>,
     pub within: Option<Box<RawLocator>>,
+    pub child_of: Option<Box<RawLocator>>,
     pub has: Option<Box<RawLocator>>,
     pub above: Option<Box<RawLocator>>,
     pub below: Option<Box<RawLocator>>,
@@ -492,6 +494,13 @@ pub enum TextMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelativePoint {
+    pub x: u32,
+    pub y: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewportPoint {
     pub x: u32,
     pub y: u32,
 }
@@ -565,6 +574,9 @@ pub enum Operation {
     Click {
         target: Locator,
         position: Option<RelativePoint>,
+    },
+    ClickPoint {
+        point: ViewportPoint,
     },
     DoubleClick {
         target: Locator,
@@ -763,6 +775,7 @@ pub struct LocatorRelation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationKind {
     Within,
+    ChildOf,
     Has,
     Above,
     Below,
@@ -1800,14 +1813,42 @@ fn compile_operation(
         });
     }
     if let Some(raw) = step.click {
+        if let Some(point) = raw.point {
+            if raw.target.is_some() || raw.position.is_some() {
+                return invalid(format!(
+                    "step {index} click point cannot be combined with target or position"
+                ));
+            }
+            if point.x >= viewport.width || point.y >= viewport.height {
+                return invalid(format!(
+                    "step {index} click point ({}, {}) is outside viewport {}x{}",
+                    point.x, point.y, viewport.width, viewport.height
+                ));
+            }
+            return Ok(Operation::ClickPoint { point });
+        }
+        let target = raw.target.ok_or_else(|| {
+            FlowError::Invalid(format!(
+                "step {index} click requires exactly one of target or point"
+            ))
+        })?;
         return Ok(Operation::Click {
-            target: compile_locator(raw.target, index, inputs)?,
+            target: compile_locator(target, index, inputs)?,
             position: raw.position,
         });
     }
     if let Some(raw) = step.double_click {
+        if raw.point.is_some() {
+            return invalid(format!("step {index} double_click does not support point"));
+        }
         return Ok(Operation::DoubleClick {
-            target: compile_locator(raw.target, index, inputs)?,
+            target: compile_locator(
+                raw.target.ok_or_else(|| {
+                    FlowError::Invalid(format!("step {index} double_click requires target"))
+                })?,
+                index,
+                inputs,
+            )?,
             position: raw.position,
         });
     }
@@ -2311,6 +2352,7 @@ fn compile_locator_at(
     let mut relations = Vec::new();
     for (kind, relation) in [
         (RelationKind::Within, raw.within),
+        (RelationKind::ChildOf, raw.child_of),
         (RelationKind::Has, raw.has),
         (RelationKind::Above, raw.above),
         (RelationKind::Below, raw.below),
@@ -3340,9 +3382,46 @@ steps: [{ open: https://x.test }]
     }
 
     #[test]
+    fn compiles_only_in_bounds_targetless_click_points() {
+        let flow = compile(
+            "version: 1\nname: x\nsettings: { video: off, viewport: { width: 800, height: 600 } }\nsteps: [{ click: { point: { x: 799, y: 599 } } }]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            flow.steps[0].operation,
+            Operation::ClickPoint {
+                point: ViewportPoint { x: 799, y: 599 }
+            }
+        ));
+
+        for (click, message) in [
+            ("{ point: { x: 800, y: 10 } }", "outside viewport 800x600"),
+            ("{ point: { x: 10, y: 600 } }", "outside viewport 800x600"),
+            ("{}", "requires exactly one of target or point"),
+            (
+                "{ target: { css: button }, point: { x: 10, y: 10 } }",
+                "cannot be combined with target or position",
+            ),
+            (
+                "{ point: { x: 10, y: 10 }, position: { x: 1, y: 1 } }",
+                "cannot be combined with target or position",
+            ),
+        ] {
+            let source = format!(
+                "version: 1\nname: x\nsettings: {{ video: off, viewport: {{ width: 800, height: 600 }} }}\nsteps: [{{ click: {click} }}]\n"
+            );
+            assert!(error(&source).contains(message), "{}", error(&source));
+        }
+        assert!(
+            error("version: 1\nname: x\nsteps: [{ double_click: { point: { x: 1, y: 1 } } }]\n")
+                .contains("double_click does not support point")
+        );
+    }
+
+    #[test]
     fn compiles_recursive_relations_and_bounds_their_depth() {
         let flow = compile(
-            "version: 1\nname: x\nsteps:\n  - click:\n      target:\n        css: button\n        within: { css: .panel }\n        has: { text: Save }\n        above: { test_id: footer }\n        below: { css: header }\n        left: { label: Cancel }\n        right: { role: { value: img, name: Logo } }\n",
+            "version: 1\nname: x\nsteps:\n  - click:\n      target:\n        css: button\n        within: { css: .panel }\n        child_of: { css: .toolbar }\n        has: { text: Save }\n        above: { test_id: footer }\n        below: { css: header }\n        left: { label: Cancel }\n        right: { role: { value: img, name: Logo } }\n",
         )
         .unwrap();
         let Operation::Click { target, .. } = &flow.steps[0].operation else {
@@ -3356,6 +3435,7 @@ steps: [{ open: https://x.test }]
                 .collect::<Vec<_>>(),
             [
                 RelationKind::Within,
+                RelationKind::ChildOf,
                 RelationKind::Has,
                 RelationKind::Above,
                 RelationKind::Below,

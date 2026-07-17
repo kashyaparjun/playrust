@@ -21,12 +21,18 @@ const HTML: &str = r#"<!doctype html>
       #below-anchor { position: absolute; left: 100px; top: 20px; width: 40px; height: 20px; }
       #left-anchor { position: absolute; left: 10px; top: 100px; width: 30px; height: 20px; }
       #right-anchor { position: absolute; left: 300px; top: 100px; width: 30px; height: 20px; }
+      #point-target { position: fixed; left: 400px; top: 20px; width: 80px; height: 40px; }
     </style>
   </head>
   <body>
     <button class="enabled-choice" disabled>Disabled</button>
     <button class="enabled-choice" onclick="document.querySelector('#enabled-result').textContent = 'enabled'">Enabled</button>
     <p id="enabled-result">pending</p>
+    <button id="point-target">Point</button>
+    <p id="point-result">0</p>
+    <div id="direct-parent"><button class="child-choice">Direct</button></div>
+    <div><div><button class="child-choice">Nested</button></div></div>
+    <p id="child-result">pending</p>
     <section id="panel">
       <button id="target" class="candidate"><span>Save</span></button>
       <div id="cover"></div>
@@ -41,6 +47,15 @@ const HTML: &str = r#"<!doctype html>
         const rect = event.currentTarget.getBoundingClientRect();
         document.querySelector('#click-result').textContent =
           `${Math.round(event.clientX - rect.left)},${Math.round(event.clientY - rect.top)}`;
+      });
+      document.querySelector('#point-target').addEventListener('click', () => {
+        const result = document.querySelector('#point-result');
+        result.textContent = String(Number(result.textContent) + 1);
+      });
+      document.querySelectorAll('.child-choice').forEach(button => {
+        button.addEventListener('click', () => {
+          document.querySelector('#child-result').textContent = button.textContent;
+        });
       });
     </script>
   </body>
@@ -75,6 +90,11 @@ steps:
   - click:
       target: {{ css: .enabled-choice, enabled: true, index: 0 }}
   - assert: {{ text: {{ target: {{ css: "#enabled-result" }}, equals: enabled }} }}
+  - click: {{ point: {{ x: 410, y: 30 }} }}
+  - assert: {{ text: {{ target: {{ css: "#point-result" }}, equals: "1" }} }}
+  - click:
+      target: {{ css: .child-choice, child_of: {{ css: "#direct-parent" }} }}
+  - assert: {{ text: {{ target: {{ css: "#child-result" }}, equals: Direct }} }}
   - click:
       position: {{ x: 10, y: 10 }}
       target:

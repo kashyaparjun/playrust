@@ -108,6 +108,7 @@ Variable equality is resolved at compile time against a declared, immutable, non
 | --- | --- |
 | Navigate | `open: /path` (requires `base_url`) or an absolute HTTP(S) URL |
 | Click | `click: { target: { test_id: submit }, position: { x: 8, y: 12 } }` |
+| Click viewport point | `click: { point: { x: 100, y: 200 } }` |
 | Double click | `double_click: { target: { test_id: item }, position: { x: 8, y: 12 } }` |
 | Fill | `fill: { target: { label: Email }, value: "${username}" }` |
 | Erase | `erase: { target: { label: Search } }` |
@@ -134,7 +135,7 @@ Variable equality is resolved at compile time against a declared, immutable, non
 | Evaluate page JavaScript | `evaluate: { script: "return args[0]", args: [value], save_as: result }` |
 | HTTP setup request | `request: { method: POST, url: "https://api.test/setup", expected_status: 201 }` |
 
-Click, double click, fill, erase, select, swipe, long press, and press wait for one unique, visible, stable, enabled, uncovered target; fill and erase also require an editable target. Click and double-click optionally accept `position`, an unsigned CSS-pixel offset from the target's top-left border box. The point must be inside the target, inside the viewport, and hit the target or one of its descendants; hit testing is performed at that exact point. Without `position`, the target center is used. Erase supports the same text inputs, textareas, and content-editable elements as fill. Select accepts an option value (including an empty value) on a native, non-`multiple` `<select>` and dispatches one bubbling `input` event followed by one `change` event. Swipe and long press dispatch one mouse gesture after actionability succeeds. Input actions are not retried after pointer, keyboard, wheel, or form event dispatch begins.
+Click, double click, fill, erase, select, swipe, long press, and press wait for one unique, visible, stable, enabled, uncovered target; fill and erase also require an editable target. Click and double-click optionally accept `position`, an unsigned CSS-pixel offset from the target's top-left border box. The position must be inside the target, inside the viewport, and hit the target or one of its descendants; hit testing is performed at that exact position. Without `position`, the target center is used. A targetless click instead accepts Maestro-style absolute viewport coordinates as `point: { x, y }`. The point is validated against the configured CSS-pixel viewport, dispatches exactly one click without locator lookup, waiting, scrolling, uniqueness, or element actionability checks, and is reported as `click.point`; it cannot be combined with `target` or `position`. Erase supports the same text inputs, textareas, and content-editable elements as fill. Select accepts an option value (including an empty value) on a native, non-`multiple` `<select>` and dispatches one bubbling `input` event followed by one `change` event. Swipe and long press dispatch one mouse gesture after actionability succeeds. Input actions are not retried after pointer, keyboard, wheel, or form event dispatch begins.
 
 Scroll sends one wheel input at the viewport center; positive values move right/down and negative values move left/up, and at least one axis must be non-zero. `scroll_until_visible` repeats one bounded wheel delta until its unique target is visible or the step deadline expires, allowing a target that is initially absent from a virtualized list. Its `x` and `y` values, and swipe offsets, are limited to `-10000..=10000` CSS pixels and cannot both be zero. A swipe endpoint must remain inside the viewport. Swipe defaults to `300ms`; long press defaults to `500ms`; either duration must be positive and at most `10s`, and must fit within the remaining step deadline.
 
@@ -198,6 +199,7 @@ target: { css: ".row", checked: true, enabled: true, index: 0 }
 target:
   role: { value: button, name: Save }
   within: { test_id: editor }
+  child_of: { css: .toolbar }
   has: { text: Ready }
   above: { text: Footer }
 ```
@@ -206,7 +208,7 @@ Each target has exactly one strategy. `test_id` matches `data-testid`. Label and
 
 The optional boolean filters `checked`, `selected`, `focused`, and `enabled` match the corresponding live DOM state. `checked` applies only to checkable elements, `selected` only to selectable elements, and `enabled` accounts for native disabled controls, inert ancestors, and `aria-disabled="true"` ancestors. An optional zero-based `index` then selects from the filtered matches in DOM order.
 
-Relations are additional filters and may be combined. `within` requires the candidate to be a descendant of a relation match; `has` requires it to contain a matching descendant. `above`, `below`, `left`, and `right` require non-overlapping bounding boxes in that direction, so overlapping or empty boxes do not match. Each relation value is another complete locator with exactly one base strategy and may recursively contain relations up to eight levels deep. At every level, base matches are placed in DOM order, state and relation filters run before `index`, and only the outer locator is checked for final uniqueness and actionability. Secret-derived values in any nested relation redact the complete locator diagnostic.
+Relations are additional filters and may be combined. `within` requires the candidate to be a descendant of a relation match; `child_of` requires the candidate's direct parent element to match; `has` requires it to contain a matching descendant. `above`, `below`, `left`, and `right` require non-overlapping bounding boxes in that direction, so overlapping or empty boxes do not match. Each relation value is another complete locator with exactly one base strategy and may recursively contain relations up to eight levels deep. At every level, base matches are placed in DOM order, state and relation filters run before `index`, and only the outer locator is checked for final uniqueness and actionability. Secret-derived values in any nested relation redact the complete locator diagnostic.
 
 ### Assertions
 
