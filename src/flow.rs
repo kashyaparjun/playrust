@@ -23,6 +23,10 @@ pub const MAX_FLOW_STEPS: usize = 10_000;
 pub const MAX_SUBFLOW_DEPTH: usize = 32;
 /// Maximum nested locator relation depth, excluding the root locator.
 pub const MAX_LOCATOR_DEPTH: usize = 8;
+/// Maximum compile-time repetitions of one step or subflow.
+pub const MAX_REPEAT: usize = 100;
+/// Maximum additional attempts for an assertion.
+pub const MAX_RETRIES: usize = 10;
 /// Maximum size of a YAML scalar or interpolated value in bytes (64 KiB).
 pub const MAX_SCALAR_BYTES: usize = 64 * 1024;
 /// Maximum timeout accepted for flow settings or an individual step.
@@ -185,7 +189,10 @@ pub struct RawStep {
     source_index: Option<usize>,
     pub id: Option<String>,
     pub timeout: Option<String>,
-    pub run: Option<String>,
+    pub run: Option<RawRun>,
+    pub when: Option<RawWhen>,
+    pub repeat: Option<usize>,
+    pub retry: Option<usize>,
     pub open: Option<String>,
     pub click: Option<RawClick>,
     pub double_click: Option<RawClick>,
@@ -207,6 +214,36 @@ pub struct RawStep {
     pub clear: Option<ClearTarget>,
     #[serde(rename = "assert")]
     pub assertion: Option<RawAssertion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawRun {
+    Path(String),
+    Mapped(RawRunOptions),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRunOptions {
+    pub path: String,
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawWhen {
+    pub visible: Option<RawLocator>,
+    pub hidden: Option<RawLocator>,
+    pub variable: Option<RawVariablePredicate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawVariablePredicate {
+    pub name: String,
+    pub equals: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -471,7 +508,15 @@ pub struct CompiledStep {
     pub source_index: usize,
     pub id: Option<String>,
     pub timeout: Duration,
+    pub when: Option<When>,
+    pub retries: usize,
     pub operation: Operation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum When {
+    Visible(Locator),
+    Hidden(Locator),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -733,8 +778,15 @@ fn compile_file_with_env_and_video(
     if let Some(video) = video {
         raw.settings.video = Some(video);
     }
-    let mut flow =
-        compile_raw_expanded(raw, path.to_owned(), cli_vars, environment, 0, &mut state)?;
+    let mut flow = compile_raw_expanded(
+        raw,
+        path.to_owned(),
+        cli_vars,
+        environment,
+        &BTreeMap::new(),
+        0,
+        &mut state,
+    )?;
     if let Some(name) = cli_vars
         .keys()
         .find(|name| !state.declared_cli_vars.contains(*name))
@@ -781,7 +833,15 @@ pub fn compile_raw(
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
 ) -> Result<CompiledFlow, FlowError> {
-    let mut flow = compile_raw_inner(raw, source_path.into(), cli_vars, environment, true, false)?;
+    let mut flow = compile_raw_inner(
+        raw,
+        source_path.into(),
+        cli_vars,
+        environment,
+        &BTreeMap::new(),
+        true,
+        false,
+    )?;
     validate_expanded_steps(&mut flow.steps)?;
     validate_page_switching_video(&flow)?;
     Ok(flow)
@@ -792,6 +852,7 @@ fn compile_raw_inner(
     source_path: PathBuf,
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
+    passed_vars: &BTreeMap<String, Resolved<String>>,
     reject_unknown_cli_vars: bool,
     allow_empty_steps: bool,
 ) -> Result<CompiledFlow, FlowError> {
@@ -810,6 +871,7 @@ fn compile_raw_inner(
         &raw.secrets,
         cli_vars,
         environment,
+        passed_vars,
         reject_unknown_cli_vars,
     )?;
     let redactor = Redactor::from_inputs(&inputs);
@@ -877,6 +939,20 @@ fn compile_raw_inner(
     let mut steps = Vec::with_capacity(raw.steps.len());
     for (offset, step) in raw.steps.into_iter().enumerate() {
         let index = step.source_index.unwrap_or(offset + 1);
+        let repeat = validate_count("repeat", index, step.repeat.unwrap_or(1), MAX_REPEAT)?;
+        let retries = step
+            .retry
+            .map(|value| validate_count("retry", index, value, MAX_RETRIES))
+            .transpose()?
+            .unwrap_or(0);
+        if retries > 0 && step.assertion.is_none() {
+            return invalid(format!(
+                "step {index} retry is only supported for assertions"
+            ));
+        }
+        if retries > 0 && step.when.is_some() {
+            return invalid(format!("step {index} cannot combine when and retry"));
+        }
         let id = step
             .id
             .as_deref()
@@ -886,6 +962,9 @@ fn compile_raw_inner(
             require_non_empty(&format!("step {index} id"), id)?;
             if !ids.insert(id.clone()) {
                 return invalid(format!("duplicate step id {id:?}"));
+            }
+            if repeat > 1 {
+                return invalid(format!("step {index} cannot combine id and repeat"));
             }
         }
         let step_timeout = step
@@ -901,6 +980,7 @@ fn compile_raw_inner(
                 "step {index} subflow includes require compiling a flow file"
             ));
         }
+        let when = compile_when(step.when.clone(), index, &inputs)?;
         let operation = compile_operation(
             step,
             index,
@@ -909,19 +989,34 @@ fn compile_raw_inner(
             viewport,
             &inputs,
         )?;
+        let skip = matches!(when, CompiledWhen::Skip);
+        let when = match when {
+            CompiledWhen::Runtime(when) => Some(when),
+            CompiledWhen::Always | CompiledWhen::Skip => None,
+        };
+        if skip {
+            continue;
+        }
         if let Operation::Screenshot { name, .. } = &operation
             && !screenshot_names.insert(name.to_ascii_lowercase())
         {
             return invalid(format!("duplicate screenshot name {name:?}"));
         }
-        steps.push(CompiledStep {
-            index,
-            source: source_path.clone(),
-            source_index: index,
-            id,
-            timeout: step_timeout,
-            operation,
-        });
+        for _ in 0..repeat {
+            steps.push(CompiledStep {
+                index,
+                source: source_path.clone(),
+                source_index: index,
+                id: id.clone(),
+                timeout: step_timeout,
+                when: when.clone(),
+                retries,
+                operation: operation.clone(),
+            });
+        }
+        if steps.len() > MAX_FLOW_STEPS {
+            return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
+        }
     }
 
     Ok(CompiledFlow {
@@ -945,6 +1040,7 @@ fn compile_raw_expanded(
     source_path: PathBuf,
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
+    passed_vars: &BTreeMap<String, Resolved<String>>,
     depth: usize,
     state: &mut ExpansionState,
 ) -> Result<CompiledFlow, FlowError> {
@@ -967,6 +1063,7 @@ fn compile_raw_expanded(
         ));
     }
     state.declared_cli_vars.extend(raw.vars.keys().cloned());
+    let original_len = raw.steps.len();
     let mut includes = BTreeMap::new();
     for (offset, step) in raw.steps.iter_mut().enumerate() {
         step.source_index = Some(offset + 1);
@@ -998,12 +1095,30 @@ fn compile_raw_expanded(
             .count();
             if step.id.is_some() || step.timeout.is_some() || operation_count != 0 {
                 return invalid(format!(
-                    "{}: step {} run must be the only field",
+                    "{}: step {} run must be the only field except when.variable, repeat, and retry",
                     source_path.display(),
                     offset + 1
                 ));
             }
-            includes.insert(offset, run.clone());
+            if step
+                .when
+                .as_ref()
+                .is_some_and(|when| when.variable.is_none())
+            {
+                return invalid(format!(
+                    "{}: step {} run only supports when.variable",
+                    source_path.display(),
+                    offset + 1
+                ));
+            }
+            let repeat =
+                validate_count("repeat", offset + 1, step.repeat.unwrap_or(1), MAX_REPEAT)?;
+            let retries = step
+                .retry
+                .map(|value| validate_count("retry", offset + 1, value, MAX_RETRIES))
+                .transpose()?
+                .unwrap_or(0);
+            includes.insert(offset, (run.clone(), step.when.clone(), repeat, retries));
         }
     }
     raw.steps.retain(|step| step.run.is_none());
@@ -1017,23 +1132,31 @@ fn compile_raw_expanded(
         source_path.clone(),
         &filtered_cli,
         environment,
+        passed_vars,
         false,
         true,
     )
     .map_err(|error| with_path(&source_path, error))?;
 
-    let mut compiled = flow.steps.into_iter();
-    let original_len = compiled.len() + includes.len();
+    let mut compiled = flow.steps.into_iter().peekable();
     let mut steps = Vec::new();
     for offset in 0..original_len {
         let local_index = offset + 1;
-        if let Some(run) = includes.get(&offset) {
+        if let Some((run, when, repeat, retries)) = includes.get(&offset) {
+            let skip = matches!(
+                compile_when(when.clone(), local_index, &flow.inputs)?,
+                CompiledWhen::Skip
+            );
             if depth == MAX_SUBFLOW_DEPTH {
                 return invalid(format!(
                     "{}: step {local_index} exceeds maximum subflow depth {MAX_SUBFLOW_DEPTH}",
                     source_path.display()
                 ));
             }
+            let (run, raw_vars) = match run {
+                RawRun::Path(path) => (path.as_str(), None),
+                RawRun::Mapped(options) => (options.path.as_str(), Some(&options.vars)),
+            };
             validate_subflow_path(run, &source_path, local_index)?;
             let child_path = source_path
                 .parent()
@@ -1057,21 +1180,57 @@ fn compile_raw_expanded(
             }
             state.active.push((canonical, child_path.clone()));
             let child_raw = read_flow(&child_path)?;
+            let child_vars = raw_vars
+                .map(|vars| compile_run_vars(vars, local_index, &flow.inputs))
+                .transpose()?
+                .unwrap_or_default();
             let child = compile_raw_expanded(
                 child_raw,
                 child_path,
                 cli_vars,
                 environment,
+                &child_vars,
                 depth + 1,
                 state,
             );
             state.active.pop();
             let child = child?;
             flow.redactor.extend(&child.redactor);
-            steps.extend(child.steps);
-        } else if let Some(mut step) = compiled.next() {
-            step.source_index = local_index;
-            steps.push(step);
+            if *retries > 0
+                && child
+                    .steps
+                    .iter()
+                    .any(|step| !matches!(step.operation, Operation::Assert(_)))
+            {
+                return invalid(format!(
+                    "{}: step {local_index} retry requires an assertion-only subflow",
+                    source_path.display()
+                ));
+            }
+            if skip {
+                continue;
+            }
+            for _ in 0..*repeat {
+                for mut step in child.steps.iter().cloned() {
+                    step.retries = step.retries.checked_add(*retries).filter(|value| *value <= MAX_RETRIES).ok_or_else(|| {
+                        FlowError::Invalid(format!(
+                            "{}: step {local_index} combined retry must not exceed {MAX_RETRIES}",
+                            source_path.display()
+                        ))
+                    })?;
+                    steps.push(step);
+                }
+                if steps.len() > MAX_FLOW_STEPS {
+                    return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
+                }
+            }
+        } else {
+            while compiled
+                .peek()
+                .is_some_and(|step| step.source_index == local_index)
+            {
+                steps.push(compiled.next().expect("peeked step"));
+            }
         }
         if steps.len() > MAX_FLOW_STEPS {
             return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
@@ -1228,11 +1387,108 @@ impl Redactor {
     }
 }
 
+enum CompiledWhen {
+    Always,
+    Skip,
+    Runtime(When),
+}
+
+fn compile_when(
+    raw: Option<RawWhen>,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<CompiledWhen, FlowError> {
+    let Some(raw) = raw else {
+        return Ok(CompiledWhen::Always);
+    };
+    let count = [
+        raw.visible.is_some(),
+        raw.hidden.is_some(),
+        raw.variable.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if count != 1 {
+        return invalid(format!(
+            "step {index} when must contain exactly one predicate"
+        ));
+    }
+    if let Some(locator) = raw.visible {
+        return Ok(CompiledWhen::Runtime(When::Visible(compile_locator(
+            locator, index, inputs,
+        )?)));
+    }
+    if let Some(locator) = raw.hidden {
+        return Ok(CompiledWhen::Runtime(When::Hidden(compile_locator(
+            locator, index, inputs,
+        )?)));
+    }
+    let predicate = raw.variable.expect("predicate count checked");
+    validate_input_name(&predicate.name)?;
+    let actual = inputs.get(&predicate.name).ok_or_else(|| {
+        FlowError::Invalid(format!(
+            "step {index} when.variable references unknown variable {:?}",
+            predicate.name
+        ))
+    })?;
+    if actual.is_secret() {
+        return invalid(format!(
+            "step {index} when.variable must reference a non-secret variable"
+        ));
+    }
+    let expected = interpolate(
+        &format!("step {index} when.variable.equals"),
+        &predicate.equals,
+        inputs,
+    )?;
+    if expected.is_secret() {
+        return invalid(format!(
+            "step {index} when.variable.equals cannot contain a secret"
+        ));
+    }
+    Ok(if actual.expose() == expected.expose() {
+        CompiledWhen::Always
+    } else {
+        CompiledWhen::Skip
+    })
+}
+
+fn compile_run_vars(
+    vars: &BTreeMap<String, String>,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<BTreeMap<String, Resolved<String>>, FlowError> {
+    vars.iter()
+        .map(|(name, value)| {
+            validate_input_name(name)?;
+            let value = interpolate(&format!("step {index} run.vars.{name}"), value, inputs)?;
+            require_non_empty(&format!("step {index} run.vars.{name}"), value.expose())?;
+            Ok((name.clone(), value))
+        })
+        .collect()
+}
+
+fn validate_count(
+    field: &str,
+    index: usize,
+    value: usize,
+    maximum: usize,
+) -> Result<usize, FlowError> {
+    if value == 0 || value > maximum {
+        return invalid(format!(
+            "step {index} {field} must be between 1 and {maximum}",
+        ));
+    }
+    Ok(value)
+}
+
 fn resolve_inputs(
     vars: &BTreeMap<String, RawVariable>,
     secrets: &BTreeMap<String, RawSecret>,
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
+    passed_vars: &BTreeMap<String, Resolved<String>>,
     reject_unknown_cli_vars: bool,
 ) -> Result<BTreeMap<String, Resolved<String>>, FlowError> {
     for name in vars.keys().chain(secrets.keys()) {
@@ -1262,10 +1518,18 @@ fn resolve_inputs(
     {
         return invalid(format!("CLI variable {name:?} is not declared under vars"));
     }
+    if let Some(name) = passed_vars.keys().find(|name| !vars.contains_key(*name)) {
+        return invalid(format!("run variable {name:?} is not declared under vars"));
+    }
 
     let mut resolved = BTreeMap::new();
     for (name, raw) in vars {
-        let value = if let Some(value) = cli_vars.get(name) {
+        let value = if let Some(value) = passed_vars.get(name) {
+            require_scalar_size(&format!("vars.{name}"), value.expose())?;
+            require_non_empty(&format!("vars.{name}"), value.expose())?;
+            resolved.insert(name.clone(), value.clone());
+            continue;
+        } else if let Some(value) = cli_vars.get(name) {
             value.clone()
         } else {
             match raw {
@@ -3139,5 +3403,138 @@ steps:
             .unwrap_err()
             .to_string();
         assert!(message.contains("maximum subflow depth 32"), "{message}");
+    }
+
+    #[test]
+    fn compiles_when_repeat_and_assertion_retries_without_runtime_control_flow() {
+        let flow = compile(
+            r#"version: 1
+name: control
+vars: { mode: enabled }
+steps:
+  - when: { variable: { name: mode, equals: enabled } }
+    repeat: 2
+    click: { target: { css: button } }
+  - when: { variable: { name: mode, equals: disabled } }
+    click: { target: { css: skipped } }
+  - when: { visible: { css: .ready } }
+    assert: { hidden: { css: .loading } }
+  - retry: 3
+    assert: { visible: { css: .eventual } }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(flow.steps.len(), 4);
+        assert!(matches!(flow.steps[0].operation, Operation::Click { .. }));
+        assert!(matches!(flow.steps[1].operation, Operation::Click { .. }));
+        assert!(matches!(flow.steps[2].when, Some(When::Visible(_))));
+        assert_eq!(flow.steps[3].retries, 3);
+    }
+
+    #[test]
+    fn rejects_unbounded_or_unsafe_step_controls() {
+        for (source, expected) in [
+            (
+                "version: 1\nname: x\nsteps: [{ repeat: 0, open: https://x.test }]\n",
+                "repeat must be between 1 and 100",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ repeat: 101, open: https://x.test }]\n",
+                "repeat must be between 1 and 100",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ retry: 11, assert: { visible: { css: x } } }]\n",
+                "retry must be between 1 and 10",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ retry: 1, click: { target: { css: x } } }]\n",
+                "only supported for assertions",
+            ),
+            (
+                "version: 1\nname: x\nsteps: [{ id: x, repeat: 2, open: https://x.test }]\n",
+                "cannot combine id and repeat",
+            ),
+            (
+                "version: 1\nname: x\nvars: { mode: off }\nsteps: [{ when: { variable: { name: mode, equals: on } }, click: { target: { css: x, text: y } } }]\n",
+                "exactly one strategy",
+            ),
+        ] {
+            assert!(error(source).contains(expected), "missing {expected:?}");
+        }
+    }
+
+    #[test]
+    fn mapped_run_arguments_preserve_taint_and_repeat_while_scalar_run_still_works() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("child.subflow.yaml");
+        fs::write(
+            &root,
+            "version: 1\nname: root\nsettings: { video: off }\nvars: { mode: enabled }\nsecrets: { token: { env: TOKEN } }\nsteps:\n  - run: ./child.subflow.yaml\n  - repeat: 2\n    run: { path: ./child.subflow.yaml, vars: { value: '${mode}-${token}' } }\n",
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            "version: 1\nname: child\nvars: { value: default }\nsteps: [{ fill: { target: { css: input }, value: '${value}' } }]\n",
+        )
+        .unwrap();
+        let environment = BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]);
+
+        let flow = compile_file_with_env(&root, &BTreeMap::new(), &environment).unwrap();
+
+        assert_eq!(flow.steps.len(), 3);
+        assert_eq!(
+            flow.steps
+                .iter()
+                .map(|step| (step.index, step.source.as_path(), step.source_index))
+                .collect::<Vec<_>>(),
+            [
+                (1, child.as_path(), 1),
+                (2, child.as_path(), 1),
+                (3, child.as_path(), 1)
+            ]
+        );
+        let Operation::Fill { value, .. } = &flow.steps[1].operation else {
+            panic!("expected child fill");
+        };
+        assert_eq!(value.expose(), "enabled-canary-secret");
+        assert!(value.is_secret());
+        assert!(!format!("{flow:?}").contains("canary-secret"));
+        assert_eq!(flow.redactor.redact("canary-secret"), REDACTED);
+    }
+
+    #[test]
+    fn run_retry_expands_only_across_assertion_only_subflows() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("child.subflow.yaml");
+        fs::write(
+            &root,
+            "version: 1\nname: root\nsteps: [{ run: ./child.subflow.yaml, retry: 2 }]\n",
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            "version: 1\nname: child\nsteps: [{ assert: { visible: { css: x } } }]\n",
+        )
+        .unwrap();
+        let flow = compile_file(&root, &BTreeMap::new()).unwrap();
+        assert_eq!(flow.steps[0].retries, 2);
+
+        fs::write(
+            &child,
+            "version: 1\nname: child\nsteps: [{ click: { target: { css: x } } }]\n",
+        )
+        .unwrap();
+        fs::write(
+            &root,
+            "version: 1\nname: root\nvars: { mode: off }\nsteps: [{ run: ./child.subflow.yaml, retry: 2, when: { variable: { name: mode, equals: on } } }]\n",
+        )
+        .unwrap();
+        let message = compile_file(&root, &BTreeMap::new())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("assertion-only subflow"), "{message}");
     }
 }

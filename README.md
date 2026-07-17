@@ -36,7 +36,7 @@ playrust check examples/example.yaml --var username=alice
 playrust run examples/example.yaml --var username=alice
 ```
 
-`check` validates YAML, inputs, URLs, durations, keys, subflows, and configuration without launching Chromium. A path may be one `.yaml`/`.yml` file or a directory, searched recursively in stable path order. Files ending in `.subflow.yaml` or `.subflow.yml` are not directory entrypoints; they run only when included.
+`check` validates YAML, inputs, URLs, durations, keys, subflows, flow control, and configuration without launching Chromium. `run` also compiles every discovered entrypoint and all of its subflows before installing or launching Chromium; one invalid specification prevents every flow from running. A path may be one `.yaml`/`.yml` file or a directory, searched recursively in stable path order. Files ending in `.subflow.yaml` or `.subflow.yml` are not directory entrypoints; they run only when included.
 
 ```text
 playrust check <path> [--var NAME=VALUE]
@@ -71,12 +71,36 @@ Include reusable steps at compile time with a relative path:
 steps:
   - open: /login
   - run: ./shared/sign-in.subflow.yaml
+  - run:
+      path: ./shared/check-user.subflow.yaml
+      vars: { expected_user: "${username}" }
   - assert: { url: { path: /dashboard } }
 ```
 
-A subflow is a normal V1 document with `version`, `name`, and `steps`. Includes are expanded in place, may be nested up to 32 levels, and the expanded flow may contain at most 10,000 steps. Include paths are literal, must end in `.subflow.yaml` or `.subflow.yml`, and resolve relative to the file containing the `run` step. The `run` field must be the only field in its step. Canonical active include paths are checked for cycles; the same subflow may be included more than once when it is not already active.
+A subflow is a normal V1 document with `version`, `name`, and `steps`. `run` accepts either the original scalar path or `{ path, vars }`. Mapped values are interpolated in the caller and take precedence over CLI values and the called file's declared `vars`; unknown names and attempts to bind `secrets` are rejected. Secret-derived arguments remain secret-tainted in the child and are added to the entrypoint redactor.
+
+Includes are expanded in place, may be nested up to 32 levels, and the expanded flow may contain at most 10,000 steps. Include paths are literal, must end in `.subflow.yaml` or `.subflow.yml`, and resolve relative to the file containing the `run` step. A `run` step may additionally use `when.variable`, `repeat`, or `retry`; no action field, `id`, `timeout`, or DOM `when` predicate is allowed. Canonical active include paths are checked for cycles; the same subflow may be included more than once when it is not already active.
 
 Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `secrets`; these values are not inherited across file boundaries. CLI variables apply to every file that declares the name and are rejected unless at least one file declares them. Child secrets remain redacted in root-flow diagnostics. Subflows cannot set `settings.viewport` or `settings.video`; those runtime-wide settings belong to the entrypoint. Child names and resolved inputs do not replace the entrypoint's report identity or inputs. Runtime failures from expanded steps report both the expanded step number and child source path/local step number.
+
+### Flow control
+
+`when` has exactly one structured predicate:
+
+```yaml
+- when: { variable: { name: mode, equals: admin } }
+  click: { target: { test_id: admin-panel } }
+- when: { visible: { css: .optional-banner } }
+  click: { target: { css: .dismiss } }
+- when: { hidden: { css: .blocking-dialog } }
+  open: /ready
+```
+
+Variable equality is resolved at compile time against a declared, immutable, non-secret variable. Both operands must be non-secret. DOM predicates are evaluated once, immediately before the operation: `visible` is true when any matching element is visible, while `hidden` is true when there is no visible match. They are snapshots and do not wait for the condition to change; protocol errors fail the step. DOM predicates are not supported on `run` because applying one independently to expanded child steps could partially execute a subflow.
+
+`repeat: N` expands a step or subflow `N` times at compile time. `N` must be `1..=100`, the final flow remains limited to 10,000 steps, and a repeated leaf step cannot have an `id`. Normal expanded-flow uniqueness rules still reject repeated screenshot names.
+
+`retry: N` gives an assertion up to `N` additional attempts, each with the step's full timeout and normal cancellation checks. `N` must be `1..=10`. Actions cannot be retried, so pointer, keyboard, wheel, navigation, form, clear, and screenshot operations are never replayed after dispatch. A `run` may use `retry` only when its fully expanded child is assertion-only; the retry count is added to each child assertion at compile time and the combined count cannot exceed 10. This is per-assertion retry, not rollback or whole-subflow transaction retry. `when` and `retry` cannot be combined on one leaf step.
 
 ### Actions
 
@@ -170,7 +194,7 @@ Relations are additional filters and may be combined. `within` requires the cand
       max_changed_ratio: 0.001
 ```
 
-Positive assertions require one unique visible target. `hidden` passes with no matches or when all matches are hidden. URL `equals` compares the full URL; `path` compares the encoded path and, when supplied, query while ignoring origin and fragment. Actions and assertions retry until their condition passes or the step deadline expires.
+Positive assertions require one unique visible target. `hidden` passes with no matches or when all matches are hidden. URL `equals` compares the full URL; `path` compares the encoded path and, when supplied, query while ignoring origin and fragment. Actions and assertions wait until their condition passes or the step deadline expires; only assertions accept explicit `retry` attempts.
 
 Screenshot assertions capture the fixed viewport once and compare RGBA channels against a PNG baseline. `crop` is optional and uses the same viewport-relative bounds as named screenshots. `channel_tolerance` defaults to `0` and permits an absolute difference of up to that value in each channel. A pixel is changed when any channel exceeds the tolerance; `max_changed_ratio` defaults to `0` and accepts a value from `0` through `1`. Dimension mismatches always fail.
 
@@ -202,6 +226,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports opener-linked popups and same-origin frames as described above. Arbitrary tab selection, cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, loops, branches, mutable variables, parameterized imports, or plugins.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports opener-linked popups and same-origin frames as described above. Arbitrary tab selection, cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, mutable variables, general expressions, unbounded loops, transactional subflow retries, dynamic paths, or plugins.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

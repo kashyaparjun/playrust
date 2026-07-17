@@ -36,7 +36,7 @@ use crate::browser::{BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, FrameSwitch, Key, Locator,
     LocatorStrategy, Modifier, NamedKey, Operation, PageSwitch, RecordingControl, RelationKind,
-    RelativePoint, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
+    RelativePoint, TextMatch, UrlExpectation, VideoMode, VisualExpectation, When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -315,29 +315,58 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     }
 
     let mut video_stop_at = None;
-    for step in &flow.steps {
+    'steps: for step in &flow.steps {
         if interrupted {
             break;
         }
-        let Some(deadline) = Instant::now().checked_add(step.timeout) else {
-            video_stop_at = Some(Instant::now());
-            artifacts.failure_screenshot =
-                capture_failure_screenshot(&active, &options.artifact_directory)
-                    .await
-                    .map(|path| path_text(&path));
-            primary = Some(
-                step_failure(
-                    host,
-                    flow,
-                    &active,
-                    step,
-                    StepError::new(FailureCategory::Protocol, "step timeout is too large"),
-                )
-                .await,
-            );
-            break;
-        };
         if let Operation::Recording(control) = step.operation {
+            let Some(deadline) = Instant::now().checked_add(step.timeout) else {
+                primary = Some(
+                    step_failure(
+                        host,
+                        flow,
+                        &active,
+                        step,
+                        StepError::new(FailureCategory::Protocol, "step timeout is too large"),
+                    )
+                    .await,
+                );
+                break;
+            };
+            let matches = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(options.cancellation.as_ref()) => {
+                    interrupted = true;
+                    video_stop_at = Some(Instant::now());
+                    break;
+                }
+                result = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    step_matches(&active, step),
+                ) => result,
+            };
+            match matches {
+                Ok(Ok(false)) => continue,
+                Ok(Ok(true)) => {}
+                Ok(Err(error)) => {
+                    primary = Some(step_failure(host, flow, &active, step, error).await);
+                    break;
+                }
+                Err(_) => {
+                    primary = Some(
+                        step_failure(
+                            host,
+                            flow,
+                            &active,
+                            step,
+                            StepError::new(FailureCategory::Timeout, "step deadline expired")
+                                .deadline(),
+                        )
+                        .await,
+                    );
+                    break;
+                }
+            }
             match control {
                 RecordingControl::Start => {
                     match start_video(&active.page, flow, options, step.timeout).await {
@@ -388,40 +417,56 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             }
             continue;
         }
-        let result = tokio::select! {
-            biased;
-            _ = wait_for_cancellation(options.cancellation.as_ref()) => {
-                interrupted = true;
-                video_stop_at = Some(Instant::now());
+        let mut error = None;
+        for attempt in 0..=step.retries {
+            let Some(deadline) = Instant::now().checked_add(step.timeout) else {
+                error = Some(StepError::new(
+                    FailureCategory::Protocol,
+                    "step timeout is too large",
+                ));
                 break;
-            }
-            result = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
-                execute_step(
-                    host,
-                    context.id(),
-                    &mut active,
-                    step,
-                    deadline,
-                    &options.artifact_directory,
-                    page_settings,
-                ),
-            ) => result,
-        };
-        let succeeded = matches!(&result, Ok(Ok(_)));
-        if !succeeded {
-            video_stop_at = Some(Instant::now());
-        }
-        let error = match result {
-            Ok(Ok(screenshot)) => {
-                if let Some(path) = screenshot {
-                    artifacts.screenshots.push(path_text(&path));
+            };
+            let result = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(options.cancellation.as_ref()) => {
+                    interrupted = true;
+                    video_stop_at = Some(Instant::now());
+                    break 'steps;
                 }
+                result = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    execute_step(
+                        host,
+                        context.id(),
+                        &mut active,
+                        step,
+                        deadline,
+                        &options.artifact_directory,
+                        page_settings,
+                    ),
+                ) => result,
+            };
+            match result {
+                Ok(Ok(screenshot)) => {
+                    if let Some(path) = screenshot {
+                        artifacts.screenshots.push(path_text(&path));
+                    }
+                    continue 'steps;
+                }
+                Ok(Err(attempt_error)) => error = Some(attempt_error),
+                Err(_) => {
+                    error = Some(
+                        StepError::new(FailureCategory::Timeout, "step deadline expired")
+                            .deadline(),
+                    )
+                }
+            }
+            if attempt < step.retries {
                 continue;
             }
-            Ok(Err(error)) => error,
-            Err(_) => StepError::new(FailureCategory::Timeout, "step deadline expired").deadline(),
-        };
+        }
+        video_stop_at = Some(Instant::now());
+        let error = error.expect("failed attempt records an error");
         if let Some((actual, diff)) = &error.visual_artifacts {
             artifacts.visual_actual = Some(path_text(actual));
             artifacts.visual_diff = Some(path_text(diff));
@@ -528,13 +573,8 @@ async fn execute_step(
     artifact_directory: &Path,
     settings: PageSettings,
 ) -> Result<Option<PathBuf>, StepError> {
-    if active.frame().is_some()
-        && !matches!(
-            step.operation,
-            Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
-        )
-    {
-        verify_frame_origin(active).await?;
+    if !step_matches(active, step).await? {
+        return Ok(None);
     }
     match &step.operation {
         Operation::Open { url } => navigate(active, url.expose().as_str(), deadline)
@@ -692,6 +732,36 @@ async fn execute_step(
         }
         Operation::Assert(assertion) => assert(active, assertion, deadline).await.map(|_| None),
     }
+}
+
+async fn step_matches(active: &ActiveContext, step: &CompiledStep) -> Result<bool, StepError> {
+    if active.frame().is_some()
+        && !matches!(
+            step.operation,
+            Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
+        )
+    {
+        verify_frame_origin(active).await?;
+    }
+    match &step.when {
+        Some(predicate) => when_matches(active, predicate).await,
+        None => Ok(true),
+    }
+}
+
+async fn when_matches(active: &ActiveContext, predicate: &When) -> Result<bool, StepError> {
+    let observation = match predicate {
+        When::Visible(locator) | When::Hidden(locator) => active
+            .locator()
+            .observe_any_visible(locator)
+            .await
+            .map_err(locator_error)?,
+    };
+    let visible = matches!(observation, Observation::Ready(_));
+    Ok(match predicate {
+        When::Visible(_) => visible,
+        When::Hidden(_) => !visible,
+    })
 }
 
 async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Result<(), StepError> {
