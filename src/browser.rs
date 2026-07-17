@@ -265,6 +265,17 @@ impl BrowserHost {
             .new_page(target)
             .await
             .context("create page in isolated Chromium browser context")?;
+        self.configure_page(&page, viewport, geolocation).await?;
+
+        Ok(BrowserContext { id, page, viewport })
+    }
+
+    pub async fn configure_page(
+        &self,
+        page: &Page,
+        viewport: Viewport,
+        geolocation: Option<Geolocation>,
+    ) -> Result<()> {
         page.execute(SetDeviceMetricsOverrideParams::new(
             viewport.width,
             viewport.height,
@@ -284,8 +295,7 @@ impl BrowserHost {
             .await
             .context("apply page geolocation override")?;
         }
-
-        Ok(BrowserContext { id, page, viewport })
+        Ok(())
     }
 
     pub async fn dispose_context(&self, context: BrowserContext) -> Result<()> {

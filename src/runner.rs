@@ -8,19 +8,23 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chromiumoxide::Page;
-use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, ResolveNodeParams};
+use chromiumoxide::cdp::browser_protocol::dom::{
+    BackendNodeId, DescribeNodeParams, GetFrameOwnerParams, ResolveNodeParams,
+};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, EventFrameStartedNavigating, EventLifecycleEvent,
-    EventScreencastFrame, GetFrameTreeParams, GetNavigationHistoryParams, NavigateParams,
+    EventScreencastFrame, FrameId, GetFrameTreeParams, GetNavigationHistoryParams, NavigateParams,
     NavigateToHistoryEntryParams, ScreencastFrameAckParams, StartScreencastFormat,
     StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
-use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams};
+use chromiumoxide::cdp::js_protocol::runtime::{
+    CallFunctionOnParams, EvaluateParams, ReleaseObjectParams,
+};
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
@@ -28,11 +32,11 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot};
 
-use crate::browser::{BrowserHost, BrowserStatus, Viewport};
+use crate::browser::{BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
-    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, LocatorStrategy,
-    Modifier, NamedKey, Operation, RelationKind, RelativePoint, TextMatch, UrlExpectation,
-    RecordingControl, VideoMode, VisualExpectation,
+    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, FrameSwitch, Key, Locator,
+    LocatorStrategy, Modifier, NamedKey, Operation, PageSwitch, RecordingControl, RelationKind,
+    RelativePoint, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -108,7 +112,8 @@ const SELECT_FUNCTION: &str = r#"function(value) {
 }"#;
 
 const INNER_TEXT_FUNCTION: &str = r#"function() { return this.innerText; }"#;
-const CLEAR_STORAGE_EXPRESSION: &str = "localStorage.clear(); sessionStorage.clear()";
+const CLEAR_STORAGE_EXPRESSION: &str =
+    "(() => { localStorage.clear(); sessionStorage.clear(); return true; })()";
 const CLEAR_INDEXEDDB_EXPRESSION: &str = r#"indexedDB.databases().then(databases => Promise.all(
     databases.filter(database => database.name).map(database => new Promise((resolve, reject) => {
         const request = indexedDB.deleteDatabase(database.name);
@@ -119,6 +124,45 @@ const CLEAR_INDEXEDDB_EXPRESSION: &str = r#"indexedDB.databases().then(databases
 ))"#;
 const CLEAR_CACHE_STORAGE_EXPRESSION: &str =
     "caches.keys().then(names => Promise.all(names.map(name => caches.delete(name))))";
+const FRAME_OFFSET_FUNCTION: &str = r#"function() {
+    const rect = this.getBoundingClientRect();
+    return [rect.left + this.clientLeft, rect.top + this.clientTop];
+}"#;
+
+struct ActiveContext {
+    page: Page,
+    frames: Vec<FrameId>,
+}
+
+#[derive(Clone, Copy)]
+struct PageSettings {
+    viewport: Viewport,
+    geolocation: Option<Geolocation>,
+}
+
+impl ActiveContext {
+    fn new(page: Page) -> Self {
+        Self {
+            page,
+            frames: Vec::new(),
+        }
+    }
+
+    fn frame(&self) -> Option<&FrameId> {
+        self.frames.last()
+    }
+
+    fn locator(&self) -> LocatorEngine<'_> {
+        LocatorEngine::in_frame(&self.page, self.frame())
+    }
+
+    async fn url(&self) -> chromiumoxide::error::Result<Option<String>> {
+        match self.frame() {
+            Some(frame) => self.page.frame_url(frame.clone()).await,
+            None => self.page.url().await,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
@@ -237,6 +281,11 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         }
     };
     let page = context.page().clone();
+    let mut active = ActiveContext::new(page.clone());
+    let page_settings = PageSettings {
+        viewport,
+        geolocation: flow.settings.geolocation,
+    };
 
     let mut primary = None;
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
@@ -273,14 +322,14 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         let Some(deadline) = Instant::now().checked_add(step.timeout) else {
             video_stop_at = Some(Instant::now());
             artifacts.failure_screenshot =
-                capture_failure_screenshot(&page, &options.artifact_directory)
+                capture_failure_screenshot(&active, &options.artifact_directory)
                     .await
                     .map(|path| path_text(&path));
             primary = Some(
                 step_failure(
                     host,
                     flow,
-                    &page,
+                    &active,
                     step,
                     StepError::new(FailureCategory::Protocol, "step timeout is too large"),
                 )
@@ -291,7 +340,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         if let Operation::Recording(control) = step.operation {
             match control {
                 RecordingControl::Start => {
-                    match start_video(&page, flow, options, step.timeout).await {
+                    match start_video(&active.page, flow, options, step.timeout).await {
                         Ok(VideoStartup::Ready(session)) => video = session,
                         Ok(VideoStartup::Cancelled(finish)) => {
                             interrupted = true;
@@ -310,11 +359,15 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                     }
                 }
                 RecordingControl::Stop => {
-                    settle_video(&page).await;
+                    settle_video(&active.page).await;
                     video_stop_at = Some(Instant::now());
                     if let Some(session) = video.take() {
                         let finish = session
-                            .finish(&page, true, video_stop_at.expect("recording stop set"))
+                            .finish(
+                                &active.page,
+                                true,
+                                video_stop_at.expect("recording stop set"),
+                            )
                             .await;
                         apply_video_finish(finish, &mut artifacts, &mut recording_error);
                     }
@@ -347,10 +400,11 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                 execute_step(
                     host,
                     context.id(),
-                    &page,
+                    &mut active,
                     step,
                     deadline,
                     &options.artifact_directory,
+                    page_settings,
                 ),
             ) => result,
         };
@@ -373,15 +427,15 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             artifacts.visual_diff = Some(path_text(diff));
         }
         artifacts.failure_screenshot =
-            capture_failure_screenshot(&page, &options.artifact_directory)
+            capture_failure_screenshot(&active, &options.artifact_directory)
                 .await
                 .map(|path| path_text(&path));
-        primary = Some(step_failure(host, flow, &page, step, error).await);
+        primary = Some(step_failure(host, flow, &active, step, error).await);
         break;
     }
 
     if primary.is_none() && !interrupted && video.is_some() {
-        settle_video(&page).await;
+        settle_video(&active.page).await;
         video_stop_at = Some(Instant::now());
     }
 
@@ -389,7 +443,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         let flow_failed = primary.is_some() || interrupted;
         let finish = session
             .finish(
-                &page,
+                &active.page,
                 flow_failed,
                 video_stop_at.unwrap_or_else(Instant::now),
             )
@@ -403,7 +457,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     }
     if !failures.is_empty() && artifacts.failure_screenshot.is_none() {
         artifacts.failure_screenshot =
-            capture_failure_screenshot(&page, &options.artifact_directory)
+            capture_failure_screenshot(&active, &options.artifact_directory)
                 .await
                 .map(|path| path_text(&path));
     }
@@ -468,53 +522,64 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
 async fn execute_step(
     host: &BrowserHost,
     context_id: &chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
-    page: &Page,
+    active: &mut ActiveContext,
     step: &CompiledStep,
     deadline: Instant,
     artifact_directory: &Path,
+    settings: PageSettings,
 ) -> Result<Option<PathBuf>, StepError> {
+    if active.frame().is_some()
+        && !matches!(
+            step.operation,
+            Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
+        )
+    {
+        verify_frame_origin(active).await?;
+    }
     match &step.operation {
-        Operation::Open { url } => navigate(page, url.expose().as_str(), deadline)
+        Operation::Open { url } => navigate(active, url.expose().as_str(), deadline)
             .await
             .map(|_| None),
         Operation::Click { target, position } => {
             let element =
-                wait_actionable(page, target, Actionability::CLICK, *position, deadline).await?;
-            dispatch_click(page, element.center.x, element.center.y, 1)
-                .await
-                .map(|_| None)
+                wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
+            let (x, y) = page_point(active, element.center.x, element.center.y).await?;
+            dispatch_click(&active.page, x, y, 1).await.map(|_| None)
         }
         Operation::DoubleClick { target, position } => {
             let element =
-                wait_actionable(page, target, Actionability::CLICK, *position, deadline).await?;
-            dispatch_click(page, element.center.x, element.center.y, 2)
-                .await
-                .map(|_| None)
+                wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
+            let (x, y) = page_point(active, element.center.x, element.center.y).await?;
+            dispatch_click(&active.page, x, y, 2).await.map(|_| None)
         }
         Operation::Fill { target, value } => {
             let element =
-                wait_actionable(page, target, Actionability::EDITABLE, None, deadline).await?;
-            prepare_fill(page, element.backend_node_id).await?;
-            page.execute(InsertTextParams::new(value.expose()))
+                wait_actionable(active, target, Actionability::EDITABLE, None, deadline).await?;
+            prepare_fill(&active.page, element.backend_node_id).await?;
+            active
+                .page
+                .execute(InsertTextParams::new(value.expose()))
                 .await
                 .map_err(protocol)?;
             Ok(None)
         }
         Operation::Erase { target } => {
             let element =
-                wait_actionable(page, target, Actionability::EDITABLE, None, deadline).await?;
-            erase(page, element.backend_node_id).await.map(|_| None)
-        }
-        Operation::Select { target, value } => {
-            let element =
-                wait_actionable(page, target, Actionability::CLICK, None, deadline).await?;
-            select(page, element.backend_node_id, value.expose())
+                wait_actionable(active, target, Actionability::EDITABLE, None, deadline).await?;
+            erase(&active.page, element.backend_node_id)
                 .await
                 .map(|_| None)
         }
-        Operation::Scroll { x, y } => dispatch_scroll(page, *x, *y).await.map(|_| None),
+        Operation::Select { target, value } => {
+            let element =
+                wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
+            select(&active.page, element.backend_node_id, value.expose())
+                .await
+                .map(|_| None)
+        }
+        Operation::Scroll { x, y } => dispatch_scroll(active, *x, *y).await.map(|_| None),
         Operation::ScrollUntilVisible { target, x, y } => {
-            scroll_until_visible(page, target, *x, *y, deadline)
+            scroll_until_visible(active, target, *x, *y, deadline)
                 .await
                 .map(|_| None)
         }
@@ -524,40 +589,55 @@ async fn execute_step(
             y,
             duration,
         } => {
-            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
-            dispatch_swipe(page, &element, *x, *y, *duration, deadline)
+            let element =
+                wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
+            dispatch_swipe(active, &element, *x, *y, *duration, deadline)
                 .await
                 .map(|_| None)
         }
         Operation::LongPress { target, duration } => {
-            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
-            dispatch_long_press(page, &element, *duration, deadline)
+            let element =
+                wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
+            dispatch_long_press(active, &element, *duration, deadline)
                 .await
                 .map(|_| None)
         }
         Operation::WaitUntilVisible { target } => {
-            wait_actionable(page, target, Actionability::VISIBLE, deadline)
+            wait_actionable(active, target, Actionability::VISIBLE, None, deadline)
                 .await
                 .map(|_| None)
         }
         Operation::WaitUntilStable { target } => {
-            wait_actionable(page, target, Actionability::STABLE, deadline)
+            wait_actionable(active, target, Actionability::STABLE, None, deadline)
                 .await
                 .map(|_| None)
         }
-        Operation::Back => navigate_back(page, deadline).await.map(|_| None),
+        Operation::Back => navigate_back(&active.page, deadline).await.map(|_| None),
+        Operation::SwitchPage(page) => switch_page(
+            host,
+            active,
+            *page,
+            deadline,
+            settings.viewport,
+            settings.geolocation,
+        )
+        .await
+        .map(|_| None),
+        Operation::SwitchFrame(frame) => switch_frame(active, frame, deadline).await.map(|_| None),
         Operation::Press {
             target,
             key,
             modifiers,
         } => {
             let element =
-                wait_actionable(page, target, Actionability::CLICK, None, deadline).await?;
-            focus(page, element.backend_node_id).await?;
-            dispatch_key(page, key, modifiers).await.map(|_| None)
+                wait_actionable(active, target, Actionability::CLICK, None, deadline).await?;
+            focus(&active.page, element.backend_node_id).await?;
+            dispatch_key(&active.page, key, modifiers)
+                .await
+                .map(|_| None)
         }
         Operation::Screenshot { name, crop } => {
-            capture_screenshot(page, artifact_directory, &format!("{name}.png"), *crop)
+            capture_screenshot(active, artifact_directory, &format!("{name}.png"), *crop)
                 .await
                 .map(Some)
         }
@@ -577,30 +657,24 @@ async fn execute_step(
             Ok(None)
         }
         Operation::Clear(ClearTarget::Storage) => {
-            page.evaluate(CLEAR_STORAGE_EXPRESSION)
-                .await
-                .map_err(protocol)?;
+            evaluate(active, CLEAR_STORAGE_EXPRESSION).await?;
             Ok(None)
         }
         Operation::Assert(Assertion::Screenshot(expectation)) => {
-            assert_screenshot(page, expectation, step.index, artifact_directory)
+            assert_screenshot(active, expectation, step.index, artifact_directory)
                 .await
                 .map(|_| None)
         }
         Operation::Clear(ClearTarget::Indexeddb) => {
-            page.evaluate(CLEAR_INDEXEDDB_EXPRESSION)
-                .await
-                .map_err(protocol)?;
+            evaluate(active, CLEAR_INDEXEDDB_EXPRESSION).await?;
             Ok(None)
         }
         Operation::Clear(ClearTarget::CacheStorage) => {
-            page.evaluate(CLEAR_CACHE_STORAGE_EXPRESSION)
-                .await
-                .map_err(protocol)?;
+            evaluate(active, CLEAR_CACHE_STORAGE_EXPRESSION).await?;
             Ok(None)
         }
         Operation::Clear(ClearTarget::ServiceWorkers) => {
-            let url = page
+            let url = active
                 .url()
                 .await
                 .map_err(protocol)?
@@ -609,35 +683,57 @@ async fn execute_step(
                 .map_err(protocol)?
                 .origin()
                 .ascii_serialization();
-            page.execute(ClearDataForOriginParams::new(origin, "service_workers"))
+            active
+                .page
+                .execute(ClearDataForOriginParams::new(origin, "service_workers"))
                 .await
                 .map_err(protocol)?;
             Ok(None)
         }
-        Operation::Assert(assertion) => assert(page, assertion, deadline).await.map(|_| None),
+        Operation::Assert(assertion) => assert(active, assertion, deadline).await.map(|_| None),
     }
 }
 
-async fn navigate(page: &Page, url: &str, deadline: Instant) -> Result<(), StepError> {
-    let frame = page
+async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Result<(), StepError> {
+    if active.frame().is_some() {
+        let parent = parent_frame_url(active).await?;
+        if !same_origin_or_inherited(&parent, url) {
+            return Err(StepError::new(
+                FailureCategory::Navigation,
+                "cross-origin iframe navigation is unsupported by chromiumoxide 0.9.1",
+            ));
+        }
+    }
+    let tree = active
+        .page
         .execute(GetFrameTreeParams::default())
         .await
         .map_err(protocol)?
         .result
-        .frame_tree
-        .frame;
-    let main_frame_id = frame.id;
-    let previous_loader_id = frame.loader_id;
-    let mut started = page
+        .frame_tree;
+    let frame = match active.frame() {
+        None => &tree.frame,
+        Some(id) => find_frame(&tree, id).ok_or_else(|| {
+            StepError::new(FailureCategory::Protocol, "active frame no longer exists")
+        })?,
+    };
+    let target_frame_id = frame.id.clone();
+    let previous_loader_id = frame.loader_id.clone();
+    let mut started = active
+        .page
         .event_listener::<EventFrameStartedNavigating>()
         .await
         .map_err(protocol)?;
-    let mut events = page
+    let mut events = active
+        .page
         .event_listener::<EventLifecycleEvent>()
         .await
         .map_err(protocol)?;
-    let navigation = page
-        .command_future(NavigateParams::new(url))
+    let mut params = NavigateParams::new(url);
+    params.frame_id = active.frame().cloned();
+    let navigation = active
+        .page
+        .command_future(params)
         .map_err(|error| StepError::new(FailureCategory::Navigation, error.to_string()))?;
     tokio::pin!(navigation);
     let mut navigation_loader = None;
@@ -670,7 +766,7 @@ async fn navigate(page: &Page, url: &str, deadline: Instant) -> Result<(), StepE
                         "navigation resulted in a download",
                     ));
                 }
-                if response.frame_id != main_frame_id {
+                if response.frame_id != target_frame_id {
                     return Err(StepError::new(
                         FailureCategory::Protocol,
                         "navigation completed for an unexpected frame",
@@ -678,16 +774,16 @@ async fn navigate(page: &Page, url: &str, deadline: Instant) -> Result<(), StepE
                 }
                 // chromiumoxide releases this future only for same-document navigation
                 // or after its full-load watcher completes.
-                return Ok(());
+                return verify_frame_origin(active).await;
             }
             NavigationCompletion::Started(Some(event)) => {
-                if event.frame_id == main_frame_id
+                if event.frame_id == target_frame_id
                     && event.url == url
                     && event.loader_id != previous_loader_id
                 {
                     navigation_loader = Some(event.loader_id.clone());
                     if dom_content_loaded.contains(&event.loader_id) {
-                        return Ok(());
+                        return verify_frame_origin(active).await;
                     }
                 }
             }
@@ -698,13 +794,13 @@ async fn navigate(page: &Page, url: &str, deadline: Instant) -> Result<(), StepE
                 ));
             }
             NavigationCompletion::Lifecycle(Some(event)) => {
-                if event.frame_id == main_frame_id
+                if event.frame_id == target_frame_id
                     && event.loader_id != previous_loader_id
                     && event.name == "DOMContentLoaded"
                 {
                     dom_content_loaded.insert(event.loader_id.clone());
                     if navigation_loader.as_ref() == Some(&event.loader_id) {
-                        return Ok(());
+                        return verify_frame_origin(active).await;
                     }
                 }
             }
@@ -718,20 +814,193 @@ async fn navigate(page: &Page, url: &str, deadline: Instant) -> Result<(), StepE
     }
 }
 
+async fn parent_frame_url(active: &ActiveContext) -> Result<String, StepError> {
+    match active.frames.len() {
+        0 | 1 => active
+            .page
+            .url()
+            .await
+            .map_err(protocol)
+            .map(|url| url.unwrap_or_default()),
+        length => active
+            .page
+            .frame_url(active.frames[length - 2].clone())
+            .await
+            .map_err(protocol)
+            .map(|url| url.unwrap_or_default()),
+    }
+}
+
+async fn verify_frame_origin(active: &ActiveContext) -> Result<(), StepError> {
+    let Some(frame) = active.frame() else {
+        return Ok(());
+    };
+    let parent = parent_frame_url(active).await?;
+    let child = active
+        .page
+        .frame_url(frame.clone())
+        .await
+        .map_err(protocol)?
+        .unwrap_or_default();
+    if same_origin_or_inherited(&parent, &child) {
+        Ok(())
+    } else {
+        Err(StepError::new(
+            FailureCategory::Navigation,
+            "cross-origin iframe navigation is unsupported by chromiumoxide 0.9.1",
+        ))
+    }
+}
+
+fn find_frame<'a>(
+    tree: &'a chromiumoxide::cdp::browser_protocol::page::FrameTree,
+    id: &FrameId,
+) -> Option<&'a chromiumoxide::cdp::browser_protocol::page::Frame> {
+    if &tree.frame.id == id {
+        return Some(&tree.frame);
+    }
+    tree.child_frames
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .find_map(|child| find_frame(child, id))
+}
+
 enum NavigationCompletion<C, S, L> {
     Intercepted(C),
     Started(Option<Arc<S>>),
     Lifecycle(Option<Arc<L>>),
 }
 
+async fn switch_page(
+    host: &BrowserHost,
+    active: &mut ActiveContext,
+    destination: PageSwitch,
+    deadline: Instant,
+    viewport: Viewport,
+    geolocation: Option<Geolocation>,
+) -> Result<(), StepError> {
+    let page = match destination {
+        PageSwitch::Opener => {
+            let opener = active.page.opener_id().clone().ok_or_else(|| {
+                StepError::new(FailureCategory::Navigation, "active page has no opener")
+            })?;
+            host.browser().get_page(opener).await.map_err(protocol)?
+        }
+        PageSwitch::Popup => loop {
+            let pages = host.browser().pages().await.map_err(protocol)?;
+            let candidates = pages
+                .into_iter()
+                .filter(|page| page.opener_id().as_ref() == Some(active.page.target_id()))
+                .collect::<Vec<_>>();
+            match candidates.as_slice() {
+                [page] => break page.clone(),
+                pages if pages.len() > 1 => {
+                    return Err(StepError::new(
+                        FailureCategory::Navigation,
+                        "active page has multiple popup pages",
+                    ));
+                }
+                _ if Instant::now() >= deadline => {
+                    return Err(StepError::new(
+                        FailureCategory::Timeout,
+                        "popup did not open before the step deadline",
+                    )
+                    .deadline());
+                }
+                _ => sleep_until_poll(deadline).await,
+            }
+        },
+    };
+    host.configure_page(&page, viewport, geolocation)
+        .await
+        .map_err(protocol)?;
+    page.activate().await.map_err(protocol)?;
+    active.page = page;
+    active.frames.clear();
+    Ok(())
+}
+
+async fn switch_frame(
+    active: &mut ActiveContext,
+    destination: &FrameSwitch,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    match destination {
+        FrameSwitch::Main => active.frames.clear(),
+        FrameSwitch::Parent => {
+            if active.frames.pop().is_none() {
+                return Err(StepError::new(
+                    FailureCategory::Navigation,
+                    "active frame is already the main frame",
+                ));
+            }
+        }
+        FrameSwitch::Target(locator) => {
+            let element =
+                wait_actionable(active, locator, Actionability::ATTACHED, None, deadline).await?;
+            let node = active
+                .page
+                .execute(
+                    DescribeNodeParams::builder()
+                        .backend_node_id(element.backend_node_id)
+                        .depth(1)
+                        .build(),
+                )
+                .await
+                .map_err(protocol)?
+                .result
+                .node;
+            let frame = node.frame_id.ok_or_else(|| {
+                StepError::new(
+                    FailureCategory::Actionability,
+                    "switch_frame target is not an iframe or frame element",
+                )
+            })?;
+            let parent_url = active.url().await.map_err(protocol)?.unwrap_or_default();
+            let child_url = active
+                .page
+                .frame_url(frame.clone())
+                .await
+                .map_err(protocol)?
+                .unwrap_or_default();
+            if !same_origin_or_inherited(&parent_url, &child_url) {
+                return Err(StepError::new(
+                    FailureCategory::Navigation,
+                    "cross-origin iframe switching is unsupported by chromiumoxide 0.9.1",
+                ));
+            }
+            if node.content_document.is_none() {
+                return Err(StepError::new(
+                    FailureCategory::Navigation,
+                    "iframe is not available in the page CDP session; cross-origin OOPIF switching is unsupported by chromiumoxide 0.9.1",
+                ));
+            }
+            active.frames.push(frame);
+        }
+    }
+    Ok(())
+}
+
+fn same_origin_or_inherited(parent: &str, child: &str) -> bool {
+    if matches!(child, "about:blank" | "about:srcdoc") {
+        return true;
+    }
+    match (url::Url::parse(parent), url::Url::parse(child)) {
+        (Ok(parent), Ok(child)) => parent.origin() == child.origin(),
+        _ => false,
+    }
+}
+
 async fn wait_actionable(
-    page: &Page,
+    active: &ActiveContext,
     locator: &Locator,
     requirements: Actionability,
     action_point: Option<RelativePoint>,
     deadline: Instant,
 ) -> Result<ResolvedElement, StepError> {
-    LocatorEngine::new(page)
+    active
+        .locator()
         .wait_unique(locator, requirements, action_point, deadline)
         .await
         .map_err(locator_error)
@@ -810,33 +1079,29 @@ async fn select(page: &Page, node: BackendNodeId, value: &str) -> Result<(), Ste
     }
 }
 
-async fn dispatch_scroll(page: &Page, x: i64, y: i64) -> Result<(), StepError> {
-    let [width, height]: [f64; 2] = page
-        .evaluate("[innerWidth, innerHeight]")
-        .await
-        .map_err(protocol)?
-        .into_value()
-        .map_err(protocol)?;
+async fn dispatch_scroll(active: &ActiveContext, x: i64, y: i64) -> Result<(), StepError> {
+    let [width, height]: [f64; 2] = evaluate_value(active, "[innerWidth, innerHeight]").await?;
+    let (center_x, center_y) = page_point(active, width / 2.0, height / 2.0).await?;
     let event = DispatchMouseEventParams::builder()
         .r#type(DispatchMouseEventType::MouseWheel)
-        .x(width / 2.0)
-        .y(height / 2.0)
+        .x(center_x)
+        .y(center_y)
         .delta_x(x as f64)
         .delta_y(y as f64)
         .build()
         .expect("all mandatory wheel event fields are set");
-    page.execute(event).await.map_err(protocol)?;
+    active.page.execute(event).await.map_err(protocol)?;
     Ok(())
 }
 
 async fn scroll_until_visible(
-    page: &Page,
+    active: &ActiveContext,
     target: &Locator,
     x: i32,
     y: i32,
     deadline: Instant,
 ) -> Result<(), StepError> {
-    let engine = LocatorEngine::new(page);
+    let engine = active.locator();
     loop {
         let observation = match engine.observe_unique(target, Actionability::VISIBLE).await {
             Ok(Observation::Ready(_)) => return Ok(()),
@@ -854,13 +1119,13 @@ async fn scroll_until_visible(
             .deadline()
             .observed(observation.to_string()));
         }
-        dispatch_scroll(page, i64::from(x), i64::from(y)).await?;
+        dispatch_scroll(active, i64::from(x), i64::from(y)).await?;
         sleep_until_poll(deadline).await;
     }
 }
 
 async fn dispatch_swipe(
-    page: &Page,
+    active: &ActiveContext,
     element: &ResolvedElement,
     x: i32,
     y: i32,
@@ -869,12 +1134,7 @@ async fn dispatch_swipe(
 ) -> Result<(), StepError> {
     let end_x = element.center.x + f64::from(x);
     let end_y = element.center.y + f64::from(y);
-    let [width, height]: [f64; 2] = page
-        .evaluate("[innerWidth, innerHeight]")
-        .await
-        .map_err(protocol)?
-        .into_value()
-        .map_err(protocol)?;
+    let [width, height]: [f64; 2] = evaluate_value(active, "[innerWidth, innerHeight]").await?;
     if end_x < 0.0 || end_y < 0.0 || end_x >= width || end_y >= height {
         return Err(StepError::new(
             FailureCategory::Actionability,
@@ -882,45 +1142,47 @@ async fn dispatch_swipe(
         ));
     }
     require_gesture_time(duration, deadline, "swipe")?;
+    let (start_x, start_y) = page_point(active, element.center.x, element.center.y).await?;
+    let (end_x, end_y) = page_point(active, end_x, end_y).await?;
     dispatch_pointer(
-        page,
+        &active.page,
         DispatchMouseEventType::MousePressed,
-        element.center.x,
-        element.center.y,
+        start_x,
+        start_y,
         1,
     )
     .await?;
     tokio::time::sleep(duration).await;
-    let moved = dispatch_pointer(page, DispatchMouseEventType::MouseMoved, end_x, end_y, 1).await;
-    let released =
-        dispatch_pointer(page, DispatchMouseEventType::MouseReleased, end_x, end_y, 0).await;
+    let moved = dispatch_pointer(
+        &active.page,
+        DispatchMouseEventType::MouseMoved,
+        end_x,
+        end_y,
+        1,
+    )
+    .await;
+    let released = dispatch_pointer(
+        &active.page,
+        DispatchMouseEventType::MouseReleased,
+        end_x,
+        end_y,
+        0,
+    )
+    .await;
     moved.and(released)
 }
 
 async fn dispatch_long_press(
-    page: &Page,
+    active: &ActiveContext,
     element: &ResolvedElement,
     duration: Duration,
     deadline: Instant,
 ) -> Result<(), StepError> {
     require_gesture_time(duration, deadline, "long_press")?;
-    dispatch_pointer(
-        page,
-        DispatchMouseEventType::MousePressed,
-        element.center.x,
-        element.center.y,
-        1,
-    )
-    .await?;
+    let (x, y) = page_point(active, element.center.x, element.center.y).await?;
+    dispatch_pointer(&active.page, DispatchMouseEventType::MousePressed, x, y, 1).await?;
     tokio::time::sleep(duration).await;
-    dispatch_pointer(
-        page,
-        DispatchMouseEventType::MouseReleased,
-        element.center.x,
-        element.center.y,
-        0,
-    )
-    .await
+    dispatch_pointer(&active.page, DispatchMouseEventType::MouseReleased, x, y, 0).await
 }
 
 fn require_gesture_time(
@@ -961,6 +1223,80 @@ async fn dispatch_pointer(
     .await
     .map_err(protocol)?;
     Ok(())
+}
+
+async fn page_point(
+    active: &ActiveContext,
+    mut x: f64,
+    mut y: f64,
+) -> Result<(f64, f64), StepError> {
+    for frame in &active.frames {
+        let owner = active
+            .page
+            .execute(GetFrameOwnerParams::new(frame.clone()))
+            .await
+            .map_err(protocol)?
+            .result
+            .backend_node_id;
+        let [offset_x, offset_y]: [f64; 2] =
+            call_on_node(&active.page, owner, FRAME_OFFSET_FUNCTION, &[]).await?;
+        x += offset_x;
+        y += offset_y;
+    }
+    Ok((x, y))
+}
+
+async fn evaluate(active: &ActiveContext, expression: &str) -> Result<(), StepError> {
+    evaluate_value::<serde_json::Value>(active, expression)
+        .await
+        .map(|_| ())
+}
+
+async fn evaluate_value<T: DeserializeOwned>(
+    active: &ActiveContext,
+    expression: &str,
+) -> Result<T, StepError> {
+    if active.frame().is_none() {
+        return active
+            .page
+            .evaluate(expression)
+            .await
+            .map_err(protocol)?
+            .into_value()
+            .map_err(protocol);
+    }
+    let context = active
+        .page
+        .frame_execution_context(active.frame().expect("frame checked").clone())
+        .await
+        .map_err(protocol)?
+        .ok_or_else(|| {
+            StepError::new(
+                FailureCategory::Protocol,
+                "active frame has no executable context",
+            )
+        })?;
+    let params = EvaluateParams::builder()
+        .expression(expression)
+        .context_id(context)
+        .return_by_value(true)
+        .await_promise(true)
+        .build()
+        .map_err(protocol)?;
+    let response = active.page.execute(params).await.map_err(protocol)?.result;
+    if let Some(exception) = response.exception_details {
+        return Err(StepError::new(
+            FailureCategory::Protocol,
+            format!("page expression threw: {}", exception.text),
+        ));
+    }
+    serde_json::from_value(response.result.value.ok_or_else(|| {
+        StepError::new(
+            FailureCategory::Protocol,
+            "page expression returned no value",
+        )
+    })?)
+    .map_err(protocol)
 }
 
 async fn navigate_back(page: &Page, deadline: Instant) -> Result<(), StepError> {
@@ -1132,31 +1468,36 @@ async fn dispatch_click(page: &Page, x: f64, y: f64, clicks: i64) -> Result<(), 
     Ok(())
 }
 
-async fn assert(page: &Page, assertion: &Assertion, deadline: Instant) -> Result<(), StepError> {
+async fn assert(
+    active: &ActiveContext,
+    assertion: &Assertion,
+    deadline: Instant,
+) -> Result<(), StepError> {
     match assertion {
-        Assertion::Visible(locator) => LocatorEngine::new(page)
+        Assertion::Visible(locator) => active
+            .locator()
             .wait_unique(locator, Actionability::VISIBLE, None, deadline)
             .await
             .map(|_| ())
             .map_err(assertion_locator_error),
-        Assertion::Hidden(locator) => assert_hidden(page, locator, deadline).await,
+        Assertion::Hidden(locator) => assert_hidden(active, locator, deadline).await,
         Assertion::Text {
             target,
             expected,
             match_kind,
-        } => assert_text(page, target, expected.expose(), *match_kind, deadline).await,
-        Assertion::Url(expectation) => assert_url(page, expectation, deadline).await,
+        } => assert_text(active, target, expected.expose(), *match_kind, deadline).await,
+        Assertion::Url(expectation) => assert_url(active, expectation, deadline).await,
         Assertion::Screenshot(_) => unreachable!("visual assertions are executed with artifacts"),
     }
 }
 
 async fn assert_screenshot(
-    page: &Page,
+    active: &ActiveContext,
     expectation: &VisualExpectation,
     step: usize,
     artifact_directory: &Path,
 ) -> Result<(), StepError> {
-    let actual_png = screenshot_bytes(page, expectation.crop).await?;
+    let actual_png = screenshot_bytes(active, expectation.crop).await?;
     let baseline = expectation.baseline.clone();
     let comparison_png = actual_png.clone();
     let tolerance = expectation.channel_tolerance;
@@ -1195,9 +1536,13 @@ async fn assert_screenshot(
     )
 }
 
-async fn assert_hidden(page: &Page, locator: &Locator, deadline: Instant) -> Result<(), StepError> {
+async fn assert_hidden(
+    active: &ActiveContext,
+    locator: &Locator,
+    deadline: Instant,
+) -> Result<(), StepError> {
     loop {
-        let observation = match LocatorEngine::new(page).observe_any_visible(locator).await {
+        let observation = match active.locator().observe_any_visible(locator).await {
             Ok(observation) => observation,
             Err(error) if retryable(&error) => Observation::Unavailable {
                 message: error.to_string(),
@@ -1219,13 +1564,13 @@ async fn assert_hidden(page: &Page, locator: &Locator, deadline: Instant) -> Res
 }
 
 async fn assert_text(
-    page: &Page,
+    active: &ActiveContext,
     locator: &Locator,
     expected: &str,
     match_kind: TextMatch,
     deadline: Instant,
 ) -> Result<(), StepError> {
-    let engine = LocatorEngine::new(page);
+    let engine = active.locator();
     loop {
         let observation = match engine.observe_unique(locator, Actionability::VISIBLE).await {
             Ok(observation) => observation,
@@ -1236,25 +1581,29 @@ async fn assert_text(
         };
         match observation {
             Observation::Ready(element) => {
-                let actual: String =
-                    match call_on_node(page, element.backend_node_id, INNER_TEXT_FUNCTION, &[])
-                        .await
+                let actual: String = match call_on_node(
+                    &active.page,
+                    element.backend_node_id,
+                    INNER_TEXT_FUNCTION,
+                    &[],
+                )
+                .await
+                {
+                    Ok(actual) => actual,
+                    Err(error)
+                        if error.category == FailureCategory::Protocol
+                            && retryable_cdp_message(&error.message) =>
                     {
-                        Ok(actual) => actual,
-                        Err(error)
-                            if error.category == FailureCategory::Protocol
-                                && retryable_cdp_message(&error.message) =>
-                        {
-                            if Instant::now() >= deadline {
-                                return Err(StepError::assertion("text target was unavailable")
-                                    .deadline()
-                                    .observed(error.message));
-                            }
-                            sleep_until_poll(deadline).await;
-                            continue;
+                        if Instant::now() >= deadline {
+                            return Err(StepError::assertion("text target was unavailable")
+                                .deadline()
+                                .observed(error.message));
                         }
-                        Err(error) => return Err(error),
-                    };
+                        sleep_until_poll(deadline).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if text_matches(&actual, expected, match_kind) {
                     return Ok(());
                 }
@@ -1277,12 +1626,12 @@ async fn assert_text(
 }
 
 async fn assert_url(
-    page: &Page,
+    active: &ActiveContext,
     expectation: &UrlExpectation,
     deadline: Instant,
 ) -> Result<(), StepError> {
     loop {
-        let actual = page.url().await.map_err(protocol)?.unwrap_or_default();
+        let actual = active.url().await.map_err(protocol)?.unwrap_or_default();
         if url_matches(&actual, expectation) {
             return Ok(());
         }
@@ -1632,10 +1981,10 @@ async fn stop_screencast(page: &Page) -> Option<String> {
     }
 }
 
-async fn capture_failure_screenshot(page: &Page, directory: &Path) -> Option<PathBuf> {
+async fn capture_failure_screenshot(active: &ActiveContext, directory: &Path) -> Option<PathBuf> {
     match tokio::time::timeout(
         SECONDARY_TIMEOUT,
-        capture_screenshot(page, directory, SCREENSHOT_NAME, None),
+        capture_screenshot(active, directory, SCREENSHOT_NAME, None),
     )
     .await
     {
@@ -1645,34 +1994,64 @@ async fn capture_failure_screenshot(page: &Page, directory: &Path) -> Option<Pat
 }
 
 async fn capture_screenshot(
-    page: &Page,
+    active: &ActiveContext,
     directory: &Path,
     file_name: &str,
     crop: Option<Crop>,
 ) -> Result<PathBuf, StepError> {
-    let bytes = screenshot_bytes(page, crop).await?;
+    let bytes = screenshot_bytes(active, crop).await?;
     let path = directory.join(file_name);
     publish_bytes(directory, &path, &bytes).await?;
     Ok(path)
 }
 
-async fn screenshot_bytes(page: &Page, crop: Option<Crop>) -> Result<Vec<u8>, StepError> {
+async fn screenshot_bytes(
+    active: &ActiveContext,
+    crop: Option<Crop>,
+) -> Result<Vec<u8>, StepError> {
     let mut params = ScreenshotParams::builder().format(CaptureScreenshotFormat::Png);
-    if let Some(crop) = crop {
-        let viewport = page
+    if active.frame().is_some() || crop.is_some() {
+        let viewport = active
+            .page
             .layout_metrics()
             .await
             .map_err(protocol)?
             .css_visual_viewport;
+        let (frame_x, frame_y) = page_point(active, 0.0, 0.0).await?;
+        let [frame_width, frame_height]: [f64; 2] =
+            evaluate_value(active, "[innerWidth, innerHeight]").await?;
+        if active.frame().is_some()
+            && crop.is_some_and(|crop| {
+                f64::from(crop.x + crop.width) > frame_width
+                    || f64::from(crop.y + crop.height) > frame_height
+            })
+        {
+            return Err(StepError::new(
+                FailureCategory::Protocol,
+                "screenshot crop must fit within the active frame viewport",
+            ));
+        }
+        let (x, y, width, height) = crop.map_or((0.0, 0.0, frame_width, frame_height), |crop| {
+            (
+                f64::from(crop.x),
+                f64::from(crop.y),
+                f64::from(crop.width),
+                f64::from(crop.height),
+            )
+        });
         params = params.clip(ScreenshotViewport {
-            x: viewport.page_x + f64::from(crop.x),
-            y: viewport.page_y + f64::from(crop.y),
-            width: f64::from(crop.width),
-            height: f64::from(crop.height),
+            x: viewport.page_x + frame_x + x,
+            y: viewport.page_y + frame_y + y,
+            width,
+            height,
             scale: 1.0,
         });
     }
-    let bytes = page.screenshot(params.build()).await.map_err(protocol)?;
+    let bytes = active
+        .page
+        .screenshot(params.build())
+        .await
+        .map_err(protocol)?;
     if bytes.len() > visual::MAX_IMAGE_BYTES {
         return Err(protocol("captured screenshot exceeds the image byte limit"));
     }
@@ -1714,11 +2093,11 @@ async fn publish_bytes(directory: &Path, path: &Path, bytes: &[u8]) -> Result<()
 async fn step_failure(
     host: &BrowserHost,
     flow: &CompiledFlow,
-    page: &Page,
+    active: &ActiveContext,
     step: &CompiledStep,
     error: StepError,
 ) -> Failure {
-    let current_url = tokio::time::timeout(SECONDARY_TIMEOUT, page.url())
+    let current_url = tokio::time::timeout(SECONDARY_TIMEOUT, active.url())
         .await
         .ok()
         .and_then(Result::ok)
@@ -1764,6 +2143,11 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::WaitUntilVisible { .. } => "wait_until_visible",
         Operation::WaitUntilStable { .. } => "wait_until_stable",
         Operation::Back => "back",
+        Operation::SwitchPage(PageSwitch::Popup) => "switch_page.popup",
+        Operation::SwitchPage(PageSwitch::Opener) => "switch_page.opener",
+        Operation::SwitchFrame(FrameSwitch::Target(_)) => "switch_frame.target",
+        Operation::SwitchFrame(FrameSwitch::Main) => "switch_frame.main",
+        Operation::SwitchFrame(FrameSwitch::Parent) => "switch_frame.parent",
         Operation::Press { .. } => "press",
         Operation::Screenshot { .. } => "screenshot",
         Operation::Recording(RecordingControl::Start) => "recording.start",
@@ -1794,11 +2178,14 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::WaitUntilVisible { target }
         | Operation::WaitUntilStable { target }
         | Operation::Press { target, .. }
+        | Operation::SwitchFrame(FrameSwitch::Target(target))
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
         Operation::Open { .. }
         | Operation::Scroll { .. }
         | Operation::Back
+        | Operation::SwitchPage(_)
+        | Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
         | Operation::Screenshot { .. }
         | Operation::Recording(_)
         | Operation::Clear(_)
@@ -2350,15 +2737,20 @@ steps:
             &BTreeMap::new(),
         )
         .unwrap();
+        let mut active = ActiveContext::new(page.clone());
 
         for step in &flow.steps {
             execute_step(
                 &host,
                 context.id(),
-                &page,
+                &mut active,
                 step,
                 Instant::now() + Duration::from_secs(2),
                 Path::new("."),
+                PageSettings {
+                    viewport: Viewport::new(800, 600).unwrap(),
+                    geolocation: None,
+                },
             )
             .await
             .unwrap_or_else(|error| panic!("{}: {:?}", error.message, error.last_observed));

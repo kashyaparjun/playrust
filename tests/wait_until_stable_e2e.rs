@@ -10,7 +10,7 @@ const HTML: &str = r#"<!doctype html><style>#moving { width:100px; height:50px; 
 #[test]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn waits_for_two_stable_actionability_samples() {
-    let server = FixtureServer::start(HTML);
+    let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("wait-until-stable.yaml");
     let artifacts = directory.path().join("artifacts");

@@ -95,6 +95,9 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 | Wait until visible | `wait_until_visible: { target: { css: .late } }` |
 | Wait until stable | `wait_until_stable: { target: { css: .animated } }` |
 | Navigate back | `back: {}` |
+| Switch to popup/opener | `switch_page: popup` or `switch_page: opener` |
+| Enter iframe | `switch_frame: { target: { css: "#checkout" } }` |
+| Switch frame | `switch_frame: parent` or `switch_frame: main` |
 | Press | `press: { target: { label: Search }, key: Enter, modifiers: [Control] }` |
 | Screenshot | `screenshot: { name: dashboard }` |
 | Start recording | `recording: start` |
@@ -110,6 +113,10 @@ Click, double click, fill, erase, select, swipe, long press, and press wait for 
 Scroll sends one wheel input at the viewport center; positive values move right/down and negative values move left/up, and at least one axis must be non-zero. `scroll_until_visible` repeats one bounded wheel delta until its unique target is visible or the step deadline expires, allowing a target that is initially absent from a virtualized list. Its `x` and `y` values, and swipe offsets, are limited to `-10000..=10000` CSS pixels and cannot both be zero. A swipe endpoint must remain inside the viewport. Swipe defaults to `300ms`; long press defaults to `500ms`; either duration must be positive and at most `10s`, and must fit within the remaining step deadline.
 
 `wait_until_visible` is the explicit positive visibility wait; set a longer step `timeout` when the normal flow timeout is too short. `wait_until_stable` waits for a unique visible target whose bounding box is unchanged across two polling samples. Both use the same locator polling and deadline diagnostics as actionability. Back navigates one browser-history entry and fails when there is no previous entry. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
+
+`switch_page: popup` waits for exactly one page opened by the active page; `switch_page: opener` returns to its opener. Page switching requires `settings.video: off` because chromiumoxide cannot safely hand an active screencast between page targets. The configured viewport and geolocation are applied to each newly active page. Locators, URL assertions and failure diagnostics, screenshots, storage clearing, and subsequent actions use the active page. The isolated browser context owns and cleans up every popup.
+
+`switch_frame` accepts a locator for one same-origin `<iframe>`/`<frame>`, `parent`, or `main`. Locators, frame URL assertions and diagnostics, screenshots, storage clearing, scrolling, and input use the active frame; a full frame screenshot captures its visible viewport. Nested same-origin frames are supported. Cross-origin OOPIF switching is explicitly rejected: chromiumoxide 0.9.1 does not drive its `iframe` CDP targets, so Playrust does not advertise cross-origin frame automation.
 
 Screenshots are PNG files written atomically to the flow artifact directory as `<name>.png`. Names may contain 1-64 ASCII letters, numbers, `-`, or `_`, must start and end with a letter or number, cannot be `failure` or a Windows-reserved filename, cannot contain secrets, and must be case-insensitively unique within a flow. An optional crop uses viewport-relative CSS pixels and must fit within the configured viewport:
 
@@ -195,6 +202,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 operates in the main frame with one page per isolated flow. Iframes, shadow-root traversal, popups, multiple tabs, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, loops, branches, mutable variables, parameterized imports, or plugins.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports opener-linked popups and same-origin frames as described above. Arbitrary tab selection, cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, scripts, loops, branches, mutable variables, parameterized imports, or plugins.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

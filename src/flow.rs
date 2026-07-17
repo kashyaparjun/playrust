@@ -199,6 +199,8 @@ pub struct RawStep {
     pub wait_until_visible: Option<RawTargetAction>,
     pub wait_until_stable: Option<RawTargetAction>,
     pub back: Option<RawEmpty>,
+    pub switch_page: Option<PageSwitch>,
+    pub switch_frame: Option<RawFrameSwitch>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
     pub recording: Option<RecordingControl>,
@@ -290,6 +292,27 @@ pub struct RawLongPress {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawEmpty {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageSwitch {
+    Popup,
+    Opener,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawFrameSwitch {
+    Target(Box<RawTargetAction>),
+    Location(FrameLocation),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameLocation {
+    Main,
+    Parent,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -501,6 +524,8 @@ pub enum Operation {
         target: Locator,
     },
     Back,
+    SwitchPage(PageSwitch),
+    SwitchFrame(FrameSwitch),
     Press {
         target: Locator,
         key: Key,
@@ -513,6 +538,13 @@ pub enum Operation {
     Recording(RecordingControl),
     Clear(ClearTarget),
     Assert(Assertion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameSwitch {
+    Target(Locator),
+    Main,
+    Parent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +742,7 @@ fn compile_file_with_env_and_video(
         return invalid(format!("CLI variable {name:?} is not declared under vars"));
     }
     validate_expanded_steps(&mut flow.steps)?;
+    validate_page_switching_video(&flow)?;
     Ok(flow)
 }
 
@@ -750,6 +783,7 @@ pub fn compile_raw(
 ) -> Result<CompiledFlow, FlowError> {
     let mut flow = compile_raw_inner(raw, source_path.into(), cli_vars, environment, true, false)?;
     validate_expanded_steps(&mut flow.steps)?;
+    validate_page_switching_video(&flow)?;
     Ok(flow)
 }
 
@@ -951,6 +985,8 @@ fn compile_raw_expanded(
                 step.wait_until_visible.is_some(),
                 step.wait_until_stable.is_some(),
                 step.back.is_some(),
+                step.switch_page.is_some(),
+                step.switch_frame.is_some(),
                 step.press.is_some(),
                 step.screenshot.is_some(),
                 step.recording.is_some(),
@@ -1103,6 +1139,25 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
             return invalid("recording start requires one later recording stop");
         }
         _ => return invalid("a flow may contain only one recording start/stop pair"),
+    }
+    Ok(())
+}
+
+fn validate_page_switching_video(flow: &CompiledFlow) -> Result<(), FlowError> {
+    if (flow.settings.video != VideoMode::Off
+        || flow
+            .steps
+            .iter()
+            .any(|step| matches!(step.operation, Operation::Recording(_))))
+        && let Some(step) = flow
+            .steps
+            .iter()
+            .find(|step| matches!(step.operation, Operation::SwitchPage(_)))
+    {
+        return invalid(format!(
+            "step {} switch_page requires settings.video: off and no recording controls because recording cannot safely move between pages",
+            step.index
+        ));
     }
     Ok(())
 }
@@ -1271,6 +1326,8 @@ fn compile_operation(
         step.wait_until_visible.is_some(),
         step.wait_until_stable.is_some(),
         step.back.is_some(),
+        step.switch_page.is_some(),
+        step.switch_frame.is_some(),
         step.press.is_some(),
         step.screenshot.is_some(),
         step.recording.is_some(),
@@ -1397,6 +1454,18 @@ fn compile_operation(
     }
     if step.back.is_some() {
         return Ok(Operation::Back);
+    }
+    if let Some(page) = step.switch_page {
+        return Ok(Operation::SwitchPage(page));
+    }
+    if let Some(frame) = step.switch_frame {
+        return Ok(Operation::SwitchFrame(match frame {
+            RawFrameSwitch::Target(raw) => {
+                FrameSwitch::Target(compile_locator(raw.target, index, inputs)?)
+            }
+            RawFrameSwitch::Location(FrameLocation::Main) => FrameSwitch::Main,
+            RawFrameSwitch::Location(FrameLocation::Parent) => FrameSwitch::Parent,
+        }));
     }
     if let Some(raw) = step.press {
         let key = interpolate_non_secret(&format!("step {index} press.key"), &raw.key, inputs)?;

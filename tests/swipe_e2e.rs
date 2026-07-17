@@ -16,7 +16,7 @@ addEventListener('mouseup', event => result.textContent = event.clientX - start 
 #[test]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn swipes_once_from_an_actionable_target() {
-    let server = FixtureServer::start(HTML);
+    let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("swipe.yaml");
     let artifacts = directory.path().join("artifacts");

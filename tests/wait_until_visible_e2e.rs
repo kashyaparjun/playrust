@@ -10,7 +10,7 @@ const HTML: &str = r#"<!doctype html><body><p id="late" hidden>ready</p><script>
 #[test]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn uses_the_explicit_step_timeout_for_visibility() {
-    let server = FixtureServer::start(HTML);
+    let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("wait-until-visible.yaml");
     let artifacts = directory.path().join("artifacts");

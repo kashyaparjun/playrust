@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{
@@ -14,74 +14,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use playrust::report::AggregateReport;
-
-pub struct FixtureServer {
-    address: std::net::SocketAddr,
-    stop: Arc<AtomicBool>,
-    thread: Option<thread::JoinHandle<io::Result<()>>>,
-}
-
-impl FixtureServer {
-    pub fn start(html: &'static str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
-        let address = listener.local_addr().expect("read fixture address");
-        listener
-            .set_nonblocking(true)
-            .expect("make fixture server stoppable");
-        let stop = Arc::new(AtomicBool::new(false));
-        let server_stop = Arc::clone(&stop);
-        let thread = thread::spawn(move || -> io::Result<()> {
-            while !server_stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false)?;
-                        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                        let mut request = [0; 4096];
-                        let _ = stream.read(&mut request)?;
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-                            html.len()
-                        )?;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        });
-        Self {
-            address,
-            stop,
-            thread: Some(thread),
-        }
-    }
-
-    pub fn url(&self) -> String {
-        format!("http://{}", self.address)
-    }
-
-    pub fn shutdown(mut self) {
-        self.stop.store(true, Ordering::Release);
-        self.thread
-            .take()
-            .expect("fixture server thread missing")
-            .join()
-            .expect("fixture server thread panicked")
-            .expect("serve HTML fixture");
-    }
-}
-
-impl Drop for FixtureServer {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(server) = self.thread.take() {
-            let _ = server.join();
-        }
-    }
-}
 
 pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_playrust"));
@@ -151,12 +83,23 @@ pub fn ffmpeg_path() -> String {
 
 pub struct FixtureServer {
     pub url: String,
+    pub address: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<io::Result<()>>>,
 }
 
 impl FixtureServer {
-    pub fn start(routes: &'static [(&'static str, &'static str, &'static str)]) -> Self {
+    pub fn start(routes: &[(&str, &str, &str)]) -> Self {
+        let routes = routes
+            .iter()
+            .map(|(path, content_type, body)| {
+                (
+                    (*path).to_owned(),
+                    (*content_type).to_owned(),
+                    (*body).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         let address = listener.local_addr().expect("read fixture address");
         listener
@@ -179,8 +122,10 @@ impl FixtureServer {
                             .unwrap_or("/");
                         let (status, content_type, body) = routes
                             .iter()
-                            .find(|(route, _, _)| *route == path)
-                            .map(|(_, content_type, body)| ("200 OK", *content_type, *body))
+                            .find(|(route, _, _)| route == path)
+                            .map(|(_, content_type, body)| {
+                                ("200 OK", content_type.as_str(), body.as_str())
+                            })
                             .unwrap_or(("404 Not Found", "text/plain", "not found"));
                         write!(
                             stream,
@@ -198,9 +143,24 @@ impl FixtureServer {
         });
         Self {
             url: format!("http://{address}"),
+            address,
             stop,
             thread: Some(thread),
         }
+    }
+
+    pub fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.thread
+            .take()
+            .expect("fixture server thread missing")
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("serve fixture");
     }
 }
 

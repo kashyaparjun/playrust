@@ -5,8 +5,11 @@ use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxValueNativeSourceType, QueryAxTreeParams,
 };
-use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, ResolveNodeParams};
-use chromiumoxide::cdp::browser_protocol::page::GetFrameTreeParams;
+use chromiumoxide::cdp::browser_protocol::dom::{
+    BackendNodeId, DescribeNodeParams, GetFrameOwnerParams, NodeId, QuerySelectorAllParams,
+    ResolveNodeParams,
+};
+use chromiumoxide::cdp::browser_protocol::page::{FrameId, GetFrameTreeParams};
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallArgument, CallFunctionOnParams, ReleaseObjectParams,
 };
@@ -272,11 +275,16 @@ pub enum LocatorError {
 
 pub struct LocatorEngine<'page> {
     page: &'page Page,
+    frame: Option<&'page FrameId>,
 }
 
 impl<'page> LocatorEngine<'page> {
     pub fn new(page: &'page Page) -> Self {
-        Self { page }
+        Self { page, frame: None }
+    }
+
+    pub fn in_frame(page: &'page Page, frame: Option<&'page FrameId>) -> Self {
+        Self { page, frame }
     }
 
     pub async fn resolve_all(&self, locator: &Locator) -> Result<CandidateSet, LocatorError> {
@@ -361,10 +369,9 @@ impl<'page> LocatorEngine<'page> {
         &self,
         candidates: Vec<BackendNodeId>,
     ) -> Result<Vec<BackendNodeId>, LocatorError> {
-        let elements = self.page.find_elements("*").await.map_err(protocol)?;
+        let elements = self.query_selector_all("*").await?;
         Ok(elements
             .into_iter()
-            .map(|element| element.backend_node_id)
             .filter(|id| candidates.contains(id))
             .collect())
     }
@@ -469,16 +476,7 @@ impl<'page> LocatorEngine<'page> {
     }
 
     async fn resolve_css(&self, selector: &str) -> Result<Vec<BackendNodeId>, LocatorError> {
-        self.page
-            .find_elements(selector)
-            .await
-            .map(|elements| {
-                elements
-                    .into_iter()
-                    .map(|element| element.backend_node_id)
-                    .collect()
-            })
-            .map_err(protocol)
+        self.query_selector_all(selector).await
     }
 
     async fn resolve_text(
@@ -486,18 +484,18 @@ impl<'page> LocatorEngine<'page> {
         expected: &str,
         match_kind: TextMatch,
     ) -> Result<Vec<BackendNodeId>, LocatorError> {
-        let elements = self.page.find_elements("*").await.map_err(protocol)?;
+        let elements = self.query_selector_all("*").await?;
         let arguments = [
             argument(Value::String(normalize_text(expected))),
             argument(Value::Bool(match_kind == TextMatch::Exact)),
         ];
         let mut matches = Vec::new();
-        for element in elements {
+        for backend_node_id in elements {
             let matched = self
-                .call_on_node::<bool>(element.backend_node_id, TEXT_MATCH_FUNCTION, &arguments)
+                .call_on_node::<bool>(backend_node_id, TEXT_MATCH_FUNCTION, &arguments)
                 .await?;
             if matched {
-                matches.push(element.backend_node_id);
+                matches.push(backend_node_id);
             }
         }
         Ok(matches)
@@ -509,17 +507,21 @@ impl<'page> LocatorEngine<'page> {
         name: Option<&str>,
         form_controls_only: bool,
     ) -> Result<Vec<BackendNodeId>, LocatorError> {
-        let document = self.page.get_document().await.map_err(protocol)?;
-        let main_frame = self
-            .page
-            .execute(GetFrameTreeParams::default())
-            .await
-            .map_err(protocol)?
-            .result
-            .frame_tree
-            .frame
-            .id;
-        let mut query = QueryAxTreeParams::builder().node_id(document.node_id);
+        let document = self.document_root().await?;
+        let expected_frame = match self.frame {
+            Some(frame) => frame.clone(),
+            None => {
+                self.page
+                    .execute(GetFrameTreeParams::default())
+                    .await
+                    .map_err(protocol)?
+                    .result
+                    .frame_tree
+                    .frame
+                    .id
+            }
+        };
+        let mut query = QueryAxTreeParams::builder().node_id(document);
         if let Some(role) = role {
             query = query.role(role);
         }
@@ -538,7 +540,10 @@ impl<'page> LocatorEngine<'page> {
         let mut matches = Vec::new();
         for node in nodes {
             if node.ignored
-                || node.frame_id.as_ref().is_some_and(|id| id != &main_frame)
+                || node
+                    .frame_id
+                    .as_ref()
+                    .is_some_and(|id| id != &expected_frame)
                 || !ax_matches(&node, role, None)
             {
                 continue;
@@ -569,6 +574,68 @@ impl<'page> LocatorEngine<'page> {
             matches.push(backend_node_id);
         }
         Ok(matches)
+    }
+
+    async fn query_selector_all(&self, selector: &str) -> Result<Vec<BackendNodeId>, LocatorError> {
+        let root = self.document_root().await?;
+        let nodes = self
+            .page
+            .execute(QuerySelectorAllParams::new(root, selector))
+            .await
+            .map_err(protocol)?
+            .result
+            .node_ids;
+        let mut backend_nodes = Vec::with_capacity(nodes.len());
+        for node_id in nodes {
+            backend_nodes.push(
+                self.page
+                    .execute(DescribeNodeParams::builder().node_id(node_id).build())
+                    .await
+                    .map_err(protocol)?
+                    .result
+                    .node
+                    .backend_node_id,
+            );
+        }
+        Ok(backend_nodes)
+    }
+
+    async fn document_root(&self) -> Result<NodeId, LocatorError> {
+        let Some(frame) = self.frame else {
+            return self
+                .page
+                .get_document()
+                .await
+                .map(|document| document.node_id)
+                .map_err(protocol);
+        };
+        self.page.get_document().await.map_err(protocol)?;
+        let owner = self
+            .page
+            .execute(GetFrameOwnerParams::new(frame.clone()))
+            .await
+            .map_err(protocol)?
+            .result;
+        let node = self
+            .page
+            .execute(
+                DescribeNodeParams::builder()
+                    .backend_node_id(owner.backend_node_id)
+                    .depth(1)
+                    .pierce(true)
+                    .build(),
+            )
+            .await
+            .map_err(protocol)?
+            .result
+            .node;
+        node.content_document
+            .map(|document| document.node_id)
+            .ok_or_else(|| {
+                LocatorError::Protocol(
+                    "cross-origin iframe targets are unsupported by chromiumoxide 0.9.1".into(),
+                )
+            })
     }
 
     async fn observe_candidate(

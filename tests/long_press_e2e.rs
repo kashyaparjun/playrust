@@ -16,7 +16,7 @@ target.addEventListener('mouseup', () => result.textContent = performance.now() 
 #[test]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn holds_and_releases_an_actionable_target_once() {
-    let server = FixtureServer::start(HTML);
+    let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("long-press.yaml");
     let artifacts = directory.path().join("artifacts");
