@@ -70,6 +70,7 @@ jobs:
           --test scroll_until_visible_e2e
           --test storage_clearing_e2e
           --test swipe_e2e
+          --test tab_selection_e2e
           --test tabs_e2e
           --test wait_until_stable_e2e
           --test wait_until_visible_e2e

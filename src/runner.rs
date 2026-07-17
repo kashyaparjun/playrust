@@ -24,6 +24,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
+use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallFunctionOnParams, EvaluateParams, ReleaseObjectParams,
 };
@@ -698,8 +699,9 @@ async fn execute_step(
         Operation::Back => navigate_back(&active.page, deadline).await.map(|_| None),
         Operation::SwitchPage(page) => switch_page(
             host,
+            context_id,
             active,
-            *page,
+            page,
             deadline,
             runtime.page_settings.viewport,
             runtime.page_settings.geolocation,
@@ -1195,8 +1197,9 @@ enum NavigationCompletion<C, S, L> {
 
 async fn switch_page(
     host: &BrowserHost,
+    context_id: &chromiumoxide::cdp::browser_protocol::browser::BrowserContextId,
     active: &mut ActiveContext,
-    destination: PageSwitch,
+    destination: &PageSwitch,
     deadline: Instant,
     viewport: Viewport,
     geolocation: Option<Geolocation>,
@@ -1208,24 +1211,82 @@ async fn switch_page(
             })?;
             host.browser().get_page(opener).await.map_err(protocol)?
         }
-        PageSwitch::Popup => loop {
+        PageSwitch::Popup | PageSwitch::Name(_) | PageSwitch::Url(_) => loop {
             let pages = host.browser().pages().await.map_err(protocol)?;
-            let candidates = pages
+            let targets = host
+                .browser()
+                .execute(GetTargetsParams::default())
+                .await
+                .map_err(protocol)?
+                .result
+                .target_infos;
+            let pages = pages
                 .into_iter()
-                .filter(|page| page.opener_id().as_ref() == Some(active.page.target_id()))
+                .filter(|page| {
+                    targets.iter().any(|target| {
+                        target.target_id == *page.target_id()
+                            && target.r#type == "page"
+                            && target.browser_context_id.as_ref() == Some(context_id)
+                    })
+                })
                 .collect::<Vec<_>>();
+            let mut candidates = Vec::new();
+            for page in pages {
+                let matches = match destination {
+                    PageSwitch::Popup => page.opener_id().as_ref() == Some(active.page.target_id()),
+                    PageSwitch::Name(expected) => {
+                        page.evaluate("window.name")
+                            .await
+                            .map_err(protocol)?
+                            .into_value::<String>()
+                            .map_err(protocol)?
+                            == *expected.expose()
+                    }
+                    PageSwitch::Url(expected) => {
+                        page.url().await.map_err(protocol)?.as_deref()
+                            == Some(expected.expose().as_str())
+                    }
+                    PageSwitch::Opener => unreachable!("opener handled above"),
+                };
+                if matches {
+                    candidates.push(page);
+                }
+            }
             match candidates.as_slice() {
                 [page] => break page.clone(),
                 pages if pages.len() > 1 => {
                     return Err(StepError::new(
                         FailureCategory::Navigation,
-                        "active page has multiple popup pages",
+                        match destination {
+                            PageSwitch::Popup => "active page has multiple popup pages".to_owned(),
+                            PageSwitch::Name(name) => {
+                                format!("multiple pages match switch_page name {:?}", name.expose())
+                            }
+                            PageSwitch::Url(url) => format!(
+                                "multiple pages match switch_page URL {:?}",
+                                url.expose().as_str()
+                            ),
+                            PageSwitch::Opener => unreachable!("opener handled above"),
+                        },
                     ));
                 }
                 _ if Instant::now() >= deadline => {
                     return Err(StepError::new(
                         FailureCategory::Timeout,
-                        "popup did not open before the step deadline",
+                        match destination {
+                            PageSwitch::Popup => {
+                                "popup did not open before the step deadline".to_owned()
+                            }
+                            PageSwitch::Name(name) => format!(
+                                "no page named {:?} appeared before the step deadline",
+                                name.expose()
+                            ),
+                            PageSwitch::Url(url) => format!(
+                                "no page with URL {:?} appeared before the step deadline",
+                                url.expose().as_str()
+                            ),
+                            PageSwitch::Opener => unreachable!("opener handled above"),
+                        },
                     )
                     .deadline());
                 }
@@ -2565,6 +2626,8 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Back => "back",
         Operation::SwitchPage(PageSwitch::Popup) => "switch_page.popup",
         Operation::SwitchPage(PageSwitch::Opener) => "switch_page.opener",
+        Operation::SwitchPage(PageSwitch::Name(_)) => "switch_page.name",
+        Operation::SwitchPage(PageSwitch::Url(_)) => "switch_page.url",
         Operation::SwitchFrame(FrameSwitch::Target(_)) => "switch_frame.target",
         Operation::SwitchFrame(FrameSwitch::Main) => "switch_frame.main",
         Operation::SwitchFrame(FrameSwitch::Parent) => "switch_frame.parent",

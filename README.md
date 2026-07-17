@@ -120,7 +120,7 @@ Variable equality is resolved at compile time against a declared, immutable, non
 | Wait until visible | `wait_until_visible: { target: { css: .late } }` |
 | Wait until stable | `wait_until_stable: { target: { css: .animated } }` |
 | Navigate back | `back: {}` |
-| Switch to popup/opener | `switch_page: popup` or `switch_page: opener` |
+| Switch page | `switch_page: popup`, `switch_page: opener`, `switch_page: { name: checkout }`, or `switch_page: { url: /checkout }` |
 | Enter iframe | `switch_frame: { target: { css: "#checkout" } }` |
 | Switch frame | `switch_frame: parent` or `switch_frame: main` |
 | Press | `press: { target: { label: Search }, key: Enter, modifiers: [Control] }` |
@@ -141,7 +141,7 @@ Scroll sends one wheel input at the viewport center; positive values move right/
 
 `wait_until_visible` is the explicit positive visibility wait; set a longer step `timeout` when the normal flow timeout is too short. `wait_until_stable` waits for a unique visible target whose bounding box is unchanged across two polling samples. Both use the same locator polling and deadline diagnostics as actionability. Back navigates one browser-history entry and fails when there is no previous entry. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
 
-`switch_page: popup` waits for exactly one page opened by the active page; `switch_page: opener` returns to its opener. Page switching requires `settings.video: off` because chromiumoxide cannot safely hand an active screencast between page targets. The configured viewport and geolocation are applied to each newly active page. Locators, URL assertions and failure diagnostics, screenshots, storage clearing, and subsequent actions use the active page. The isolated browser context owns and cleans up every popup.
+`switch_page: popup` waits for exactly one page opened by the active page; `switch_page: opener` returns to its opener. `{ name: value }` matches the exact `window.name`, and `{ url: value }` matches one exact resolved HTTP(S) URL; a relative URL requires `base_url`. Named and URL selectors search only the current flow's isolated browser context and fail if multiple pages match. Page switching requires `settings.video: off` because chromiumoxide cannot safely hand an active screencast between page targets. The configured viewport and geolocation are applied to each newly active page. Locators, URL assertions and failure diagnostics, screenshots, storage clearing, and subsequent actions use the active page. The isolated browser context owns and cleans up every page.
 
 `switch_frame` accepts a locator for one same-origin `<iframe>`/`<frame>`, `parent`, or `main`. Locators, frame URL assertions and diagnostics, screenshots, storage clearing, scrolling, and input use the active frame; a full frame screenshot captures its visible viewport. Nested same-origin frames are supported. Cross-origin OOPIF switching is explicitly rejected: chromiumoxide 0.9.1 does not drive its `iframe` CDP targets, so Playrust does not advertise cross-origin frame automation.
 
@@ -261,6 +261,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports opener-linked popups and same-origin frames as described above. Arbitrary tab selection, cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Flows are sequential and do not provide sleeps, mutable variables, general expressions, unbounded loops, transactional subflow retries, dynamic paths, plugins, or a JavaScript sandbox.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports popup, opener, exact named/URL page selection, and same-origin frames as described above. Cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Swipe and long press retain mouse semantics because desktop Chrome touch emulation synthesizes an additional, timing-incompatible mouse sequence. Flows are sequential and do not provide sleeps, mutable variables, general expressions, unbounded loops, transactional subflow retries, dynamic paths, plugins, or a JavaScript sandbox.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

@@ -30,6 +30,14 @@ fn page_switching_rejects_enabled_video() {
     )
     .expect_err("page switching must reject default-on video");
     assert!(error.to_string().contains("requires settings.video: off"));
+
+    let error = compile_yaml(
+        "version: 1\nname: unsafe-video\nsteps: [{ switch_page: { name: checkout } }]\n",
+        "unsafe-video.yaml",
+        &BTreeMap::new(),
+    )
+    .expect_err("named page switching must reject default-on video");
+    assert!(error.to_string().contains("requires settings.video: off"));
 }
 
 #[tokio::test(flavor = "current_thread")]

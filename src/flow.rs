@@ -220,7 +220,7 @@ pub struct RawStep {
     pub wait_until_visible: Option<RawTargetAction>,
     pub wait_until_stable: Option<RawTargetAction>,
     pub back: Option<RawEmpty>,
-    pub switch_page: Option<PageSwitch>,
+    pub switch_page: Option<RawPageSwitch>,
     pub switch_frame: Option<RawFrameSwitch>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
@@ -368,11 +368,33 @@ pub struct RawLongPress {
 #[serde(deny_unknown_fields)]
 pub struct RawEmpty {}
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawPageSwitch {
+    Location(PageLocation),
+    Selector(RawPageSelector),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPageSelector {
+    pub name: Option<String>,
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum PageLocation {
+    Popup,
+    Opener,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageSwitch {
     Popup,
     Opener,
+    Name(Resolved<String>),
+    Url(Resolved<Url>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1930,7 +1952,56 @@ fn compile_operation(
         return Ok(Operation::Back);
     }
     if let Some(page) = step.switch_page {
-        return Ok(Operation::SwitchPage(page));
+        return Ok(Operation::SwitchPage(match page {
+            RawPageSwitch::Location(PageLocation::Popup) => PageSwitch::Popup,
+            RawPageSwitch::Location(PageLocation::Opener) => PageSwitch::Opener,
+            RawPageSwitch::Selector(raw) => match (raw.name, raw.url) {
+                (Some(name), None) => {
+                    let name =
+                        interpolate(&format!("step {index} switch_page.name"), &name, inputs)?;
+                    require_non_empty(&format!("step {index} switch_page.name"), name.expose())?;
+                    PageSwitch::Name(name)
+                }
+                (None, Some(raw)) => {
+                    let value =
+                        interpolate(&format!("step {index} switch_page.url"), &raw, inputs)?;
+                    require_non_empty(&format!("step {index} switch_page.url"), value.expose())?;
+                    let (url, base_secret) = match Url::parse(value.expose()) {
+                        Ok(url) => (
+                            validate_http_url(&format!("step {index} switch_page.url"), url)?,
+                            false,
+                        ),
+                        Err(url::ParseError::RelativeUrlWithoutBase) => {
+                            let base = base_url.ok_or_else(|| {
+                                FlowError::Invalid(format!(
+                                    "step {index} has a relative switch_page URL but base_url is not set"
+                                ))
+                            })?;
+                            let url = base.expose().join(value.expose()).map_err(|_| {
+                                FlowError::Invalid(format!(
+                                    "step {index} switch_page.url is not a valid URL"
+                                ))
+                            })?;
+                            (
+                                validate_http_url(&format!("step {index} switch_page.url"), url)?,
+                                base.secret,
+                            )
+                        }
+                        Err(_) => {
+                            return invalid(format!(
+                                "step {index} switch_page.url is not a valid URL"
+                            ));
+                        }
+                    };
+                    PageSwitch::Url(Resolved::new(url, value.secret || base_secret))
+                }
+                _ => {
+                    return invalid(format!(
+                        "step {index} switch_page must contain exactly one of name or url"
+                    ));
+                }
+            },
+        }));
     }
     if let Some(frame) = step.switch_frame {
         return Ok(Operation::SwitchFrame(match frame {
