@@ -21,6 +21,8 @@ pub const MAX_FLOW_SOURCE_BYTES: usize = 1024 * 1024;
 pub const MAX_FLOW_STEPS: usize = 10_000;
 /// Maximum nested subflow include depth, excluding the entrypoint.
 pub const MAX_SUBFLOW_DEPTH: usize = 32;
+/// Maximum nested locator relation depth, excluding the root locator.
+pub const MAX_LOCATOR_DEPTH: usize = 8;
 /// Maximum size of a YAML scalar or interpolated value in bytes (64 KiB).
 pub const MAX_SCALAR_BYTES: usize = 64 * 1024;
 /// Maximum timeout accepted for flow settings or an individual step.
@@ -185,8 +187,8 @@ pub struct RawStep {
     pub timeout: Option<String>,
     pub run: Option<String>,
     pub open: Option<String>,
-    pub click: Option<RawTargetAction>,
-    pub double_click: Option<RawTargetAction>,
+    pub click: Option<RawClick>,
+    pub double_click: Option<RawClick>,
     pub fill: Option<RawFill>,
     pub erase: Option<RawTargetAction>,
     pub select: Option<RawSelect>,
@@ -224,6 +226,13 @@ pub struct RawCrop {
 #[serde(deny_unknown_fields)]
 pub struct RawTargetAction {
     pub target: RawLocator,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawClick {
+    pub target: RawLocator,
+    pub position: Option<RelativePoint>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -336,6 +345,13 @@ pub struct RawLocator {
     pub checked: Option<bool>,
     pub selected: Option<bool>,
     pub focused: Option<bool>,
+    pub enabled: Option<bool>,
+    pub within: Option<Box<RawLocator>>,
+    pub has: Option<Box<RawLocator>>,
+    pub above: Option<Box<RawLocator>>,
+    pub below: Option<Box<RawLocator>>,
+    pub left: Option<Box<RawLocator>>,
+    pub right: Option<Box<RawLocator>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +389,13 @@ pub enum VideoMode {
 pub enum TextMatch {
     Exact,
     Contains,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelativePoint {
+    pub x: u32,
+    pub y: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -424,9 +447,11 @@ pub enum Operation {
     },
     Click {
         target: Locator,
+        position: Option<RelativePoint>,
     },
     DoubleClick {
         target: Locator,
+        position: Option<RelativePoint>,
     },
     Fill {
         target: Locator,
@@ -520,6 +545,24 @@ pub struct Locator {
     pub checked: Option<bool>,
     pub selected: Option<bool>,
     pub focused: Option<bool>,
+    pub enabled: Option<bool>,
+    pub relations: Vec<LocatorRelation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatorRelation {
+    pub kind: RelationKind,
+    pub locator: Box<Locator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    Within,
+    Has,
+    Above,
+    Below,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1237,11 +1280,13 @@ fn compile_operation(
     if let Some(raw) = step.click {
         return Ok(Operation::Click {
             target: compile_locator(raw.target, index, inputs)?,
+            position: raw.position,
         });
     }
     if let Some(raw) = step.double_click {
         return Ok(Operation::DoubleClick {
             target: compile_locator(raw.target, index, inputs)?,
+            position: raw.position,
         });
     }
     if let Some(raw) = step.fill {
@@ -1597,6 +1642,15 @@ fn compile_locator(
     index: usize,
     inputs: &BTreeMap<String, Resolved<String>>,
 ) -> Result<Locator, FlowError> {
+    compile_locator_at(raw, index, inputs, 0)
+}
+
+fn compile_locator_at(
+    raw: RawLocator,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+    depth: usize,
+) -> Result<Locator, FlowError> {
     let strategy_count = [
         raw.css.is_some(),
         raw.test_id.is_some(),
@@ -1642,12 +1696,35 @@ fn compile_locator(
                 .transpose()?,
         }
     };
+    let mut relations = Vec::new();
+    for (kind, relation) in [
+        (RelationKind::Within, raw.within),
+        (RelationKind::Has, raw.has),
+        (RelationKind::Above, raw.above),
+        (RelationKind::Below, raw.below),
+        (RelationKind::Left, raw.left),
+        (RelationKind::Right, raw.right),
+    ] {
+        if let Some(relation) = relation {
+            if depth == MAX_LOCATOR_DEPTH {
+                return invalid(format!(
+                    "step {index} locator exceeds maximum relation depth {MAX_LOCATOR_DEPTH}"
+                ));
+            }
+            relations.push(LocatorRelation {
+                kind,
+                locator: Box::new(compile_locator_at(*relation, index, inputs, depth + 1)?),
+            });
+        }
+    }
     Ok(Locator {
         strategy,
         index: raw.index,
         checked: raw.checked,
         selected: raw.selected,
         focused: raw.focused,
+        enabled: raw.enabled,
+        relations,
     })
 }
 
@@ -2009,7 +2086,8 @@ steps:
                         ..
                     },
                     ..
-                }
+                },
+                ..
             }
         ));
         assert!(matches!(
@@ -2170,7 +2248,8 @@ steps:
                 target: Locator {
                     strategy: LocatorStrategy::TestId(value),
                     ..
-                }
+                },
+                ..
             } if value.expose() == "item"
         ));
         assert!(error(
@@ -2398,10 +2477,10 @@ steps: [{ open: https://x.test }]
     #[test]
     fn compiles_flat_locator_modifiers_without_counting_them_as_strategies() {
         let flow = compile(
-            "version: 1\nname: x\nsteps:\n  - click:\n      target: { css: option, index: 0, checked: false, selected: true, focused: false }\n",
+            "version: 1\nname: x\nsteps:\n  - click:\n      position: { x: 4, y: 7 }\n      target: { css: option, index: 0, checked: false, selected: true, focused: false, enabled: true }\n",
         )
         .unwrap();
-        let Operation::Click { target } = &flow.steps[0].operation else {
+        let Operation::Click { target, position } = &flow.steps[0].operation else {
             panic!("expected click");
         };
         assert!(matches!(target.strategy, LocatorStrategy::Css(_)));
@@ -2409,6 +2488,8 @@ steps: [{ open: https://x.test }]
         assert_eq!(target.checked, Some(false));
         assert_eq!(target.selected, Some(true));
         assert_eq!(target.focused, Some(false));
+        assert_eq!(target.enabled, Some(true));
+        assert_eq!(*position, Some(RelativePoint { x: 4, y: 7 }));
 
         assert!(
             error("version: 1\nname: x\nsteps: [{ click: { target: { index: 0 } } }]\n")
@@ -2427,9 +2508,43 @@ steps: [{ open: https://x.test }]
             .is_err()
         );
         assert!(parse_yaml(
-            "version: 1\nname: x\nsteps: [{ click: { target: { css: x, has: { text: y } } } }]\n"
+            "version: 1\nname: x\nsteps: [{ erase: { target: { css: x }, position: { x: 1, y: 1 } } }]\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn compiles_recursive_relations_and_bounds_their_depth() {
+        let flow = compile(
+            "version: 1\nname: x\nsteps:\n  - click:\n      target:\n        css: button\n        within: { css: .panel }\n        has: { text: Save }\n        above: { test_id: footer }\n        below: { css: header }\n        left: { label: Cancel }\n        right: { role: { value: img, name: Logo } }\n",
+        )
+        .unwrap();
+        let Operation::Click { target, .. } = &flow.steps[0].operation else {
+            panic!("expected click");
+        };
+        assert_eq!(
+            target
+                .relations
+                .iter()
+                .map(|relation| relation.kind)
+                .collect::<Vec<_>>(),
+            [
+                RelationKind::Within,
+                RelationKind::Has,
+                RelationKind::Above,
+                RelationKind::Below,
+                RelationKind::Left,
+                RelationKind::Right,
+            ]
+        );
+
+        let mut locator = "{ css: leaf }".to_owned();
+        for _ in 0..=MAX_LOCATOR_DEPTH {
+            locator = format!("{{ css: node, has: {locator} }}");
+        }
+        let source =
+            format!("version: 1\nname: x\nsteps: [{{ click: {{ target: {locator} }} }}]\n");
+        assert!(error(&source).contains("maximum relation depth 8"));
     }
 
     #[test]

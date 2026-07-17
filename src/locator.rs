@@ -10,12 +10,13 @@ use chromiumoxide::cdp::browser_protocol::page::GetFrameTreeParams;
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallArgument, CallFunctionOnParams, ReleaseObjectParams,
 };
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::flow::{Locator, LocatorStrategy, TextMatch};
+use crate::flow::{Locator, LocatorStrategy, RelationKind, RelativePoint, TextMatch};
 
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -50,14 +51,32 @@ const NATIVE_LABEL_MATCH_FUNCTION: &str = r#"function(expected) {
         normalize(Array.from(this.labels, label => label.textContent).join(' ')) === expected;
 }"#;
 
-const STATE_FILTER_FUNCTION: &str = r#"function(checked, selected, focused) {
+const STATE_FILTER_FUNCTION: &str = r#"function(checked, selected, focused, enabled) {
     if (checked !== null && (!('checked' in this) || this.checked !== checked)) return false;
     if (selected !== null && (!('selected' in this) || this.selected !== selected)) return false;
     if (focused !== null && (document.activeElement === this) !== focused) return false;
+    const disabled = this.matches(':disabled') || this.closest('[inert]') !== null ||
+        this.closest('[aria-disabled="true"]') !== null;
+    if (enabled !== null && !disabled !== enabled) return false;
     return true;
 }"#;
 
-const ACTIONABILITY_FUNCTION: &str = r#"function(scroll) {
+const RELATION_FUNCTION: &str = r#"function(other, relation) {
+    if (!this.isConnected || !other.isConnected || this === other) return false;
+    if (relation === 'within') return other.contains(this);
+    if (relation === 'has') return this.contains(other);
+    const rect = this.getBoundingClientRect();
+    const otherRect = other.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || otherRect.width <= 0 || otherRect.height <= 0) {
+        return false;
+    }
+    if (relation === 'above') return rect.bottom <= otherRect.top;
+    if (relation === 'below') return rect.top >= otherRect.bottom;
+    if (relation === 'left') return rect.right <= otherRect.left;
+    return rect.left >= otherRect.right;
+}"#;
+
+const ACTIONABILITY_FUNCTION: &str = r#"function(scroll, offsetX, offsetY) {
     if (!this.isConnected) return { attached: false };
     const visible = (() => {
         if (this.getClientRects().length === 0) return false;
@@ -80,8 +99,14 @@ const ACTIONABILITY_FUNCTION: &str = r#"function(scroll) {
         this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
     }
     const rect = this.getBoundingClientRect();
-    const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    const center = {
+        x: rect.left + (offsetX === null ? rect.width / 2 : offsetX),
+        y: rect.top + (offsetY === null ? rect.height / 2 : offsetY)
+    };
+    const pointInside = center.x >= rect.left && center.x < rect.right &&
+        center.y >= rect.top && center.y < rect.bottom;
     const hit = rect.width > 0 && rect.height > 0 &&
+        pointInside &&
         center.x >= 0 && center.y >= 0 && center.x < innerWidth && center.y < innerHeight
         ? document.elementFromPoint(center.x, center.y) : null;
     const covered = hit === null || (hit !== this && !this.contains(hit));
@@ -92,6 +117,7 @@ const ACTIONABILITY_FUNCTION: &str = r#"function(scroll) {
         editable,
         rect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
         center,
+        pointInside,
         covered,
         covering: covered && hit !== null
             ? `${hit.tagName.toLowerCase()}${hit.id ? '#' + hit.id : ''}` : null
@@ -195,6 +221,7 @@ pub enum Observation {
     Disabled,
     NonEditable,
     EmptyBox,
+    InvalidPoint,
     Unstable {
         backend_node_id: BackendNodeId,
         previous: Rect,
@@ -219,6 +246,7 @@ impl fmt::Display for Observation {
             Self::Disabled => formatter.write_str("disabled"),
             Self::NonEditable => formatter.write_str("non-editable"),
             Self::EmptyBox => formatter.write_str("empty box"),
+            Self::InvalidPoint => formatter.write_str("action point outside target"),
             Self::Unstable { .. } => formatter.write_str("unstable"),
             Self::Covered { covering } => match covering {
                 Some(covering) => write!(formatter, "covered by {covering}"),
@@ -252,54 +280,81 @@ impl<'page> LocatorEngine<'page> {
     }
 
     pub async fn resolve_all(&self, locator: &Locator) -> Result<CandidateSet, LocatorError> {
-        let backend_node_ids = match &locator.strategy {
-            LocatorStrategy::Css(selector) => self.resolve_css(selector.expose()).await?,
-            LocatorStrategy::TestId(test_id) => {
-                self.resolve_css(&test_id_selector(test_id.expose()))
-                    .await?
-            }
-            LocatorStrategy::Text { value, match_kind } => {
-                self.resolve_text(value.expose(), *match_kind).await?
-            }
-            LocatorStrategy::Label(name) => {
-                self.resolve_ax(None, Some(name.expose()), true).await?
-            }
-            LocatorStrategy::Role { value, name } => {
-                self.resolve_ax(
-                    Some(value.expose()),
-                    name.as_ref().map(|name| name.expose().as_str()),
-                    false,
-                )
-                .await?
-            }
-        };
-        let mut backend_node_ids = if locator.index.is_some() {
-            self.in_dom_order(backend_node_ids).await?
-        } else {
-            let mut backend_node_ids = backend_node_ids;
-            backend_node_ids.sort_by_key(|id| *id.inner());
-            backend_node_ids.dedup();
-            backend_node_ids
-        };
-        if locator.checked.is_some() || locator.selected.is_some() || locator.focused.is_some() {
-            let arguments = [
-                optional_bool(locator.checked),
-                optional_bool(locator.selected),
-                optional_bool(locator.focused),
-            ];
-            let mut filtered = Vec::with_capacity(backend_node_ids.len());
-            for backend_node_id in backend_node_ids {
-                if self
-                    .call_on_node::<bool>(backend_node_id, STATE_FILTER_FUNCTION, &arguments)
-                    .await?
-                {
-                    filtered.push(backend_node_id);
+        self.resolve_all_at(locator).await
+    }
+
+    fn resolve_all_at<'locator>(
+        &'locator self,
+        locator: &'locator Locator,
+    ) -> BoxFuture<'locator, Result<CandidateSet, LocatorError>> {
+        Box::pin(async move {
+            let backend_node_ids = match &locator.strategy {
+                LocatorStrategy::Css(selector) => self.resolve_css(selector.expose()).await?,
+                LocatorStrategy::TestId(test_id) => {
+                    self.resolve_css(&test_id_selector(test_id.expose()))
+                        .await?
                 }
+                LocatorStrategy::Text { value, match_kind } => {
+                    self.resolve_text(value.expose(), *match_kind).await?
+                }
+                LocatorStrategy::Label(name) => {
+                    self.resolve_ax(None, Some(name.expose()), true).await?
+                }
+                LocatorStrategy::Role { value, name } => {
+                    self.resolve_ax(
+                        Some(value.expose()),
+                        name.as_ref().map(|name| name.expose().as_str()),
+                        false,
+                    )
+                    .await?
+                }
+            };
+            let mut backend_node_ids = self.in_dom_order(backend_node_ids).await?;
+            if locator.checked.is_some()
+                || locator.selected.is_some()
+                || locator.focused.is_some()
+                || locator.enabled.is_some()
+            {
+                let arguments = [
+                    optional_bool(locator.checked),
+                    optional_bool(locator.selected),
+                    optional_bool(locator.focused),
+                    optional_bool(locator.enabled),
+                ];
+                let mut filtered = Vec::with_capacity(backend_node_ids.len());
+                for backend_node_id in backend_node_ids {
+                    if self
+                        .call_on_node::<bool>(backend_node_id, STATE_FILTER_FUNCTION, &arguments)
+                        .await?
+                    {
+                        filtered.push(backend_node_id);
+                    }
+                }
+                backend_node_ids = filtered;
             }
-            backend_node_ids = filtered;
-        }
-        backend_node_ids = select_index(backend_node_ids, locator.index);
-        Ok(CandidateSet { backend_node_ids })
+            for relation in &locator.relations {
+                let related = self.resolve_all_at(&relation.locator).await?;
+                let mut filtered = Vec::with_capacity(backend_node_ids.len());
+                for backend_node_id in backend_node_ids {
+                    let mut matches = false;
+                    for related_node_id in &related.backend_node_ids {
+                        if self
+                            .nodes_match_relation(backend_node_id, *related_node_id, relation.kind)
+                            .await?
+                        {
+                            matches = true;
+                            break;
+                        }
+                    }
+                    if matches {
+                        filtered.push(backend_node_id);
+                    }
+                }
+                backend_node_ids = filtered;
+            }
+            backend_node_ids = select_index(backend_node_ids, locator.index);
+            Ok(CandidateSet { backend_node_ids })
+        })
     }
 
     async fn in_dom_order(
@@ -323,7 +378,7 @@ impl<'page> LocatorEngine<'page> {
         match candidates.backend_node_ids.as_slice() {
             [] => Ok(Observation::NoMatch),
             [backend_node_id] => {
-                self.observe_candidate(*backend_node_id, requirements, None)
+                self.observe_candidate(*backend_node_id, requirements, None, None)
                     .await
             }
             candidates => Ok(Observation::Multiple {
@@ -343,7 +398,7 @@ impl<'page> LocatorEngine<'page> {
         let mut observations = Vec::with_capacity(candidates.backend_node_ids.len());
         for backend_node_id in candidates.backend_node_ids {
             let observation = self
-                .observe_candidate(backend_node_id, Actionability::VISIBLE, None)
+                .observe_candidate(backend_node_id, Actionability::VISIBLE, None, None)
                 .await?;
             if matches!(observation, Observation::Ready(_)) {
                 return Ok(observation);
@@ -358,7 +413,7 @@ impl<'page> LocatorEngine<'page> {
         backend_node_id: BackendNodeId,
         requirements: Actionability,
     ) -> Result<Observation, LocatorError> {
-        self.observe_candidate(backend_node_id, requirements, None)
+        self.observe_candidate(backend_node_id, requirements, None, None)
             .await
     }
 
@@ -366,6 +421,7 @@ impl<'page> LocatorEngine<'page> {
         &self,
         locator: &Locator,
         requirements: Actionability,
+        action_point: Option<RelativePoint>,
         deadline: Instant,
     ) -> Result<ResolvedElement, LocatorError> {
         let mut previous = None;
@@ -375,7 +431,12 @@ impl<'page> LocatorEngine<'page> {
                     [] => Observation::NoMatch,
                     [backend_node_id] => {
                         match self
-                            .observe_candidate(*backend_node_id, requirements, previous)
+                            .observe_candidate(
+                                *backend_node_id,
+                                requirements,
+                                action_point,
+                                previous,
+                            )
                             .await
                         {
                             Ok(observation) => observation,
@@ -514,19 +575,26 @@ impl<'page> LocatorEngine<'page> {
         &self,
         backend_node_id: BackendNodeId,
         requirements: Actionability,
+        action_point: Option<RelativePoint>,
         previous: Option<(BackendNodeId, Rect)>,
     ) -> Result<Observation, LocatorError> {
         let state = self
             .call_on_node::<ElementState>(
                 backend_node_id,
                 ACTIONABILITY_FUNCTION,
-                &[argument(Value::Bool(
-                    requirements.visible
-                        || requirements.enabled
-                        || requirements.editable
-                        || requirements.stable
-                        || requirements.hit_test,
-                ))],
+                &[
+                    argument(Value::Bool(
+                        requirements.visible
+                            || requirements.enabled
+                            || requirements.editable
+                            || requirements.stable
+                            || requirements.hit_test,
+                    )),
+                    action_point
+                        .map_or_else(|| argument(Value::Null), |point| argument(point.x.into())),
+                    action_point
+                        .map_or_else(|| argument(Value::Null), |point| argument(point.y.into())),
+                ],
             )
             .await?;
         if !state.attached {
@@ -549,6 +617,9 @@ impl<'page> LocatorEngine<'page> {
             .ok_or_else(|| LocatorError::InvalidResponse("attached node had no center".into()))?;
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return Ok(Observation::EmptyBox);
+        }
+        if requirements.hit_test && !state.point_inside {
+            return Ok(Observation::InvalidPoint);
         }
         if requirements.stable {
             let Some((previous_id, previous_rect)) = previous else {
@@ -620,6 +691,60 @@ impl<'page> LocatorEngine<'page> {
         serde_json::from_value(value)
             .map_err(|error| LocatorError::InvalidResponse(error.to_string()))
     }
+
+    async fn nodes_match_relation(
+        &self,
+        backend_node_id: BackendNodeId,
+        related_node_id: BackendNodeId,
+        relation: RelationKind,
+    ) -> Result<bool, LocatorError> {
+        let object = self.resolve_object(backend_node_id).await?;
+        let related = self.resolve_object(related_node_id).await?;
+        let params = CallFunctionOnParams::builder()
+            .function_declaration(RELATION_FUNCTION)
+            .object_id(object.clone())
+            .arguments([
+                CallArgument::builder().object_id(related.clone()).build(),
+                argument(Value::String(relation_name(relation).to_owned())),
+            ])
+            .return_by_value(true)
+            .await_promise(false)
+            .build()
+            .map_err(LocatorError::InvalidResponse)?;
+        let response = self.page.execute(params).await.map_err(protocol)?.result;
+        let _ = self.page.execute(ReleaseObjectParams::new(object)).await;
+        let _ = self.page.execute(ReleaseObjectParams::new(related)).await;
+        if let Some(exception) = response.exception_details {
+            return Err(LocatorError::Protocol(format!(
+                "page relation function threw: {}",
+                exception.text
+            )));
+        }
+        serde_json::from_value(response.result.value.ok_or_else(|| {
+            LocatorError::InvalidResponse("page relation function returned no value".into())
+        })?)
+        .map_err(|error| LocatorError::InvalidResponse(error.to_string()))
+    }
+
+    async fn resolve_object(
+        &self,
+        backend_node_id: BackendNodeId,
+    ) -> Result<chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId, LocatorError> {
+        self.page
+            .execute(
+                ResolveNodeParams::builder()
+                    .backend_node_id(backend_node_id)
+                    .build(),
+            )
+            .await
+            .map_err(protocol)?
+            .result
+            .object
+            .object_id
+            .ok_or_else(|| {
+                LocatorError::InvalidResponse("resolved DOM node had no object id".into())
+            })
+    }
 }
 
 #[derive(Deserialize)]
@@ -636,6 +761,8 @@ struct ElementState {
     center: Option<Point>,
     #[serde(default)]
     covered: bool,
+    #[serde(default)]
+    point_inside: bool,
     covering: Option<String>,
 }
 
@@ -723,6 +850,17 @@ fn optional_bool(value: Option<bool>) -> CallArgument {
     argument(value.map_or(Value::Null, Value::Bool))
 }
 
+fn relation_name(relation: RelationKind) -> &'static str {
+    match relation {
+        RelationKind::Within => "within",
+        RelationKind::Has => "has",
+        RelationKind::Above => "above",
+        RelationKind::Below => "below",
+        RelationKind::Left => "left",
+        RelationKind::Right => "right",
+    }
+}
+
 fn select_index<T>(values: Vec<T>, index: Option<usize>) -> Vec<T> {
     match index {
         Some(index) => values.into_iter().nth(index).into_iter().collect(),
@@ -789,6 +927,7 @@ fn first_visible_or_hidden(observations: Vec<Observation>) -> Observation {
                     | Observation::Detached
                     | Observation::Hidden
                     | Observation::EmptyBox
+                    | Observation::InvalidPoint
             )
         })
         .unwrap_or(Observation::Hidden)

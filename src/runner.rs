@@ -31,7 +31,8 @@ use tokio::sync::{Notify, oneshot};
 use crate::browser::{BrowserHost, BrowserStatus, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, LocatorStrategy,
-    Modifier, NamedKey, Operation, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
+    Modifier, NamedKey, Operation, RelationKind, RelativePoint, TextMatch, UrlExpectation,
+    VideoMode, VisualExpectation,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -392,20 +393,23 @@ async fn execute_step(
         Operation::Open { url } => navigate(page, url.expose().as_str(), deadline)
             .await
             .map(|_| None),
-        Operation::Click { target } => {
-            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+        Operation::Click { target, position } => {
+            let element =
+                wait_actionable(page, target, Actionability::CLICK, *position, deadline).await?;
             dispatch_click(page, element.center.x, element.center.y, 1)
                 .await
                 .map(|_| None)
         }
-        Operation::DoubleClick { target } => {
-            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+        Operation::DoubleClick { target, position } => {
+            let element =
+                wait_actionable(page, target, Actionability::CLICK, *position, deadline).await?;
             dispatch_click(page, element.center.x, element.center.y, 2)
                 .await
                 .map(|_| None)
         }
         Operation::Fill { target, value } => {
-            let element = wait_actionable(page, target, Actionability::EDITABLE, deadline).await?;
+            let element =
+                wait_actionable(page, target, Actionability::EDITABLE, None, deadline).await?;
             prepare_fill(page, element.backend_node_id).await?;
             page.execute(InsertTextParams::new(value.expose()))
                 .await
@@ -413,11 +417,13 @@ async fn execute_step(
             Ok(None)
         }
         Operation::Erase { target } => {
-            let element = wait_actionable(page, target, Actionability::EDITABLE, deadline).await?;
+            let element =
+                wait_actionable(page, target, Actionability::EDITABLE, None, deadline).await?;
             erase(page, element.backend_node_id).await.map(|_| None)
         }
         Operation::Select { target, value } => {
-            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            let element =
+                wait_actionable(page, target, Actionability::CLICK, None, deadline).await?;
             select(page, element.backend_node_id, value.expose())
                 .await
                 .map(|_| None)
@@ -461,7 +467,8 @@ async fn execute_step(
             key,
             modifiers,
         } => {
-            let element = wait_actionable(page, target, Actionability::CLICK, deadline).await?;
+            let element =
+                wait_actionable(page, target, Actionability::CLICK, None, deadline).await?;
             focus(page, element.backend_node_id).await?;
             dispatch_key(page, key, modifiers).await.map(|_| None)
         }
@@ -606,10 +613,11 @@ async fn wait_actionable(
     page: &Page,
     locator: &Locator,
     requirements: Actionability,
+    action_point: Option<RelativePoint>,
     deadline: Instant,
 ) -> Result<ResolvedElement, StepError> {
     LocatorEngine::new(page)
-        .wait_unique(locator, requirements, deadline)
+        .wait_unique(locator, requirements, action_point, deadline)
         .await
         .map_err(locator_error)
 }
@@ -1012,7 +1020,7 @@ async fn dispatch_click(page: &Page, x: f64, y: f64, clicks: i64) -> Result<(), 
 async fn assert(page: &Page, assertion: &Assertion, deadline: Instant) -> Result<(), StepError> {
     match assertion {
         Assertion::Visible(locator) => LocatorEngine::new(page)
-            .wait_unique(locator, Actionability::VISIBLE, deadline)
+            .wait_unique(locator, Actionability::VISIBLE, None, deadline)
             .await
             .map(|_| ())
             .map_err(assertion_locator_error),
@@ -1655,8 +1663,8 @@ fn operation_name(operation: &Operation) -> &'static str {
 
 fn operation_locator(operation: &Operation) -> Option<&Locator> {
     match operation {
-        Operation::Click { target }
-        | Operation::DoubleClick { target }
+        Operation::Click { target, .. }
+        | Operation::DoubleClick { target, .. }
         | Operation::Fill { target, .. }
         | Operation::Erase { target }
         | Operation::Select { target, .. }
@@ -1678,42 +1686,59 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
 }
 
 fn locator_text(locator: &Locator) -> SafeText {
-    let (mut text, secret) = match &locator.strategy {
-        LocatorStrategy::Css(value) => (format!("css={:?}", value.expose()), value.is_secret()),
-        LocatorStrategy::TestId(value) => {
-            (format!("test_id={:?}", value.expose()), value.is_secret())
+    locator_text_inner(locator).map_or_else(SafeText::secret, SafeText::public)
+}
+
+fn locator_text_inner(locator: &Locator) -> Option<String> {
+    let mut text = match &locator.strategy {
+        LocatorStrategy::Css(value) if !value.is_secret() => format!("css={:?}", value.expose()),
+        LocatorStrategy::TestId(value) if !value.is_secret() => {
+            format!("test_id={:?}", value.expose())
         }
-        LocatorStrategy::Text { value, .. } => {
-            (format!("text={:?}", value.expose()), value.is_secret())
+        LocatorStrategy::Text { value, .. } if !value.is_secret() => {
+            format!("text={:?}", value.expose())
         }
-        LocatorStrategy::Label(value) => (format!("label={:?}", value.expose()), value.is_secret()),
+        LocatorStrategy::Label(value) if !value.is_secret() => {
+            format!("label={:?}", value.expose())
+        }
         LocatorStrategy::Role { value, name } => {
             if value.is_secret() || name.as_ref().is_some_and(|name| name.is_secret()) {
-                return SafeText::secret();
+                return None;
             }
-            (
-                match name {
-                    Some(name) => format!("role={:?} name={:?}", value.expose(), name.expose()),
-                    None => format!("role={:?}", value.expose()),
-                },
-                false,
-            )
+            match name {
+                Some(name) => format!("role={:?} name={:?}", value.expose(), name.expose()),
+                None => format!("role={:?}", value.expose()),
+            }
         }
+        _ => return None,
     };
-    if secret {
-        return SafeText::secret();
-    }
     for (name, value) in [
         ("index", locator.index.map(|value| value.to_string())),
         ("checked", locator.checked.map(|value| value.to_string())),
         ("selected", locator.selected.map(|value| value.to_string())),
         ("focused", locator.focused.map(|value| value.to_string())),
+        ("enabled", locator.enabled.map(|value| value.to_string())),
     ] {
         if let Some(value) = value {
             text.push_str(&format!(" {name}={value}"));
         }
     }
-    SafeText::public(text)
+    for relation in &locator.relations {
+        let nested = locator_text_inner(&relation.locator)?;
+        text.push_str(&format!(" {}=({nested})", relation_name(relation.kind)));
+    }
+    Some(text)
+}
+
+fn relation_name(relation: RelationKind) -> &'static str {
+    match relation {
+        RelationKind::Within => "within",
+        RelationKind::Has => "has",
+        RelationKind::Above => "above",
+        RelationKind::Below => "below",
+        RelationKind::Left => "left",
+        RelationKind::Right => "right",
+    }
 }
 
 fn report(
@@ -1945,7 +1970,7 @@ mod tests {
     #[test]
     fn secret_locators_are_never_rendered_in_step_context() {
         let flow = compile_yaml_with_env(
-            "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ click: { target: { css: '${token}', index: 2, checked: true } } }]\n",
+            "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ click: { target: { css: button, has: { text: '${token}' } } } }]\n",
             "x.yaml",
             &BTreeMap::new(),
             &BTreeMap::from([("TOKEN".to_owned(), "canary-secret".to_owned())]),
@@ -1958,7 +1983,7 @@ mod tests {
     #[test]
     fn public_locator_diagnostics_include_modifiers() {
         let flow = compile_yaml_with_env(
-            "version: 1\nname: x\nsteps: [{ click: { target: { css: button, index: 1, checked: false, focused: true } } }]\n",
+            "version: 1\nname: x\nsteps: [{ click: { target: { css: button, index: 1, checked: false, focused: true, enabled: true, within: { test_id: panel } } } }]\n",
             "x.yaml",
             &BTreeMap::new(),
             &BTreeMap::new(),
@@ -1967,7 +1992,7 @@ mod tests {
         let context = step_context(&flow, &flow.steps[0]);
         assert_eq!(
             context.locator.unwrap().as_str(),
-            "css=\"button\" index=1 checked=false focused=true"
+            "css=\"button\" index=1 checked=false focused=true enabled=true within=(test_id=\"panel\")"
         );
     }
 
