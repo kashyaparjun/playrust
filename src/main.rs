@@ -369,12 +369,16 @@ async fn execute_runs(
     })
     .await;
 
-    let reports = reports
+    let reports = complete_run_reports(runs, reports);
+    (reports, interrupted)
+}
+
+fn complete_run_reports(runs: &[FlowRun], reports: Vec<Option<FlowReport>>) -> Vec<FlowReport> {
+    reports
         .into_iter()
         .enumerate()
         .map(|(index, report)| report.unwrap_or_else(|| interrupted_report(&runs[index])))
-        .collect();
-    (reports, interrupted)
+        .collect()
 }
 
 async fn execute_bounded<R, I, F, Fut>(
@@ -411,14 +415,12 @@ where
                 interrupted = signal.is_ok();
             }
             Some((index, report)) = pending.next() => {
-                if !interrupted {
-                    reports[index] = Some(report);
-                    if next < count {
-                        let index = next;
-                        let future = execute(index);
-                        pending.push(indexed(index, future));
-                        next += 1;
-                    }
+                reports[index] = Some(report);
+                if !interrupted && next < count {
+                    let index = next;
+                    let future = execute(index);
+                    pending.push(indexed(index, future));
+                    next += 1;
                 }
             }
         }
@@ -816,7 +818,11 @@ mod tests {
                     started.fetch_add(1, Ordering::SeqCst);
                     release.notified().await;
                     completed.fetch_add(1, Ordering::SeqCst);
-                    index
+                    ArtifactPaths {
+                        directory: format!("flow-{index}"),
+                        recording: Some(format!("flow-{index}/recording.webm")),
+                        ..ArtifactPaths::default()
+                    }
                 }
             },
         ));
@@ -832,6 +838,89 @@ mod tests {
         assert!(interrupted);
         assert_eq!(started.load(Ordering::SeqCst), 2);
         assert_eq!(completed.load(Ordering::SeqCst), 2);
-        assert_eq!(reports, vec![None, None, None, None]);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report
+                    .as_ref()
+                    .and_then(|report| report.recording.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some("flow-0/recording.webm"),
+                Some("flow-1/recording.webm"),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_run_reports_keep_started_artifacts_and_mark_only_unstarted_flows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("flow.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\nname: flow\nsteps: [{ open: https://example.test }]\n",
+        )
+        .unwrap();
+        let flow = compile_file(&path, &BTreeMap::new()).unwrap();
+        let runs = vec![
+            FlowRun {
+                flow: flow.clone(),
+                options: RunOptions::new(directory.path().join("started")),
+            },
+            FlowRun {
+                flow,
+                options: RunOptions::new(directory.path().join("unstarted")),
+            },
+        ];
+        let reports = complete_run_reports(
+            &runs,
+            vec![
+                Some(FlowReport {
+                    name: "flow".to_owned(),
+                    path: path.to_string_lossy().into_owned(),
+                    duration_ms: 42,
+                    status: FlowStatus::Passed,
+                    failures: Vec::new(),
+                    artifacts: ArtifactPaths {
+                        directory: directory
+                            .path()
+                            .join("started")
+                            .to_string_lossy()
+                            .into_owned(),
+                        recording: Some("started/recording.webm".to_owned()),
+                        ..ArtifactPaths::default()
+                    },
+                }),
+                None,
+            ],
+        );
+
+        assert_eq!(reports[0].status, FlowStatus::Passed);
+        assert_eq!(reports[0].duration_ms, 42);
+        assert_eq!(
+            reports[0].artifacts.recording.as_deref(),
+            Some("started/recording.webm")
+        );
+        assert_eq!(reports[1].status, FlowStatus::Interrupted);
+        assert_eq!(
+            reports[1].artifacts.directory,
+            directory.path().join("unstarted").to_string_lossy()
+        );
+        assert_eq!(
+            AggregateReport::new(
+                RunnerInfo {
+                    name: "playrust".to_owned(),
+                    version: "test".to_owned(),
+                },
+                SCHEMA_VERSION,
+                None,
+                42,
+                reports,
+            )
+            .exit_code(),
+            ExitCode::Interrupted
+        );
     }
 }
