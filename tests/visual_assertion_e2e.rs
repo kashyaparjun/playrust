@@ -36,7 +36,19 @@ impl Fixture {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                        let _ = stream.read(&mut [0; 4096])?;
+                        match stream.read(&mut [0; 4096]) {
+                            Ok(0) => continue,
+                            Ok(_) => {}
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
                         write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{HTML}",
@@ -68,11 +80,16 @@ impl Drop for Fixture {
     }
 }
 
-fn write_png(path: &std::path::Path, color: Rgba<u8>) {
-    let image = RgbaImage::from_pixel(40, 30, color);
+fn write_png(path: &std::path::Path, width: u32, height: u32, color: Rgba<u8>) {
+    let image = RgbaImage::from_pixel(width, height, color);
     let mut bytes = Vec::new();
     PngEncoder::new(&mut bytes)
-        .write_image(image.as_raw(), 40, 30, image::ExtendedColorType::Rgba8)
+        .write_image(
+            image.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
         .unwrap();
     std::fs::write(path, bytes).unwrap();
 }
@@ -85,11 +102,21 @@ async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
     let directory = tempfile::tempdir().unwrap();
     write_png(
         &directory.path().join("baseline.png"),
+        40,
+        30,
         Rgba([16, 32, 48, 255]),
     );
     write_png(
         &directory.path().join("mismatch.png"),
+        40,
+        30,
         Rgba([17, 32, 48, 255]),
+    );
+    write_png(
+        &directory.path().join("retry.png"),
+        800,
+        600,
+        Rgba([16, 32, 48, 255]),
     );
     let flow_source = |baseline: &str| {
         format!(
@@ -99,10 +126,20 @@ async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
     };
     let passing_path = directory.path().join("passing.yaml");
     let failing_path = directory.path().join("failing.yaml");
+    let retrying_path = directory.path().join("retrying.yaml");
     std::fs::write(&passing_path, flow_source("baseline")).unwrap();
     std::fs::write(&failing_path, flow_source("mismatch")).unwrap();
+    std::fs::write(
+        &retrying_path,
+        format!(
+            "version: 1\nname: visual-retry\nbase_url: http://{}\nsettings: {{ viewport: {{ width: 800, height: 600 }}, video: off }}\nsteps:\n  - open: /\n  - evaluate: {{ script: \"document.documentElement.style.background = '#112030'; setTimeout(() => document.documentElement.style.background = '#102030', 50)\" }}\n  - retry: 10\n    assert:\n      screenshot:\n        baseline: retry.png\n        crop: {{ x: 0, y: 0, width: 800, height: 600 }}\n",
+            fixture.address
+        ),
+    )
+    .unwrap();
     let passing = compile_file(&passing_path, &BTreeMap::new()).unwrap();
     let failing = compile_file(&failing_path, &BTreeMap::new()).unwrap();
+    let retrying = compile_file(&retrying_path, &BTreeMap::new()).unwrap();
     let host = BrowserHost::launch(chrome, false).await.unwrap();
 
     let passed = run_flow(
@@ -118,6 +155,8 @@ async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
         &RunOptions::new(directory.path().join("fail-artifacts")),
     )
     .await;
+    let retry_artifacts = directory.path().join("retry-artifacts");
+    let retried = run_flow(&host, &retrying, &RunOptions::new(&retry_artifacts)).await;
     host.shutdown().await.unwrap();
 
     assert_eq!(failed.status, FlowStatus::Failed);
@@ -130,4 +169,14 @@ async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
     assert!(std::path::Path::new(actual).is_file());
     let diff = image::open(diff).unwrap().to_rgba8();
     assert!(diff.pixels().all(|pixel| *pixel == Rgba([255, 0, 0, 255])));
+    assert_eq!(
+        retried.status,
+        FlowStatus::Passed,
+        "{:#?}",
+        retried.failures
+    );
+    assert_eq!(retried.artifacts.visual_actual, None);
+    assert_eq!(retried.artifacts.visual_diff, None);
+    assert!(!retry_artifacts.join("__visual-3-actual.png").exists());
+    assert!(!retry_artifacts.join("__visual-3-diff.png").exists());
 }

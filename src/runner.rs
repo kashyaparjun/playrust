@@ -480,10 +480,15 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             }
         }
         video_stop_at = Some(Instant::now());
-        let error = error.expect("failed attempt records an error");
-        if let Some((actual, diff)) = &error.visual_artifacts {
-            artifacts.visual_actual = Some(path_text(actual));
-            artifacts.visual_diff = Some(path_text(diff));
+        let mut error = error.expect("failed attempt records an error");
+        if let Some(visual) = &error.visual_artifacts {
+            match publish_visual_artifacts(&options.artifact_directory, visual).await {
+                Ok(()) => {
+                    artifacts.visual_actual = Some(path_text(&visual.actual_path));
+                    artifacts.visual_diff = Some(path_text(&visual.diff_path));
+                }
+                Err(publication_error) => error = publication_error,
+            }
         }
         artifacts.failure_screenshot =
             capture_failure_screenshot(&active, &options.artifact_directory)
@@ -1820,8 +1825,6 @@ async fn assert_screenshot(
     let diff_png = visual::encode_png(&comparison.diff).map_err(protocol)?;
     let actual_path = artifact_directory.join(format!("__visual-{step}-actual.png"));
     let diff_path = artifact_directory.join(format!("__visual-{step}-diff.png"));
-    publish_bytes(artifact_directory, &actual_path, &actual_png).await?;
-    publish_bytes(artifact_directory, &diff_path, &diff_png).await?;
     let observed = if comparison.dimensions_match {
         format!(
             "{} of {} pixels changed ({:.6}); maximum changed ratio is {:.6}",
@@ -1836,8 +1839,26 @@ async fn assert_screenshot(
     Err(
         StepError::assertion("visual screenshot assertion did not match")
             .observed(observed)
-            .visual_artifacts(actual_path, diff_path),
+            .visual_artifacts(actual_path, diff_path, actual_png, diff_png),
     )
+}
+
+async fn publish_visual_artifacts(
+    artifact_directory: &Path,
+    artifacts: &VisualArtifacts,
+) -> Result<(), StepError> {
+    publish_bytes(
+        artifact_directory,
+        &artifacts.actual_path,
+        &artifacts.actual_png,
+    )
+    .await?;
+    publish_bytes(
+        artifact_directory,
+        &artifacts.diff_path,
+        &artifacts.diff_png,
+    )
+    .await
 }
 
 async fn assert_hidden(
@@ -2734,7 +2755,14 @@ struct StepError {
     message: String,
     last_observed: Option<String>,
     deadline_based: bool,
-    visual_artifacts: Option<(PathBuf, PathBuf)>,
+    visual_artifacts: Option<Box<VisualArtifacts>>,
+}
+
+struct VisualArtifacts {
+    actual_path: PathBuf,
+    diff_path: PathBuf,
+    actual_png: Vec<u8>,
+    diff_png: Vec<u8>,
 }
 
 impl StepError {
@@ -2762,8 +2790,19 @@ impl StepError {
         self
     }
 
-    fn visual_artifacts(mut self, actual: PathBuf, diff: PathBuf) -> Self {
-        self.visual_artifacts = Some((actual, diff));
+    fn visual_artifacts(
+        mut self,
+        actual_path: PathBuf,
+        diff_path: PathBuf,
+        actual_png: Vec<u8>,
+        diff_png: Vec<u8>,
+    ) -> Self {
+        self.visual_artifacts = Some(Box::new(VisualArtifacts {
+            actual_path,
+            diff_path,
+            actual_png,
+            diff_png,
+        }));
         self
     }
 }

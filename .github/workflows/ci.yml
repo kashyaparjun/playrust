@@ -61,7 +61,16 @@ jobs:
           --test browser_smoke
           --test visual_assertion_e2e
           --test advanced_selectors_e2e
+          --test flow_control_e2e
           --test frames_e2e
+          --test http_e2e
+          --test long_press_e2e
           --test recording_controls_e2e
+          --test scripting_e2e
+          --test scroll_until_visible_e2e
           --test storage_clearing_e2e
+          --test swipe_e2e
+          --test tabs_e2e
+          --test wait_until_stable_e2e
+          --test wait_until_visible_e2e
           -- --ignored --test-threads=1
