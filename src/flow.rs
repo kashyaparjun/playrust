@@ -26,6 +26,12 @@ pub const MAX_SUBFLOW_DEPTH: usize = 32;
 pub const MAX_LOCATOR_DEPTH: usize = 8;
 /// Maximum compile-time repetitions of one step or subflow.
 pub const MAX_REPEAT: usize = 100;
+/// Maximum runtime iterations of one bounded while loop.
+pub const MAX_WHILE_ITERATIONS: usize = 100;
+/// Maximum nesting depth of a structured boolean expression.
+pub const MAX_EXPRESSION_DEPTH: usize = 8;
+/// Maximum nodes in one structured boolean expression.
+pub const MAX_EXPRESSION_NODES: usize = 64;
 /// Maximum additional attempts for an assertion.
 pub const MAX_RETRIES: usize = 10;
 /// Maximum size of a YAML scalar or interpolated value in bytes (64 KiB).
@@ -205,6 +211,7 @@ pub struct RawStep {
     pub timeout: Option<String>,
     pub run: Option<RawRun>,
     pub when: Option<RawWhen>,
+    pub r#while: Option<RawWhile>,
     pub repeat: Option<usize>,
     pub retry: Option<usize>,
     pub open: Option<String>,
@@ -253,6 +260,39 @@ pub struct RawWhen {
     pub visible: Option<RawLocator>,
     pub hidden: Option<RawLocator>,
     pub variable: Option<RawVariablePredicate>,
+    pub platform: Option<Platform>,
+    pub expression: Option<RawExpression>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    Web,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawWhile {
+    pub expression: RawExpression,
+    pub max_iterations: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawExpression {
+    pub all: Option<Vec<RawExpression>>,
+    pub any: Option<Vec<RawExpression>>,
+    pub not: Option<Box<RawExpression>>,
+    pub equals: Option<RawComparison>,
+    pub not_equals: Option<RawComparison>,
+    pub boolean: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawComparison {
+    pub left: String,
+    pub right: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -578,6 +618,7 @@ pub struct CompiledStep {
     pub id: Option<String>,
     pub timeout: Duration,
     pub when: Option<When>,
+    pub guards: Vec<Guard>,
     pub retries: usize,
     pub operation: Operation,
 }
@@ -586,6 +627,34 @@ pub struct CompiledStep {
 pub enum When {
     Visible(Locator),
     Hidden(Locator),
+    Expression(Expression),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guard {
+    pub id: usize,
+    pub first: bool,
+    pub kind: GuardKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardKind {
+    When(Expression),
+    While {
+        loop_id: usize,
+        new_loop: bool,
+        expression: Expression,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expression {
+    All(Vec<Expression>),
+    Any(Vec<Expression>),
+    Not(Box<Expression>),
+    Equals(RuntimeValue, RuntimeValue),
+    NotEquals(RuntimeValue, RuntimeValue),
+    Boolean(RuntimeValue),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1092,6 +1161,11 @@ fn compile_raw_inner(
     for (offset, step) in raw.steps.into_iter().enumerate() {
         let index = step.source_index.unwrap_or(offset + 1);
         let repeat = validate_count("repeat", index, step.repeat.unwrap_or(1), MAX_REPEAT)?;
+        let while_control = step
+            .r#while
+            .clone()
+            .map(|control| compile_while(control, index, &inputs))
+            .transpose()?;
         let retries = step
             .retry
             .map(|value| validate_count("retry", index, value, MAX_RETRIES))
@@ -1115,8 +1189,10 @@ fn compile_raw_inner(
             if !ids.insert(id.clone()) {
                 return invalid(format!("duplicate step id {id:?}"));
             }
-            if repeat > 1 {
-                return invalid(format!("step {index} cannot combine id and repeat"));
+            if repeat > 1 || while_control.is_some() {
+                return invalid(format!(
+                    "step {index} cannot combine id and repeat or while"
+                ));
             }
         }
         let step_timeout = step
@@ -1155,16 +1231,36 @@ fn compile_raw_inner(
             return invalid(format!("duplicate screenshot name {name:?}"));
         }
         for _ in 0..repeat {
-            steps.push(CompiledStep {
-                index,
-                source: source_path.clone(),
-                source_index: index,
-                id: id.clone(),
-                timeout: step_timeout,
-                when: when.clone(),
-                retries,
-                operation: operation.clone(),
-            });
+            let iterations = while_control
+                .as_ref()
+                .map_or(1, |(_, max_iterations)| *max_iterations);
+            for iteration in 0..iterations {
+                let guards = while_control
+                    .as_ref()
+                    .map(|(expression, _)| {
+                        vec![Guard {
+                            id: 0,
+                            first: true,
+                            kind: GuardKind::While {
+                                loop_id: 0,
+                                new_loop: iteration == 0,
+                                expression: expression.clone(),
+                            },
+                        }]
+                    })
+                    .unwrap_or_default();
+                steps.push(CompiledStep {
+                    index,
+                    source: source_path.clone(),
+                    source_index: index,
+                    id: id.clone(),
+                    timeout: step_timeout,
+                    when: when.clone(),
+                    guards,
+                    retries,
+                    operation: operation.clone(),
+                });
+            }
         }
         if steps.len() > MAX_FLOW_STEPS {
             return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
@@ -1250,7 +1346,7 @@ fn compile_raw_expanded(
             .count();
             if step.id.is_some() || step.timeout.is_some() || operation_count != 0 {
                 return invalid(format!(
-                    "{}: step {} run must be the only field except when.variable, repeat, and retry",
+                    "{}: step {} run must be the only field except when, while, repeat, and retry",
                     source_path.display(),
                     offset + 1
                 ));
@@ -1258,10 +1354,10 @@ fn compile_raw_expanded(
             if step
                 .when
                 .as_ref()
-                .is_some_and(|when| when.variable.is_none())
+                .is_some_and(|when| when.visible.is_some() || when.hidden.is_some())
             {
                 return invalid(format!(
-                    "{}: step {} run only supports when.variable",
+                    "{}: step {} run does not support DOM when predicates",
                     source_path.display(),
                     offset + 1
                 ));
@@ -1273,7 +1369,16 @@ fn compile_raw_expanded(
                 .map(|value| validate_count("retry", offset + 1, value, MAX_RETRIES))
                 .transpose()?
                 .unwrap_or(0);
-            includes.insert(offset, (run.clone(), step.when.clone(), repeat, retries));
+            includes.insert(
+                offset,
+                (
+                    run.clone(),
+                    step.when.clone(),
+                    step.r#while.clone(),
+                    repeat,
+                    retries,
+                ),
+            );
         }
     }
     raw.steps.retain(|step| step.run.is_none());
@@ -1297,11 +1402,17 @@ fn compile_raw_expanded(
     let mut steps = Vec::new();
     for offset in 0..original_len {
         let local_index = offset + 1;
-        if let Some((run, when, repeat, retries)) = includes.get(&offset) {
-            let skip = matches!(
-                compile_when(when.clone(), local_index, &flow.inputs)?,
-                CompiledWhen::Skip
-            );
+        if let Some((run, when, while_control, repeat, retries)) = includes.get(&offset) {
+            let compiled_when = compile_when(when.clone(), local_index, &flow.inputs)?;
+            let skip = matches!(compiled_when, CompiledWhen::Skip);
+            let when_expression = match compiled_when {
+                CompiledWhen::Runtime(When::Expression(expression)) => Some(expression),
+                _ => None,
+            };
+            let while_control = while_control
+                .clone()
+                .map(|control| compile_while(control, local_index, &flow.inputs))
+                .transpose()?;
             if depth == MAX_SUBFLOW_DEPTH {
                 return invalid(format!(
                     "{}: step {local_index} exceeds maximum subflow depth {MAX_SUBFLOW_DEPTH}",
@@ -1366,18 +1477,46 @@ fn compile_raw_expanded(
             if skip {
                 continue;
             }
+            let mut first_when_step = true;
             for _ in 0..*repeat {
-                for mut step in child.steps.iter().cloned() {
-                    step.retries = step.retries.checked_add(*retries).filter(|value| *value <= MAX_RETRIES).ok_or_else(|| {
-                        FlowError::Invalid(format!(
-                            "{}: step {local_index} combined retry must not exceed {MAX_RETRIES}",
-                            source_path.display()
-                        ))
-                    })?;
-                    steps.push(step);
-                }
-                if steps.len() > MAX_FLOW_STEPS {
-                    return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
+                let iterations = while_control
+                    .as_ref()
+                    .map_or(1, |(_, max_iterations)| *max_iterations);
+                for iteration in 0..iterations {
+                    for (child_offset, mut step) in child.steps.iter().cloned().enumerate() {
+                        step.retries = step.retries.checked_add(*retries).filter(|value| *value <= MAX_RETRIES).ok_or_else(|| {
+                            FlowError::Invalid(format!(
+                                "{}: step {local_index} combined retry must not exceed {MAX_RETRIES}",
+                                source_path.display()
+                            ))
+                        })?;
+                        let mut guards = Vec::new();
+                        if let Some(expression) = &when_expression {
+                            guards.push(Guard {
+                                id: 0,
+                                first: first_when_step,
+                                kind: GuardKind::When(expression.clone()),
+                            });
+                        }
+                        if let Some((expression, _)) = &while_control {
+                            guards.push(Guard {
+                                id: 0,
+                                first: child_offset == 0,
+                                kind: GuardKind::While {
+                                    loop_id: 0,
+                                    new_loop: iteration == 0 && child_offset == 0,
+                                    expression: expression.clone(),
+                                },
+                            });
+                        }
+                        guards.append(&mut step.guards);
+                        step.guards = guards;
+                        steps.push(step);
+                        first_when_step = false;
+                    }
+                    if steps.len() > MAX_FLOW_STEPS {
+                        return invalid(format!("expanded steps must not exceed {MAX_FLOW_STEPS}"));
+                    }
                 }
             }
         } else {
@@ -1419,8 +1558,41 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
     let mut ids = BTreeSet::new();
     let mut screenshots = BTreeSet::new();
     let mut outputs = BTreeMap::new();
+    let mut next_guard_id = 0;
+    let mut next_loop_id = 0;
+    let mut active_guards = Vec::<usize>::new();
+    let mut active_loops = Vec::<Option<usize>>::new();
     for (offset, step) in steps.iter_mut().enumerate() {
         step.index = offset + 1;
+        active_guards.truncate(step.guards.len());
+        active_loops.truncate(step.guards.len());
+        active_loops.resize(step.guards.len(), None);
+        for (depth, guard) in step.guards.iter_mut().enumerate() {
+            if guard.first {
+                next_guard_id += 1;
+                if active_guards.len() == depth {
+                    active_guards.push(next_guard_id);
+                } else {
+                    active_guards[depth] = next_guard_id;
+                }
+            }
+            guard.id = *active_guards.get(depth).ok_or_else(|| {
+                FlowError::Invalid("invalid compiled control-flow guard".to_owned())
+            })?;
+            if let GuardKind::While {
+                loop_id, new_loop, ..
+            } = &mut guard.kind
+            {
+                if *new_loop {
+                    next_loop_id += 1;
+                    active_loops[depth] = Some(next_loop_id);
+                }
+                *loop_id =
+                    active_loops.get(depth).copied().flatten().ok_or_else(|| {
+                        FlowError::Invalid("invalid compiled while loop".to_owned())
+                    })?;
+            }
+        }
         if let Some(id) = &step.id
             && !ids.insert(id.clone())
         {
@@ -1433,7 +1605,21 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
                 "duplicate screenshot name {name:?} in expanded flow"
             ));
         }
-        for name in operation_runtime_values(&step.operation).flat_map(RuntimeValue::output_names) {
+        let runtime_values = step
+            .guards
+            .iter()
+            .flat_map(|guard| expression_runtime_values(guard_expression(guard)))
+            .chain(
+                step.when
+                    .iter()
+                    .filter_map(|when| match when {
+                        When::Expression(expression) => Some(expression),
+                        _ => None,
+                    })
+                    .flat_map(expression_runtime_values),
+            )
+            .chain(operation_runtime_values(&step.operation));
+        for name in runtime_values.flat_map(RuntimeValue::output_names) {
             if !outputs.contains_key(name) {
                 return invalid(format!(
                     "step {} references unknown variable or runtime output {name:?} before it is saved",
@@ -1473,6 +1659,36 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
         _ => return invalid("a flow may contain only one recording start/stop pair"),
     }
     Ok(())
+}
+
+fn guard_expression(guard: &Guard) -> &Expression {
+    match &guard.kind {
+        GuardKind::When(expression) | GuardKind::While { expression, .. } => expression,
+    }
+}
+
+fn expression_runtime_values(expression: &Expression) -> Vec<&RuntimeValue> {
+    let mut values = Vec::new();
+    collect_expression_runtime_values(expression, &mut values);
+    values
+}
+
+fn collect_expression_runtime_values<'a>(
+    expression: &'a Expression,
+    values: &mut Vec<&'a RuntimeValue>,
+) {
+    match expression {
+        Expression::All(children) | Expression::Any(children) => {
+            for child in children {
+                collect_expression_runtime_values(child, values);
+            }
+        }
+        Expression::Not(child) => collect_expression_runtime_values(child, values),
+        Expression::Equals(left, right) | Expression::NotEquals(left, right) => {
+            values.extend([left, right]);
+        }
+        Expression::Boolean(value) => values.push(value),
+    }
 }
 
 fn validate_page_switching_video(flow: &CompiledFlow) -> Result<(), FlowError> {
@@ -1604,6 +1820,8 @@ fn compile_when(
         raw.visible.is_some(),
         raw.hidden.is_some(),
         raw.variable.is_some(),
+        raw.platform.is_some(),
+        raw.expression.is_some(),
     ]
     .into_iter()
     .filter(|present| *present)
@@ -1621,6 +1839,14 @@ fn compile_when(
     if let Some(locator) = raw.hidden {
         return Ok(CompiledWhen::Runtime(When::Hidden(compile_locator(
             locator, index, inputs,
+        )?)));
+    }
+    if raw.platform.is_some() {
+        return Ok(CompiledWhen::Always);
+    }
+    if let Some(expression) = raw.expression {
+        return Ok(CompiledWhen::Runtime(When::Expression(compile_expression(
+            expression, index, inputs,
         )?)));
     }
     let predicate = raw.variable.expect("predicate count checked");
@@ -1651,6 +1877,116 @@ fn compile_when(
     } else {
         CompiledWhen::Skip
     })
+}
+
+fn compile_while(
+    control: RawWhile,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<(Expression, usize), FlowError> {
+    let max_iterations = validate_count(
+        "while.max_iterations",
+        index,
+        control.max_iterations,
+        MAX_WHILE_ITERATIONS,
+    )?;
+    Ok((
+        compile_expression(control.expression, index, inputs)?,
+        max_iterations,
+    ))
+}
+
+fn compile_expression(
+    raw: RawExpression,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<Expression, FlowError> {
+    let mut nodes = 0;
+    compile_expression_inner(raw, index, inputs, 0, &mut nodes)
+}
+
+fn compile_expression_inner(
+    raw: RawExpression,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<Expression, FlowError> {
+    if depth > MAX_EXPRESSION_DEPTH {
+        return invalid(format!(
+            "step {index} expression exceeds maximum depth {MAX_EXPRESSION_DEPTH}"
+        ));
+    }
+    *nodes += 1;
+    if *nodes > MAX_EXPRESSION_NODES {
+        return invalid(format!(
+            "step {index} expression exceeds maximum size {MAX_EXPRESSION_NODES}"
+        ));
+    }
+    let count = [
+        raw.all.is_some(),
+        raw.any.is_some(),
+        raw.not.is_some(),
+        raw.equals.is_some(),
+        raw.not_equals.is_some(),
+        raw.boolean.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if count != 1 {
+        return invalid(format!(
+            "step {index} expression must contain exactly one operator"
+        ));
+    }
+    let is_all = raw.all.is_some();
+    if let Some(children) = raw.all.or(raw.any) {
+        if children.is_empty() {
+            return invalid(format!("step {index} expression list must not be empty"));
+        }
+        let children = children
+            .into_iter()
+            .map(|child| compile_expression_inner(child, index, inputs, depth + 1, nodes))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(if is_all {
+            Expression::All(children)
+        } else {
+            Expression::Any(children)
+        });
+    }
+    if let Some(child) = raw.not {
+        return Ok(Expression::Not(Box::new(compile_expression_inner(
+            *child,
+            index,
+            inputs,
+            depth + 1,
+            nodes,
+        )?)));
+    }
+    let is_equals = raw.equals.is_some();
+    let comparison = raw.equals.or(raw.not_equals);
+    if let Some(comparison) = comparison {
+        let left = compile_runtime_value(
+            &format!("step {index} expression.left"),
+            &comparison.left,
+            inputs,
+        )?;
+        let right = compile_runtime_value(
+            &format!("step {index} expression.right"),
+            &comparison.right,
+            inputs,
+        )?;
+        return Ok(if is_equals {
+            Expression::Equals(left, right)
+        } else {
+            Expression::NotEquals(left, right)
+        });
+    }
+    Ok(Expression::Boolean(compile_runtime_value(
+        &format!("step {index} expression.boolean"),
+        raw.boolean.as_deref().expect("operator count checked"),
+        inputs,
+    )?))
 }
 
 fn compile_run_vars(
@@ -3991,6 +4327,84 @@ steps:
         assert!(matches!(flow.steps[1].operation, Operation::Click { .. }));
         assert!(matches!(flow.steps[2].when, Some(When::Visible(_))));
         assert_eq!(flow.steps[3].retries, 3);
+    }
+
+    #[test]
+    fn compiles_web_expressions_and_bounded_while_guards() {
+        let flow = compile(
+            r#"version: 1
+name: control
+vars: { mode: enabled, flag: "true" }
+steps:
+  - when: { platform: web }
+    open: https://example.test
+  - when:
+      expression:
+        all:
+          - equals: { left: "${mode}", right: enabled }
+          - not: { not_equals: { left: same, right: same } }
+          - boolean: "${flag}"
+    click: { target: { css: button } }
+  - while:
+      expression: { any: [{ boolean: "false" }, { equals: { left: x, right: x } }] }
+      max_iterations: 3
+    click: { target: { css: .next } }
+"#,
+        )
+        .unwrap();
+
+        assert!(flow.steps[0].when.is_none());
+        assert!(matches!(flow.steps[1].when, Some(When::Expression(_))));
+        assert_eq!(flow.steps.len(), 5);
+        let guards = flow.steps[2..]
+            .iter()
+            .map(|step| &step.guards[0])
+            .collect::<Vec<_>>();
+        assert!(guards.iter().all(|guard| guard.first));
+        assert_eq!(
+            guards.iter().map(|guard| guard.id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(
+            guards
+                .iter()
+                .all(|guard| matches!(guard.kind, GuardKind::While { loop_id: 1, .. }))
+        );
+    }
+
+    #[test]
+    fn expressions_and_while_are_strictly_bounded() {
+        for (control, expected) in [
+            (
+                "while: { expression: { boolean: 'true' }, max_iterations: 0 }",
+                "while.max_iterations must be between 1 and 100",
+            ),
+            (
+                "while: { expression: { boolean: 'true' }, max_iterations: 101 }",
+                "while.max_iterations must be between 1 and 100",
+            ),
+            (
+                "when: { expression: { all: [] } }",
+                "expression list must not be empty",
+            ),
+            (
+                "when: { expression: { boolean: 'true', equals: { left: x, right: x } } }",
+                "expression must contain exactly one operator",
+            ),
+        ] {
+            let source =
+                format!("version: 1\nname: x\nsteps:\n  - {control}\n    open: https://x.test\n");
+            assert!(error(&source).contains(expected), "accepted {control}");
+        }
+
+        let mut expression = "{ boolean: 'true' }".to_owned();
+        for _ in 0..=MAX_EXPRESSION_DEPTH {
+            expression = format!("{{ not: {expression} }}");
+        }
+        let source = format!(
+            "version: 1\nname: x\nsteps:\n  - when: {{ expression: {expression} }}\n    open: https://x.test\n"
+        );
+        assert!(error(&source).contains("maximum depth 8"));
     }
 
     #[test]

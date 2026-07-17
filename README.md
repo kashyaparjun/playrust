@@ -79,7 +79,7 @@ steps:
 
 A subflow is a normal V1 document with `version`, `name`, and `steps`. `run` accepts either the original scalar path or `{ path, vars }`. Mapped values are interpolated in the caller and take precedence over CLI values and the called file's declared `vars`; unknown names and attempts to bind `secrets` are rejected. Secret-derived arguments remain secret-tainted in the child and are added to the entrypoint redactor.
 
-Includes are expanded in place, may be nested up to 32 levels, and the expanded flow may contain at most 10,000 steps. Include paths are literal, must end in `.subflow.yaml` or `.subflow.yml`, and resolve relative to the file containing the `run` step. A `run` step may additionally use `when.variable`, `repeat`, or `retry`; no action field, `id`, `timeout`, or DOM `when` predicate is allowed. Canonical active include paths are checked for cycles; the same subflow may be included more than once when it is not already active.
+Includes are expanded in place, may be nested up to 32 levels, and the expanded flow may contain at most 10,000 steps. Include paths are literal, must end in `.subflow.yaml` or `.subflow.yml`, and resolve relative to the file containing the `run` step. A `run` step may additionally use non-DOM `when`, `while`, `repeat`, or `retry`; no action field, `id`, `timeout`, or DOM `when` predicate is allowed. Canonical active include paths are checked for cycles; the same subflow may be included more than once when it is not already active.
 
 Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `secrets`; these values are not inherited across file boundaries. CLI variables apply to every file that declares the name and are rejected unless at least one file declares them. Child secrets remain redacted in root-flow diagnostics. Subflows cannot set `settings.viewport` or `settings.video`; those runtime-wide settings belong to the entrypoint. Child names and resolved inputs do not replace the entrypoint's report identity or inputs. Runtime failures from expanded steps report both the expanded step number and child source path/local step number.
 
@@ -94,11 +94,32 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
   click: { target: { css: .dismiss } }
 - when: { hidden: { css: .blocking-dialog } }
   open: /ready
+- when: { platform: web }
+  open: /web-only
+- when:
+    expression:
+      all:
+        - equals: { left: "${mode}", right: admin }
+        - boolean: "${setup_ready}"
+  open: /admin
 ```
 
-Variable equality is resolved at compile time against a declared, immutable, non-secret variable. Both operands must be non-secret. DOM predicates are evaluated once, immediately before the operation: `visible` is true when any matching element is visible, while `hidden` is true when there is no visible match. They are snapshots and do not wait for the condition to change; protocol errors fail the step. DOM predicates are not supported on `run` because applying one independently to expanded child steps could partially execute a subflow.
+`platform: web` matches this web-only runner and is resolved at compile time. Variable equality is resolved at compile time against a declared, immutable, non-secret variable. Both operands must be non-secret. DOM predicates are evaluated once, immediately before the operation: `visible` is true when any matching element is visible, while `hidden` is true when there is no visible match. They are snapshots and do not wait for the condition to change; protocol errors fail the step. DOM predicates are not supported on `run` because applying one independently to expanded child steps could partially execute a subflow.
+
+`expression` is a structured boolean tree, not executable code. Its one operator is `all`, `any`, `not`, `equals`, `not_equals`, or `boolean`. Comparison operands and `boolean` are strings that may interpolate immutable inputs or previously saved runtime outputs. `boolean` accepts only the resolved text `true` or `false`; equality is exact string equality. Trees are limited to 8 nested levels and 64 nodes, lists must be non-empty, missing runtime outputs fail the step, and resolved values are never included in expression diagnostics. Evaluation has no page, filesystem, environment, network, or host-language access. `all` and `any` short-circuit.
 
 `repeat: N` expands a step or subflow `N` times at compile time. `N` must be `1..=100`, the final flow remains limited to 10,000 steps, and a repeated leaf step cannot have an `id`. Normal expanded-flow uniqueness rules still reject repeated screenshot names.
+
+`while` repeats a step or complete subflow while its structured expression is true:
+
+```yaml
+- while:
+    expression: { boolean: "${has_more}" }
+    max_iterations: 20
+  run: ./fetch-page.subflow.yaml
+```
+
+`max_iterations` is mandatory and must be `1..=100`; its full expansion counts toward the 10,000-step flow ceiling. The condition is evaluated once at the start of each iteration. A false result ends that loop permanently, while reaching the maximum ends it successfully without another condition check. For a subflow, one condition snapshot gates the complete iteration, so outputs changed by an early child step do not partially skip later child steps. Cancellation and each child step's deadline still apply normally. A loop intentionally repeats its body; it does not retry a failed action, and failures stop the flow without replaying the failed step.
 
 `retry: N` gives an assertion up to `N` additional attempts, each with the step's full timeout and normal cancellation checks. `N` must be `1..=10`. Actions cannot be retried, so pointer, keyboard, wheel, navigation, form, clear, and screenshot operations are never replayed after dispatch. A `run` may use `retry` only when its fully expanded child is assertion-only; the retry count is added to each child assertion at compile time and the combined count cannot exceed 10. This is per-assertion retry, not rollback or whole-subflow transaction retry. `when` and `retry` cannot be combined on one leaf step.
 
@@ -261,6 +282,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports popup, opener, exact named/URL page selection, and same-origin frames as described above. Cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Swipe and long press retain mouse semantics because desktop Chrome touch emulation synthesizes an additional, timing-incompatible mouse sequence. Flows are sequential and do not provide sleeps, mutable variables, general expressions, unbounded loops, transactional subflow retries, dynamic paths, plugins, or a JavaScript sandbox.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports popup, opener, exact named/URL page selection, and same-origin frames as described above. Cross-origin frames, shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Swipe and long press retain mouse semantics because desktop Chrome touch emulation synthesizes an additional, timing-incompatible mouse sequence. Flows are sequential and do not provide sleeps, mutable variables, unbounded loops, transactional subflow retries, dynamic paths, plugins, arbitrary host expressions, or a JavaScript sandbox.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

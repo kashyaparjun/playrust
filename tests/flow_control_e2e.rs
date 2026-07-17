@@ -17,6 +17,8 @@ use playrust::runner::{RunOptions, run_flow};
 
 const HTML: &str = r#"<!doctype html><html><body>
 <button id="counter" onclick="this.textContent = String(Number(this.textContent) + 1); if (this.textContent === '3') setTimeout(() => document.querySelector('#status').textContent = 'ready', 500)">0</button>
+<button id="platform" onclick="this.textContent = String(Number(this.textContent) + 1)">0</button>
+<button id="loop" onclick="this.textContent = String(Number(this.textContent) + 1)">0</button>
 <p id="status">waiting</p>
 </body></html>"#;
 
@@ -54,6 +56,7 @@ async fn predicates_repeats_retries_and_mapped_subflows_run_in_chrome() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("control.yaml");
     let child = directory.path().join("verify.subflow.yaml");
+    let worker = directory.path().join("worker.subflow.yaml");
     std::fs::write(
         &root,
         format!(
@@ -71,10 +74,29 @@ steps:
     click: {{ target: {{ css: '#counter' }} }}
   - when: {{ variable: {{ name: mode, equals: disabled }} }}
     click: {{ target: {{ css: '#counter' }} }}
+  - when: {{ platform: web }}
+    click: {{ target: {{ css: '#platform' }} }}
+  - run: ./worker.subflow.yaml
+  - when:
+      expression:
+        all:
+          - boolean: '${{keep_going}}'
+          - equals: {{ left: '${{mode}}', right: enabled }}
+    assert: {{ text: {{ target: {{ css: '#platform' }}, equals: '1' }} }}
+  - while:
+      expression: {{ boolean: '${{keep_going}}' }}
+      max_iterations: 3
+    run: ./worker.subflow.yaml
+  - assert: {{ text: {{ target: {{ css: '#loop' }}, equals: '2' }} }}
   - retry: 1
     run: {{ path: ./verify.subflow.yaml, vars: {{ expected: '${{expected}}' }} }}
 "#
         ),
+    )
+    .unwrap();
+    std::fs::write(
+        &worker,
+        "version: 1\nname: worker\nsteps:\n  - evaluate: { script: \"return Number(document.querySelector('#loop').textContent) < 1\", save_as: keep_going }\n  - click: { target: { css: '#loop' } }\n",
     )
     .unwrap();
     std::fs::write(

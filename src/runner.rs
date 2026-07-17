@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -38,10 +38,10 @@ use tokio::sync::{Notify, oneshot};
 
 use crate::browser::{BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
-    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, FrameSwitch, Key, Locator,
-    LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey, Operation, PageSwitch,
-    RecordingControl, Redactor, RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation,
-    VideoMode, VisualExpectation, When,
+    Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
+    Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey, Operation,
+    PageSwitch, RecordingControl, Redactor, RelationKind, RelativePoint, Resolved, TextMatch,
+    UrlExpectation, VideoMode, VisualExpectation, When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -297,6 +297,8 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         outputs: BTreeMap::new(),
         redactor: flow.redactor.clone(),
         page_settings,
+        guard_results: BTreeMap::new(),
+        stopped_loops: BTreeSet::new(),
     };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut recording_error = None;
@@ -354,7 +356,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
                 }
                 result = tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
-                    step_matches(&active, step),
+                    step_matches(&active, step, &mut runtime),
                 ) => result,
             };
             match matches {
@@ -588,6 +590,8 @@ struct RuntimeState {
     outputs: BTreeMap<String, Resolved<Value>>,
     redactor: Redactor,
     page_settings: PageSettings,
+    guard_results: BTreeMap<usize, bool>,
+    stopped_loops: BTreeSet<usize>,
 }
 
 async fn execute_step(
@@ -599,7 +603,7 @@ async fn execute_step(
     artifact_directory: &Path,
     runtime: &mut RuntimeState,
 ) -> Result<Option<PathBuf>, StepError> {
-    if !step_matches(active, step).await? {
+    if !step_matches(active, step, runtime).await? {
         return Ok(None);
     }
     match &step.operation {
@@ -827,7 +831,11 @@ async fn execute_step(
     }
 }
 
-async fn step_matches(active: &ActiveContext, step: &CompiledStep) -> Result<bool, StepError> {
+async fn step_matches(
+    active: &ActiveContext,
+    step: &CompiledStep,
+    runtime: &mut RuntimeState,
+) -> Result<bool, StepError> {
     if active.frame().is_some()
         && !matches!(
             step.operation,
@@ -836,25 +844,121 @@ async fn step_matches(active: &ActiveContext, step: &CompiledStep) -> Result<boo
     {
         verify_frame_origin(active).await?;
     }
+    if !guards_match(
+        &step.guards,
+        &runtime.outputs,
+        &mut runtime.guard_results,
+        &mut runtime.stopped_loops,
+    )? {
+        return Ok(false);
+    }
     match &step.when {
-        Some(predicate) => when_matches(active, predicate).await,
+        Some(predicate) => when_matches(active, predicate, &runtime.outputs).await,
         None => Ok(true),
     }
 }
 
-async fn when_matches(active: &ActiveContext, predicate: &When) -> Result<bool, StepError> {
+fn guards_match(
+    guards: &[crate::flow::Guard],
+    outputs: &BTreeMap<String, Resolved<Value>>,
+    results: &mut BTreeMap<usize, bool>,
+    stopped_loops: &mut BTreeSet<usize>,
+) -> Result<bool, StepError> {
+    for guard in guards {
+        let loop_id = match guard.kind {
+            GuardKind::While { loop_id, .. } => Some(loop_id),
+            GuardKind::When(_) => None,
+        };
+        if loop_id.is_some_and(|id| stopped_loops.contains(&id)) {
+            return Ok(false);
+        }
+        let matches = if let Some(matches) = results.get(&guard.id) {
+            *matches
+        } else {
+            let matches = evaluate_expression(guard_expression(&guard.kind), outputs)?;
+            results.insert(guard.id, matches);
+            matches
+        };
+        if !matches {
+            if let Some(loop_id) = loop_id {
+                stopped_loops.insert(loop_id);
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn guard_expression(guard: &GuardKind) -> &Expression {
+    match guard {
+        GuardKind::When(expression) | GuardKind::While { expression, .. } => expression,
+    }
+}
+
+async fn when_matches(
+    active: &ActiveContext,
+    predicate: &When,
+    outputs: &BTreeMap<String, Resolved<Value>>,
+) -> Result<bool, StepError> {
+    if let When::Expression(expression) = predicate {
+        return evaluate_expression(expression, outputs);
+    }
     let observation = match predicate {
         When::Visible(locator) | When::Hidden(locator) => active
             .locator()
             .observe_any_visible(locator)
             .await
             .map_err(locator_error)?,
+        When::Expression(_) => unreachable!("handled above"),
     };
     let visible = matches!(observation, Observation::Ready(_));
     Ok(match predicate {
         When::Visible(_) => visible,
         When::Hidden(_) => !visible,
+        When::Expression(_) => unreachable!("handled above"),
     })
+}
+
+fn evaluate_expression(
+    expression: &Expression,
+    outputs: &BTreeMap<String, Resolved<Value>>,
+) -> Result<bool, StepError> {
+    match expression {
+        Expression::All(children) => {
+            for child in children {
+                if !evaluate_expression(child, outputs)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expression::Any(children) => {
+            for child in children {
+                if evaluate_expression(child, outputs)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Expression::Not(child) => Ok(!evaluate_expression(child, outputs)?),
+        Expression::Equals(left, right) | Expression::NotEquals(left, right) => {
+            let equals = resolve_runtime(left, outputs)?.expose()
+                == resolve_runtime(right, outputs)?.expose();
+            Ok(if matches!(expression, Expression::Equals(_, _)) {
+                equals
+            } else {
+                !equals
+            })
+        }
+        Expression::Boolean(value) => match resolve_runtime(value, outputs)?.expose().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(StepError::new(
+                FailureCategory::Protocol,
+                "expression.boolean must resolve to true or false",
+            )),
+        },
+    }
 }
 
 fn resolve_runtime(
@@ -2926,7 +3030,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::flow::compile_yaml_with_env;
+    use crate::flow::{compile_file, compile_yaml_with_env};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -2983,6 +3087,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn structured_expressions_resolve_runtime_json_without_exposing_values() {
+        let flow = compile_yaml_with_env(
+            "version: 1\nname: x\nsteps:\n  - evaluate: { script: 'return true', save_as: saved }\n  - when: { expression: { all: [{ boolean: '${saved}' }, { not_equals: { left: x, right: y } }] } }\n    open: https://x.test\n",
+            "x.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let Some(When::Expression(expression)) = &flow.steps[1].when else {
+            panic!("expected expression");
+        };
+        let outputs =
+            BTreeMap::from([("saved".to_owned(), Resolved::new(Value::Bool(true), true))]);
+        assert!(matches!(
+            evaluate_expression(expression, &outputs),
+            Ok(true)
+        ));
+
+        let outputs = BTreeMap::from([(
+            "saved".to_owned(),
+            Resolved::new(Value::String("canary-secret".to_owned()), true),
+        )]);
+        let message = evaluate_expression(expression, &outputs)
+            .unwrap_err()
+            .message;
+        assert!(!message.contains("canary-secret"));
+    }
+
+    #[test]
+    fn while_guards_snapshot_subflow_iterations_and_stop_permanently() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root.yaml");
+        let child = directory.path().join("child.subflow.yaml");
+        std::fs::write(
+            &root,
+            "version: 1\nname: root\nsteps:\n  - evaluate: { script: 'return true', save_as: state }\n  - while: { expression: { boolean: '${state}' }, max_iterations: 3 }\n    run: ./child.subflow.yaml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            "version: 1\nname: child\nsteps:\n  - open: https://one.test\n  - open: https://two.test\n",
+        )
+        .unwrap();
+        let flow = compile_file(&root, &BTreeMap::new()).unwrap();
+        assert_eq!(flow.steps.len(), 7);
+        assert_eq!(flow.steps[1].source, child);
+
+        let mut outputs =
+            BTreeMap::from([("state".to_owned(), Resolved::new(Value::Bool(true), true))]);
+        let mut results = BTreeMap::new();
+        let mut stopped = BTreeSet::new();
+        assert!(matches!(
+            guards_match(&flow.steps[1].guards, &outputs, &mut results, &mut stopped),
+            Ok(true)
+        ));
+        outputs.insert("state".to_owned(), Resolved::new(Value::Bool(false), true));
+        assert!(matches!(
+            guards_match(&flow.steps[2].guards, &outputs, &mut results, &mut stopped),
+            Ok(true)
+        ));
+        assert!(matches!(
+            guards_match(&flow.steps[3].guards, &outputs, &mut results, &mut stopped),
+            Ok(false)
+        ));
+        outputs.insert("state".to_owned(), Resolved::new(Value::Bool(true), true));
+        assert!(matches!(
+            guards_match(&flow.steps[5].guards, &outputs, &mut results, &mut stopped),
+            Ok(false)
+        ));
     }
 
     #[test]
@@ -3411,6 +3587,8 @@ steps:
                 viewport: Viewport::new(800, 600).unwrap(),
                 geolocation: None,
             },
+            guard_results: BTreeMap::new(),
+            stopped_loops: BTreeSet::new(),
         };
         for step in &flow.steps {
             execute_step(
