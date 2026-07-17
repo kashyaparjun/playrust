@@ -149,6 +149,73 @@ pub fn ffmpeg_path() -> String {
         .into_owned()
 }
 
+pub struct FixtureServer {
+    pub url: String,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl FixtureServer {
+    pub fn start(routes: &'static [(&'static str, &'static str, &'static str)]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+        let address = listener.local_addr().expect("read fixture address");
+        listener
+            .set_nonblocking(true)
+            .expect("make server stoppable");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || -> io::Result<()> {
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false)?;
+                        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                        let mut request = [0; 4096];
+                        let length = stream.read(&mut request)?;
+                        let path = std::str::from_utf8(&request[..length])
+                            .ok()
+                            .and_then(|request| request.lines().next())
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let (status, content_type, body) = routes
+                            .iter()
+                            .find(|(route, _, _)| *route == path)
+                            .map(|(_, content_type, body)| ("200 OK", *content_type, *body))
+                            .unwrap_or(("404 Not Found", "text/plain", "not found"));
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        });
+        Self {
+            url: format!("http://{address}"),
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for FixtureServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("fixture server thread panicked")
+                .expect("serve fixture");
+        }
+    }
+}
+
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
     let mut child = command.spawn().expect("run playrust");
     let deadline = Instant::now() + timeout;

@@ -97,8 +97,13 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 | Navigate back | `back: {}` |
 | Press | `press: { target: { label: Search }, key: Enter, modifiers: [Control] }` |
 | Screenshot | `screenshot: { name: dashboard }` |
+| Start recording | `recording: start` |
+| Stop recording | `recording: stop` |
 | Clear cookies | `clear: cookies` |
-| Clear storage | `clear: storage` |
+| Clear local and session storage | `clear: storage` |
+| Clear IndexedDB | `clear: indexeddb` |
+| Clear Cache Storage | `clear: cache-storage` |
+| Unregister service workers | `clear: service-workers` |
 
 Click, double click, fill, erase, select, swipe, long press, and press wait for one unique, visible, stable, enabled, uncovered target; fill and erase also require an editable target. Click and double-click optionally accept `position`, an unsigned CSS-pixel offset from the target's top-left border box. The point must be inside the target, inside the viewport, and hit the target or one of its descendants; hit testing is performed at that exact point. Without `position`, the target center is used. Erase supports the same text inputs, textareas, and content-editable elements as fill. Select accepts an option value (including an empty value) on a native, non-`multiple` `<select>` and dispatches one bubbling `input` event followed by one `change` event. Swipe and long press dispatch one mouse gesture after actionability succeeds. Input actions are not retried after pointer, keyboard, wheel, or form event dispatch begins.
 
@@ -114,7 +119,7 @@ Screenshots are PNG files written atomically to the flow artifact directory as `
     crop: { x: 40, y: 80, width: 640, height: 360 }
 ```
 
-`clear: cookies` clears every cookie in the active flow's isolated browser context only. `clear: storage` clears `localStorage` and `sessionStorage` for the active page origin only; it does not clear storage for other origins or other browser storage types. Both commands use the step timeout and produce the same cancellation and failure diagnostics as other actions.
+`clear: cookies` clears every cookie in the active flow's isolated browser context only. `clear: storage` clears only `localStorage` and `sessionStorage` for the active page origin. `clear: indexeddb` deletes the active origin's named IndexedDB databases, `clear: cache-storage` deletes its Cache Storage entries, and `clear: service-workers` unregisters its service workers. These targets are deliberately separate: none of the three broader browser-storage commands clears cookies, local storage, or session storage. All clear commands remain inside the active flow's isolated browser context, use the step timeout, and produce normal cancellation and failure diagnostics. IndexedDB deletion fails if an open connection blocks it.
 
 ### Selectors
 
@@ -181,6 +186,8 @@ Treat flow files as executable test configuration. They can navigate to private 
 ## Video and artifacts
 
 Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`, which keeps every recording and prints its path after the flow finishes. `retain-on-failure` removes recordings for passing flows. Set a mode in YAML or override all flows with `--video MODE`.
+
+With no recording steps, video still covers the whole flow. To record one deliberate segment, add exactly one ordered `recording: start` / `recording: stop` pair; `check` rejects unmatched, reversed, or repeated controls after subflows are expanded. `--video off` makes a valid pair a no-op. A failure or interruption before `stop` still finalizes and reports the active recording. A completed manual recording remains reportable if a later step fails, and `retain-on-failure` removes it only after the entire flow passes.
 
 Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libvpx-vp9` encoder. Playrust records the fixed page viewport as silent 15 FPS WebM/VP9; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 

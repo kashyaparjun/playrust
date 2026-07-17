@@ -61,4 +61,6 @@ jobs:
           --test browser_smoke
           --test visual_assertion_e2e
           --test advanced_selectors_e2e
-          -- --ignored
+          --test recording_controls_e2e
+          --test storage_clearing_e2e
+          -- --ignored --test-threads=1

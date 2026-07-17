@@ -19,7 +19,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     NavigateToHistoryEntryParams, ScreencastFrameAckParams, StartScreencastFormat,
     StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
 };
-use chromiumoxide::cdp::browser_protocol::storage::ClearCookiesParams;
+use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
 use chromiumoxide::cdp::js_protocol::runtime::{CallFunctionOnParams, ReleaseObjectParams};
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
@@ -32,7 +32,7 @@ use crate::browser::{BrowserHost, BrowserStatus, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Key, Locator, LocatorStrategy,
     Modifier, NamedKey, Operation, RelationKind, RelativePoint, TextMatch, UrlExpectation,
-    VideoMode, VisualExpectation,
+    RecordingControl, VideoMode, VisualExpectation,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -109,6 +109,16 @@ const SELECT_FUNCTION: &str = r#"function(value) {
 
 const INNER_TEXT_FUNCTION: &str = r#"function() { return this.innerText; }"#;
 const CLEAR_STORAGE_EXPRESSION: &str = "localStorage.clear(); sessionStorage.clear()";
+const CLEAR_INDEXEDDB_EXPRESSION: &str = r#"indexedDB.databases().then(databases => Promise.all(
+    databases.filter(database => database.name).map(database => new Promise((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(database.name);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+        request.onblocked = () => reject(new Error(`IndexedDB database ${database.name} is blocked`));
+    }))
+))"#;
+const CLEAR_CACHE_STORAGE_EXPRESSION: &str =
+    "caches.keys().then(names => Promise.all(names.map(name => caches.delete(name))))";
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
@@ -232,7 +242,11 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut recording_error = None;
     let mut video = None;
-    if !interrupted {
+    let manual_recording = flow
+        .steps
+        .iter()
+        .any(|step| matches!(step.operation, Operation::Recording(_)));
+    if !interrupted && !manual_recording {
         match start_video(&page, flow, options, flow.settings.timeout).await {
             Ok(VideoStartup::Ready(session)) => {
                 video = session;
@@ -252,7 +266,10 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     }
 
     let mut video_stop_at = None;
-    for step in flow.steps.iter().filter(|_| !interrupted) {
+    for step in &flow.steps {
+        if interrupted {
+            break;
+        }
         let Some(deadline) = Instant::now().checked_add(step.timeout) else {
             video_stop_at = Some(Instant::now());
             artifacts.failure_screenshot =
@@ -271,6 +288,53 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
             );
             break;
         };
+        if let Operation::Recording(control) = step.operation {
+            match control {
+                RecordingControl::Start => {
+                    match start_video(&page, flow, options, step.timeout).await {
+                        Ok(VideoStartup::Ready(session)) => video = session,
+                        Ok(VideoStartup::Cancelled(finish)) => {
+                            interrupted = true;
+                            if let Some(finish) = finish {
+                                apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                            }
+                        }
+                        Err(error) => {
+                            primary = Some(failure(
+                                flow,
+                                FailureCategory::Recording,
+                                error,
+                                Some(step_context(flow, step)),
+                            ));
+                        }
+                    }
+                }
+                RecordingControl::Stop => {
+                    settle_video(&page).await;
+                    video_stop_at = Some(Instant::now());
+                    if let Some(session) = video.take() {
+                        let finish = session
+                            .finish(&page, true, video_stop_at.expect("recording stop set"))
+                            .await;
+                        apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                    }
+                }
+            }
+            interrupted |= is_cancelled(options.cancellation.as_ref());
+            if primary.is_some() || interrupted {
+                break;
+            }
+            if let Some(error) = recording_error.take() {
+                primary = Some(failure(
+                    flow,
+                    FailureCategory::Recording,
+                    error,
+                    Some(step_context(flow, step)),
+                ));
+                break;
+            }
+            continue;
+        }
         let result = tokio::select! {
             biased;
             _ = wait_for_cancellation(options.cancellation.as_ref()) => {
@@ -317,14 +381,7 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
     }
 
     if primary.is_none() && !interrupted && video.is_some() {
-        let _ = tokio::time::timeout(
-            SECONDARY_TIMEOUT,
-            page.evaluate(
-                "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
-            ),
-        )
-        .await;
-        tokio::time::sleep(FINAL_FRAME_DELAY).await;
+        settle_video(&page).await;
         video_stop_at = Some(Instant::now());
     }
 
@@ -367,7 +424,34 @@ pub async fn run_flow(host: &BrowserHost, flow: &CompiledFlow, options: &RunOpti
         )),
     }
 
+    if manual_recording
+        && flow.settings.video == VideoMode::RetainOnFailure
+        && failures.is_empty()
+        && !interrupted
+        && let Some(path) = artifacts.recording.take()
+        && let Err(error) = tokio::fs::remove_file(&path).await
+    {
+        artifacts.recording = Some(path.clone());
+        failures.push(failure(
+            flow,
+            FailureCategory::Recording,
+            format!("remove passing recording {path}: {error}"),
+            None,
+        ));
+    }
+
     report(flow, started, artifacts, failures, interrupted)
+}
+
+async fn settle_video(page: &Page) {
+    let _ = tokio::time::timeout(
+        SECONDARY_TIMEOUT,
+        page.evaluate(
+            "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+        ),
+    )
+    .await;
+    tokio::time::sleep(FINAL_FRAME_DELAY).await;
 }
 
 async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
@@ -477,6 +561,10 @@ async fn execute_step(
                 .await
                 .map(Some)
         }
+        Operation::Recording(_) => Err(StepError::new(
+            FailureCategory::Protocol,
+            "recording controls must be handled by the flow runner",
+        )),
         Operation::Clear(ClearTarget::Cookies) => {
             host.browser()
                 .execute(
@@ -498,6 +586,33 @@ async fn execute_step(
             assert_screenshot(page, expectation, step.index, artifact_directory)
                 .await
                 .map(|_| None)
+        }
+        Operation::Clear(ClearTarget::Indexeddb) => {
+            page.evaluate(CLEAR_INDEXEDDB_EXPRESSION)
+                .await
+                .map_err(protocol)?;
+            Ok(None)
+        }
+        Operation::Clear(ClearTarget::CacheStorage) => {
+            page.evaluate(CLEAR_CACHE_STORAGE_EXPRESSION)
+                .await
+                .map_err(protocol)?;
+            Ok(None)
+        }
+        Operation::Clear(ClearTarget::ServiceWorkers) => {
+            let url = page
+                .url()
+                .await
+                .map_err(protocol)?
+                .ok_or_else(|| protocol("active page has no URL"))?;
+            let origin = url::Url::parse(&url)
+                .map_err(protocol)?
+                .origin()
+                .ascii_serialization();
+            page.execute(ClearDataForOriginParams::new(origin, "service_workers"))
+                .await
+                .map_err(protocol)?;
+            Ok(None)
         }
         Operation::Assert(assertion) => assert(page, assertion, deadline).await.map(|_| None),
     }
@@ -1651,8 +1766,13 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Back => "back",
         Operation::Press { .. } => "press",
         Operation::Screenshot { .. } => "screenshot",
+        Operation::Recording(RecordingControl::Start) => "recording.start",
+        Operation::Recording(RecordingControl::Stop) => "recording.stop",
         Operation::Clear(ClearTarget::Cookies) => "clear.cookies",
         Operation::Clear(ClearTarget::Storage) => "clear.storage",
+        Operation::Clear(ClearTarget::Indexeddb) => "clear.indexeddb",
+        Operation::Clear(ClearTarget::CacheStorage) => "clear.cache-storage",
+        Operation::Clear(ClearTarget::ServiceWorkers) => "clear.service-workers",
         Operation::Assert(Assertion::Visible(_)) => "assert.visible",
         Operation::Assert(Assertion::Hidden(_)) => "assert.hidden",
         Operation::Assert(Assertion::Text { .. }) => "assert.text",
@@ -1680,6 +1800,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::Scroll { .. }
         | Operation::Back
         | Operation::Screenshot { .. }
+        | Operation::Recording(_)
         | Operation::Clear(_)
         | Operation::Assert(Assertion::Url(_) | Assertion::Screenshot(_)) => None,
     }

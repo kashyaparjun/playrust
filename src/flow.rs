@@ -201,6 +201,7 @@ pub struct RawStep {
     pub back: Option<RawEmpty>,
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
+    pub recording: Option<RecordingControl>,
     pub clear: Option<ClearTarget>,
     #[serde(rename = "assert")]
     pub assertion: Option<RawAssertion>,
@@ -399,10 +400,20 @@ pub struct RelativePoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum ClearTarget {
     Cookies,
     Storage,
+    Indexeddb,
+    CacheStorage,
+    ServiceWorkers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingControl {
+    Start,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -499,6 +510,7 @@ pub enum Operation {
         name: String,
         crop: Option<Crop>,
     },
+    Recording(RecordingControl),
     Clear(ClearTarget),
     Assert(Assertion),
 }
@@ -736,7 +748,9 @@ pub fn compile_raw(
     cli_vars: &BTreeMap<String, String>,
     environment: &BTreeMap<String, String>,
 ) -> Result<CompiledFlow, FlowError> {
-    compile_raw_inner(raw, source_path.into(), cli_vars, environment, true, false)
+    let mut flow = compile_raw_inner(raw, source_path.into(), cli_vars, environment, true, false)?;
+    validate_expanded_steps(&mut flow.steps)?;
+    Ok(flow)
 }
 
 fn compile_raw_inner(
@@ -939,6 +953,7 @@ fn compile_raw_expanded(
                 step.back.is_some(),
                 step.press.is_some(),
                 step.screenshot.is_some(),
+                step.recording.is_some(),
                 step.clear.is_some(),
                 step.assertion.is_some(),
             ]
@@ -1069,6 +1084,25 @@ fn validate_expanded_steps(steps: &mut [CompiledStep]) -> Result<(), FlowError> 
     }
     if steps.is_empty() {
         return invalid("expanded steps must not be empty");
+    }
+    let controls = steps
+        .iter()
+        .filter_map(|step| match step.operation {
+            Operation::Recording(control) => Some((step.index, control)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    match controls.as_slice() {
+        [] | [(_, RecordingControl::Start), (_, RecordingControl::Stop)] => {}
+        [(step, RecordingControl::Stop), ..] => {
+            return invalid(format!(
+                "step {step} recording stop must follow recording start"
+            ));
+        }
+        [(_, RecordingControl::Start)] => {
+            return invalid("recording start requires one later recording stop");
+        }
+        _ => return invalid("a flow may contain only one recording start/stop pair"),
     }
     Ok(())
 }
@@ -1239,6 +1273,7 @@ fn compile_operation(
         step.back.is_some(),
         step.press.is_some(),
         step.screenshot.is_some(),
+        step.recording.is_some(),
         step.clear.is_some(),
         step.assertion.is_some(),
     ]
@@ -1396,6 +1431,9 @@ fn compile_operation(
             .map(|crop| validate_crop(index, crop, viewport))
             .transpose()?;
         return Ok(Operation::Screenshot { name, crop });
+    }
+    if let Some(control) = step.recording {
+        return Ok(Operation::Recording(control));
     }
     if let Some(target) = step.clear {
         return Ok(Operation::Clear(target));
@@ -2354,10 +2392,11 @@ steps:
     }
 
     #[test]
-    fn clear_accepts_only_cookies_or_storage_as_a_scalar() {
-        let flow =
-            compile("version: 1\nname: clear\nsteps:\n  - clear: cookies\n  - clear: storage\n")
-                .unwrap();
+    fn clear_accepts_each_explicit_state_target_as_a_scalar() {
+        let flow = compile(
+            "version: 1\nname: clear\nsteps:\n  - clear: cookies\n  - clear: storage\n  - clear: indexeddb\n  - clear: cache-storage\n  - clear: service-workers\n",
+        )
+        .unwrap();
         assert!(matches!(
             flow.steps[0].operation,
             Operation::Clear(ClearTarget::Cookies)
@@ -2366,8 +2405,20 @@ steps:
             flow.steps[1].operation,
             Operation::Clear(ClearTarget::Storage)
         ));
+        assert!(matches!(
+            flow.steps[2].operation,
+            Operation::Clear(ClearTarget::Indexeddb)
+        ));
+        assert!(matches!(
+            flow.steps[3].operation,
+            Operation::Clear(ClearTarget::CacheStorage)
+        ));
+        assert!(matches!(
+            flow.steps[4].operation,
+            Operation::Clear(ClearTarget::ServiceWorkers)
+        ));
 
-        for value in ["cache", "Cookies", "{ cookies: true }"] {
+        for value in ["cache", "indexed-db", "service_worker", "{ cookies: true }"] {
             assert!(
                 parse_yaml(&format!(
                     "version: 1\nname: clear\nsteps: [{{ clear: {value} }}]\n"
@@ -2375,6 +2426,38 @@ steps:
                 .is_err(),
                 "accepted clear value {value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn recording_controls_require_one_ordered_pair() {
+        let flow = compile(
+            "version: 1\nname: recording\nsteps:\n  - recording: start\n  - open: https://x.test\n  - recording: stop\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            flow.steps[0].operation,
+            Operation::Recording(RecordingControl::Start)
+        ));
+        assert!(matches!(
+            flow.steps[2].operation,
+            Operation::Recording(RecordingControl::Stop)
+        ));
+
+        for (steps, expected) in [
+            ("  - recording: start\n", "requires one later"),
+            ("  - recording: stop\n", "must follow"),
+            (
+                "  - recording: start\n  - recording: start\n  - recording: stop\n",
+                "only one",
+            ),
+            (
+                "  - recording: start\n  - recording: stop\n  - recording: stop\n",
+                "only one",
+            ),
+        ] {
+            let source = format!("version: 1\nname: recording\nsteps:\n{steps}");
+            assert!(error(&source).contains(expected), "accepted {steps:?}");
         }
     }
 
