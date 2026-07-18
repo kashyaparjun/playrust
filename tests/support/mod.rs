@@ -138,29 +138,33 @@ impl FixtureServer {
             while !server_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false)?;
-                        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                        let mut request = [0; 8192];
-                        let length = match stream.read(&mut request) {
-                            Ok(0) => continue,
-                            Ok(length) => length,
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                                ) =>
-                            {
-                                continue;
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let request = String::from_utf8_lossy(&request[..length]);
-                        let (status, content_type, body) = responder(&request);
-                        write!(
-                            stream,
-                            "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )?;
+                        let responder = Arc::clone(&responder);
+                        thread::spawn(move || -> io::Result<()> {
+                            stream.set_nonblocking(false)?;
+                            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                            let mut request = [0; 8192];
+                            let length = match stream.read(&mut request) {
+                                Ok(0) => return Ok(()),
+                                Ok(length) => length,
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    return Ok(());
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            let request = String::from_utf8_lossy(&request[..length]);
+                            let (status, content_type, body) = responder(&request);
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            Ok(())
+                        });
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));

@@ -1025,6 +1025,7 @@ pub(crate) fn retryable_cdp_message(message: &str) -> bool {
         "cannot find context",
         "context with specified id",
         "session with given id",
+        "active oopif target is detached",
         "node with given id",
         "navigat",
     ]
@@ -1112,6 +1113,7 @@ mod tests {
         assert!(retryable_cdp_message(
             "Execution context was destroyed by navigation"
         ));
+        assert!(retryable_cdp_message("active OOPIF target is detached"));
         assert!(!retryable_cdp_message("Target closed"));
         assert!(!retryable_cdp_message("Session closed"));
         assert!(!retryable_cdp_message("Invalid selector"));
