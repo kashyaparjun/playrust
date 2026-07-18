@@ -104,6 +104,82 @@ async fn cross_origin_oopif_locates_fills_clicks_and_asserts() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn active_frame_navigates_across_origins_and_process_replacements() {
+    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let foreign = FixtureServer::start(&[(
+        "/foreign",
+        "text/html",
+        "<!doctype html><p id='marker'>foreign process</p>",
+    )]);
+    let foreign_url = foreign.url().replace("127.0.0.1", "localhost");
+    let server = FixtureServer::start(&[
+        (
+            "/",
+            "text/html",
+            "<!doctype html><iframe id='frame' src='/same'></iframe>",
+        ),
+        (
+            "/same",
+            "text/html",
+            "<!doctype html><p id='marker'>same process</p>",
+        ),
+        (
+            "/returned",
+            "text/html",
+            "<!doctype html><p id='marker'>returned process</p>",
+        ),
+    ]);
+    let source = format!(
+        "version: 1\nname: frame-navigation\nbase_url: {}\nsettings: {{ video: off }}\nsteps:\n  - open: /\n  - switch_frame: {{ target: {{ css: '#frame' }} }}\n  - assert: {{ text: {{ target: {{ css: '#marker' }}, equals: 'same process' }} }}\n  - open: {foreign_url}/foreign\n  - assert: {{ url: {{ path: /foreign }} }}\n  - assert: {{ text: {{ target: {{ css: '#marker' }}, equals: 'foreign process' }} }}\n  - open: {}/returned\n  - assert: {{ url: {{ path: /returned }} }}\n  - assert: {{ text: {{ target: {{ css: '#marker' }}, equals: 'returned process' }} }}\n",
+        server.url, server.url
+    );
+    let flow = compile_yaml(&source, "frame-navigation.yaml", &BTreeMap::new()).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let host = BrowserHost::launch(&chrome, false).await.unwrap();
+
+    let report = run_flow(&host, &flow, &RunOptions::new(artifacts.path())).await;
+    host.shutdown().await.unwrap();
+
+    assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn active_oopif_clears_dom_storage_scrolls_and_swipes() {
+    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let foreign = FixtureServer::start(&[(
+        "/foreign",
+        "text/html",
+        r#"<!doctype html><style>body{height:1800px}#swipe{margin-top:20px;width:160px;height:80px}</style>
+        <button id="storage">storage</button><button id="swipe">swipe</button>
+        <p id="state">pending</p><script>
+        localStorage.setItem('local', 'present'); sessionStorage.setItem('session', 'present');
+        storage.onclick = () => state.textContent = `${localStorage.getItem('local')};${sessionStorage.getItem('session')}`;
+        addEventListener('scroll', () => state.textContent = 'scrolled');
+        swipe.onmouseup = () => state.textContent = 'swiped';
+        </script>"#,
+    )]);
+    let foreign_url = foreign.url().replace("127.0.0.1", "localhost");
+    let root = format!(
+        "<!doctype html><iframe id='frame' src='{foreign_url}/foreign' style='width:500px;height:400px'></iframe>"
+    );
+    let server = FixtureServer::start(&[("/", "text/html", &root)]);
+    let source = format!(
+        "version: 1\nname: oopif-actions\nbase_url: {}\nsettings: {{ video: off, viewport: {{ width: 800, height: 600 }} }}\nsteps:\n  - open: /\n  - switch_frame: {{ target: {{ css: '#frame' }} }}\n  - clear: storage\n  - click: {{ target: {{ css: '#storage' }} }}\n  - assert: {{ text: {{ target: {{ css: '#state' }}, equals: 'null;null' }} }}\n  - scroll: {{ y: 300 }}\n  - assert: {{ text: {{ target: {{ css: '#state' }}, equals: scrolled }} }}\n  - swipe: {{ target: {{ css: '#swipe' }}, x: 40, duration: 50ms }}\n  - assert: {{ text: {{ target: {{ css: '#state' }}, equals: swiped }} }}\n",
+        server.url
+    );
+    let flow = compile_yaml(&source, "oopif-actions.yaml", &BTreeMap::new()).unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let host = BrowserHost::launch(&chrome, false).await.unwrap();
+
+    let report = run_flow(&host, &flow, &RunOptions::new(artifacts.path())).await;
+    host.shutdown().await.unwrap();
+
+    assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn nested_oopif_preserves_parent_and_main_switching() {
     let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
     let foreign_page = r#"<p id='foreign'>foreign</p>

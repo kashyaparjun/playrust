@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_tungstenite::tungstenite::Message;
@@ -10,6 +10,11 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::locator::POLL_INTERVAL;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct Sessions {
@@ -43,9 +48,13 @@ pub struct OopifRouter {
 
 impl OopifRouter {
     pub async fn connect(websocket: &str, browser_context: &str) -> Result<Arc<Self>> {
-        let (socket, _) = async_tungstenite::tokio::connect_async(websocket)
-            .await
-            .context("connect OOPIF CDP router")?;
+        let (socket, _) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            async_tungstenite::tokio::connect_async(websocket),
+        )
+        .await
+        .map_err(|_| anyhow!("connect OOPIF CDP router timed out"))?
+        .context("connect OOPIF CDP router")?;
         let (requests, receiver) = mpsc::channel(32);
         let sessions = Arc::new(RwLock::new(Sessions::default()));
         let changed = Arc::new(Notify::new());
@@ -108,25 +117,38 @@ impl OopifRouter {
             params["executionContextId"] = (*context).into();
         }
         let (reply, response) = oneshot::channel();
-        self.requests
-            .send(Request::Command {
-                target: target.to_owned(),
-                method: method.to_owned(),
-                params,
-                reply,
-            })
-            .await
-            .map_err(|_| anyhow!("OOPIF CDP router stopped"))?;
-        response
-            .await
-            .map_err(|_| anyhow!("OOPIF CDP router stopped"))?
+        tokio::time::timeout(COMMAND_TIMEOUT, async {
+            self.requests
+                .send(Request::Command {
+                    target: target.to_owned(),
+                    method: method.to_owned(),
+                    params,
+                    reply,
+                })
+                .await
+                .map_err(|_| anyhow!("OOPIF CDP router stopped"))?;
+            response
+                .await
+                .map_err(|_| anyhow!("OOPIF CDP router stopped"))?
+        })
+        .await
+        .map_err(|_| anyhow!("OOPIF CDP command {method} timed out"))?
     }
 
-    pub async fn close(&self) {
+    pub async fn close(&self) -> Result<()> {
         let (reply, closed) = oneshot::channel();
-        if self.requests.send(Request::Close(reply)).await.is_ok() {
-            let _ = closed.await;
-        }
+        tokio::time::timeout(CLOSE_TIMEOUT, async {
+            self.requests
+                .send(Request::Close(reply))
+                .await
+                .map_err(|_| anyhow!("OOPIF CDP router stopped"))?;
+            closed
+                .await
+                .map_err(|_| anyhow!("OOPIF CDP router stopped"))
+        })
+        .await
+        .map_err(|_| anyhow!("close OOPIF CDP router timed out"))??;
+        Ok(())
     }
 
     pub fn execution_context(&self, target: &str, frame: &str) -> Option<i64> {
@@ -247,7 +269,7 @@ async fn run<S>(
                     }
                 }
                 Some(Request::Close(reply)) => {
-                    let _ = socket.close().await;
+                    let _ = tokio::time::timeout(IO_TIMEOUT, socket.close()).await;
                     let _ = reply.send(());
                     return;
                 }
@@ -261,7 +283,10 @@ async fn run<S>(
                 let message = match message {
                     Ok(Message::Text(text)) => text,
                     Ok(Message::Ping(data)) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
+                        if !matches!(
+                            tokio::time::timeout(IO_TIMEOUT, socket.send(Message::Pong(data))).await,
+                            Ok(Ok(()))
+                        ) {
                             fail(&sessions, &changed, "OOPIF CDP connection failed");
                             return;
                         }
@@ -503,10 +528,13 @@ where
     if let Some(session) = session {
         message["sessionId"] = Value::String(session.to_owned());
     }
-    socket
-        .send(Message::Text(message.to_string().into()))
-        .await
-        .context("send OOPIF CDP command")
+    tokio::time::timeout(
+        IO_TIMEOUT,
+        socket.send(Message::Text(message.to_string().into())),
+    )
+    .await
+    .map_err(|_| anyhow!("send OOPIF CDP command {method} timed out"))?
+    .context("send OOPIF CDP command")
 }
 
 fn fail(sessions: &RwLock<Sessions>, changed: &Notify, error: &str) {

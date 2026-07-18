@@ -640,11 +640,7 @@ impl<'page> LocatorEngine<'page> {
             .node;
         node.content_document
             .map(|document| document.node_id)
-            .ok_or_else(|| {
-                LocatorError::Protocol(
-                    "cross-origin iframe targets are unsupported by chromiumoxide 0.9.1".into(),
-                )
-            })
+            .ok_or_else(|| LocatorError::Protocol("active frame document is unavailable".into()))
     }
 
     async fn observe_candidate(
@@ -1028,6 +1024,7 @@ pub(crate) fn retryable_cdp_message(message: &str) -> bool {
         "execution context",
         "cannot find context",
         "context with specified id",
+        "session with given id",
         "node with given id",
         "navigat",
     ]

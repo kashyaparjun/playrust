@@ -20,10 +20,10 @@ use chromiumoxide::cdp::browser_protocol::input::{
     InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, EventFrameStartedNavigating, EventLifecycleEvent,
-    EventScreencastFrame, FrameId, GetFrameTreeParams, GetNavigationHistoryParams, NavigateParams,
-    NavigateToHistoryEntryParams, ScreencastFrameAckParams, StartScreencastFormat,
-    StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
+    CaptureScreenshotFormat, EventScreencastFrame, FrameId, GetFrameTreeParams,
+    GetNavigationHistoryParams, NavigateParams, NavigateToHistoryEntryParams,
+    ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams, StopScreencastParams,
+    Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
 use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
@@ -68,6 +68,7 @@ const INSPECT_AX_NODES: usize = 500;
 const INSPECT_AX_BYTES: usize = 256 * 1024;
 const INSPECT_PAGES: usize = 100;
 const INSPECT_TEXT_CHARS: usize = 16 * 1024;
+const INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 const FOCUS_FUNCTION: &str = r#"function() {
     if (!this.isConnected) return false;
@@ -377,6 +378,22 @@ impl SessionRuntime {
         accessibility: bool,
         screenshot_directory: Option<&Path>,
     ) -> anyhow::Result<SessionInspection> {
+        let mut status = host.subscribe_status();
+        tokio::select! {
+            result = tokio::time::timeout(
+                INSPECTION_TIMEOUT,
+                self.inspect_inner(host, accessibility, screenshot_directory),
+            ) => result.map_err(|_| anyhow::anyhow!("session inspection timed out"))?,
+            error = browser_unavailable(&mut status) => Err(anyhow::anyhow!(error)),
+        }
+    }
+
+    async fn inspect_inner(
+        &self,
+        host: &BrowserHost,
+        accessibility: bool,
+        screenshot_directory: Option<&Path>,
+    ) -> anyhow::Result<SessionInspection> {
         let context = self.context.as_ref().expect("open session context");
         let target_id = self.active.page.target_id();
         let targets = host
@@ -455,11 +472,31 @@ impl SessionRuntime {
     }
 
     pub(crate) async fn close(mut self, host: &BrowserHost) -> anyhow::Result<()> {
-        if let Some(router) = self.active.router.take() {
-            router.close().await;
+        let mut errors = Vec::new();
+        if let Some(router) = self.active.router.take()
+            && let Err(error) = router.close().await
+        {
+            errors.push(error.to_string());
         }
-        host.dispose_context(self.context.take().expect("open session context"))
-            .await
+        let mut status = host.subscribe_status();
+        let disposal = tokio::select! {
+            result = tokio::time::timeout(
+                SECONDARY_TIMEOUT,
+                host.dispose_context(self.context.take().expect("open session context")),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("dispose browser context timed out")),
+            },
+            error = browser_unavailable(&mut status) => Err(anyhow::anyhow!(error)),
+        };
+        if let Err(error) = disposal {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("; "))
+        }
     }
 }
 
@@ -547,6 +584,7 @@ async fn execute_flow(
         stopped_loops: BTreeSet::new(),
     };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
+    let mut browser_status = host.subscribe_status();
     let mut recording_error = None;
     let mut video = None;
     let manual_recording = flow.manual_recording;
@@ -598,6 +636,17 @@ async fn execute_flow(
                 _ = wait_for_cancellation(options.cancellation.as_ref()) => {
                     interrupted = true;
                     video_stop_at = Some(Instant::now());
+                    break;
+                }
+                error = browser_unavailable(&mut browser_status) => {
+                    primary = Some(step_failure(
+                        host,
+                        flow,
+                        &runtime.redactor,
+                        &active,
+                        step,
+                        protocol(error),
+                    ).await);
                     break;
                 }
                 result = tokio::time::timeout_at(
@@ -695,6 +744,10 @@ async fn execute_flow(
                     interrupted = true;
                     video_stop_at = Some(Instant::now());
                     break 'steps;
+                }
+                browser_error = browser_unavailable(&mut browser_status) => {
+                    error = Some(protocol(browser_error));
+                    break;
                 }
                 result = tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
@@ -812,6 +865,19 @@ async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
     match cancellation {
         Some(cancellation) => cancellation.cancelled().await,
         None => std::future::pending().await,
+    }
+}
+
+async fn browser_unavailable(status: &mut tokio::sync::watch::Receiver<BrowserStatus>) -> String {
+    loop {
+        match status.borrow().clone() {
+            BrowserStatus::Running => {}
+            BrowserStatus::Failed(error) => return format!("Chromium is unavailable: {error}"),
+            BrowserStatus::Closed => return "Chromium is closed".to_owned(),
+        }
+        if status.changed().await.is_err() {
+            return "Chromium status monitor stopped".to_owned();
+        }
     }
 }
 
@@ -1368,160 +1434,75 @@ fn register_string_secrets(redactor: &mut Redactor, value: &Value) {
 }
 
 async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Result<(), StepError> {
-    if active.frame().is_some() {
-        let parent = parent_frame_url(active).await?;
-        if !same_origin_or_inherited(&parent, url) {
-            return Err(StepError::new(
-                FailureCategory::Navigation,
-                "cross-origin iframe navigation is unsupported by chromiumoxide 0.9.1",
-            ));
-        }
-    }
-    let tree = active
-        .page
-        .execute(GetFrameTreeParams::default())
-        .await
-        .map_err(protocol)?
-        .result
-        .frame_tree;
-    let frame = match active.frame() {
-        None => &tree.frame,
-        Some(id) => find_frame(&tree, id).ok_or_else(|| {
-            StepError::new(FailureCategory::Protocol, "active frame no longer exists")
-        })?,
-    };
-    let target_frame_id = frame.id.clone();
-    let previous_loader_id = frame.loader_id.clone();
-    let mut started = active
-        .page
-        .event_listener::<EventFrameStartedNavigating>()
-        .await
-        .map_err(protocol)?;
-    let mut events = active
-        .page
-        .event_listener::<EventLifecycleEvent>()
-        .await
-        .map_err(protocol)?;
+    let previous_url = active.url().await.map_err(protocol)?.unwrap_or_default();
     let mut params = NavigateParams::new(url);
-    params.frame_id = active.frame().cloned();
-    let navigation = active
-        .page
-        .command_future(params)
-        .map_err(|error| StepError::new(FailureCategory::Navigation, error.to_string()))?;
+    params.frame_id = active.local_frame().cloned();
+    let target_frame = active.frame().cloned();
+    let target = active.target();
+    let navigation = target.execute(params);
     tokio::pin!(navigation);
-    let mut navigation_loader = None;
-    let mut dom_content_loaded = std::collections::HashSet::new();
+    let mut command_completed = false;
     loop {
-        let selected = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        if !command_completed {
             tokio::select! {
-                response = &mut navigation => NavigationCompletion::Intercepted(response),
-                event = started.next() => NavigationCompletion::Started(event),
-                event = events.next() => NavigationCompletion::Lifecycle(event),
-            }
-        })
-        .await
-        .map_err(|_| {
-            StepError::new(FailureCategory::Timeout, "navigation deadline expired").deadline()
-        })?;
-        match selected {
-            NavigationCompletion::Intercepted(response) => {
-                let response = response
-                    .map_err(|error| {
-                        StepError::new(FailureCategory::Navigation, error.to_string())
-                    })?
-                    .result;
-                if let Some(error) = response.error_text {
-                    return Err(StepError::new(FailureCategory::Navigation, error));
-                }
-                if response.is_download == Some(true) {
-                    return Err(StepError::new(
+                response = &mut navigation => match response {
+                    Ok(response) => {
+                        if let Some(error) = response.error_text {
+                            return Err(StepError::new(FailureCategory::Navigation, error));
+                        }
+                        if response.is_download == Some(true) {
+                            return Err(StepError::new(
+                                FailureCategory::Navigation,
+                                "navigation resulted in a download",
+                            ));
+                        }
+                        if let Some(frame) = &target_frame
+                            && response.frame_id != *frame
+                        {
+                            return Err(protocol("navigation completed for an unexpected frame"));
+                        }
+                        command_completed = true;
+                    }
+                    Err(error) if target_frame.is_some() && retryable_cdp_message(&error.to_string()) => {
+                        command_completed = true;
+                    }
+                    Err(error) => return Err(StepError::new(
                         FailureCategory::Navigation,
-                        "navigation resulted in a download",
-                    ));
-                }
-                if response.frame_id != target_frame_id {
-                    return Err(StepError::new(
-                        FailureCategory::Protocol,
-                        "navigation completed for an unexpected frame",
-                    ));
-                }
-                // chromiumoxide releases this future only for same-document navigation
-                // or after its full-load watcher completes.
-                return verify_frame_origin(active).await;
-            }
-            NavigationCompletion::Started(Some(event)) => {
-                if event.frame_id == target_frame_id
-                    && event.url == url
-                    && event.loader_id != previous_loader_id
-                {
-                    navigation_loader = Some(event.loader_id.clone());
-                    if dom_content_loaded.contains(&event.loader_id) {
-                        return verify_frame_origin(active).await;
-                    }
-                }
-            }
-            NavigationCompletion::Started(None) => {
-                return Err(StepError::new(
-                    FailureCategory::Protocol,
-                    "navigation start event stream closed",
-                ));
-            }
-            NavigationCompletion::Lifecycle(Some(event)) => {
-                if event.frame_id == target_frame_id
-                    && event.loader_id != previous_loader_id
-                    && event.name == "DOMContentLoaded"
-                {
-                    dom_content_loaded.insert(event.loader_id.clone());
-                    if navigation_loader.as_ref() == Some(&event.loader_id) {
-                        return verify_frame_origin(active).await;
-                    }
-                }
-            }
-            NavigationCompletion::Lifecycle(None) => {
-                return Err(StepError::new(
-                    FailureCategory::Protocol,
-                    "navigation event stream closed",
-                ));
+                        error.to_string(),
+                    )),
+                },
+                _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
         }
-    }
-}
-
-async fn parent_frame_url(active: &ActiveContext) -> Result<String, StepError> {
-    match active.frames.len() {
-        0 | 1 => active
-            .page
-            .url()
-            .await
-            .map_err(protocol)
-            .map(|url| url.unwrap_or_default()),
-        length => active
-            .page
-            .frame_url(active.frames[length - 2].id.clone())
-            .await
-            .map_err(protocol)
-            .map(|url| url.unwrap_or_default()),
-    }
-}
-
-async fn verify_frame_origin(active: &ActiveContext) -> Result<(), StepError> {
-    let Some(frame) = active.frame() else {
-        return Ok(());
-    };
-    let parent = parent_frame_url(active).await?;
-    let child = active
-        .page
-        .frame_url(frame.clone())
-        .await
-        .map_err(protocol)?
-        .unwrap_or_default();
-    if same_origin_or_inherited(&parent, &child) {
-        Ok(())
-    } else {
-        Err(StepError::new(
-            FailureCategory::Navigation,
-            "cross-origin iframe navigation is unsupported by chromiumoxide 0.9.1",
-        ))
+        let current_url = match active.url().await {
+            Ok(url) => url.unwrap_or_default(),
+            Err(error) if retryable_cdp_message(&error.to_string()) => {
+                if Instant::now() >= deadline {
+                    return Err(StepError::new(
+                        FailureCategory::Timeout,
+                        "navigation deadline expired",
+                    )
+                    .deadline());
+                }
+                sleep_until_poll(deadline).await;
+                continue;
+            }
+            Err(error) => return Err(protocol(error)),
+        };
+        if command_completed || current_url != previous_url {
+            match evaluate_value::<String>(active, "document.readyState").await {
+                Ok(state) if state != "loading" => return Ok(()),
+                Ok(_) => {}
+                Err(error) if retryable_cdp_message(&error.message) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                StepError::new(FailureCategory::Timeout, "navigation deadline expired").deadline(),
+            );
+        }
+        sleep_until_poll(deadline).await;
     }
 }
 
@@ -1537,12 +1518,6 @@ fn find_frame<'a>(
         .unwrap_or_default()
         .iter()
         .find_map(|child| find_frame(child, id))
-}
-
-enum NavigationCompletion<C, S, L> {
-    Intercepted(C),
-    Started(Option<Arc<S>>),
-    Lifecycle(Option<Arc<L>>),
 }
 
 async fn switch_page(
@@ -1702,16 +1677,6 @@ async fn switch_frame(
         }
     }
     Ok(())
-}
-
-fn same_origin_or_inherited(parent: &str, child: &str) -> bool {
-    if matches!(child, "about:blank" | "about:srcdoc") {
-        return true;
-    }
-    match (url::Url::parse(parent), url::Url::parse(child)) {
-        (Ok(parent), Ok(child)) => parent.origin() == child.origin(),
-        _ => false,
-    }
 }
 
 async fn wait_actionable(
