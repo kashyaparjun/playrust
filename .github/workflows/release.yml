@@ -4,12 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -38,7 +45,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          asset="playrust-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          asset="playrust-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           mkdir -p dist package
           cp "target/${{ matrix.target }}/release/playrust" README.md package/
           tar -C package -czf "dist/$asset" playrust README.md
@@ -48,7 +55,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $asset = "playrust-$env:GITHUB_REF_NAME-${{ matrix.target }}.zip"
+          $asset = "playrust-$env:RELEASE_TAG-${{ matrix.target }}.zip"
           New-Item -ItemType Directory -Force dist, package
           Copy-Item -Path "target/${{ matrix.target }}/release/playrust.exe", "README.md" -Destination package
           Compress-Archive -Path package/playrust.exe, package/README.md -DestinationPath "dist/$asset"
@@ -74,4 +81,4 @@ jobs:
       - name: Upload assets to existing release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
