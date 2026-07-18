@@ -141,7 +141,19 @@ impl FixtureServer {
                         stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                         let mut request = [0; 8192];
-                        let length = stream.read(&mut request)?;
+                        let length = match stream.read(&mut request) {
+                            Ok(0) => continue,
+                            Ok(length) => length,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let request = String::from_utf8_lossy(&request[..length]);
                         let (status, content_type, body) = responder(&request);
                         write!(
@@ -185,10 +197,7 @@ impl Drop for FixtureServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .expect("fixture server thread panicked")
-                .expect("serve fixture");
+            let _ = thread.join();
         }
     }
 }
