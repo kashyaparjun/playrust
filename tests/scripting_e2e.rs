@@ -97,12 +97,13 @@ fn runtime_script_failures_are_redacted_and_keep_subflow_provenance() {
         ],
         &[],
     );
-    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(output.status.code(), Some(3));
     let report = read_report(&artifacts);
     let failure = &report.flows[0].failures[0];
     let step = failure.step.as_ref().expect("step provenance");
     assert_eq!(step.source_step, Some(2));
     assert_eq!(step.operation, "evaluate");
+    assert_eq!(failure.category, playrust::report::FailureCategory::Script);
     assert!(
         step.source
             .as_deref()

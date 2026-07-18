@@ -110,8 +110,27 @@ fn malformed_validation_automation_and_settings_errors_recover() {
     let directory = tempfile::tempdir().unwrap();
     let mut session = Session::start(&directory.path().join("artifacts"));
 
+    assert_eq!(
+        session.command(json!({ "id": "inspect-early", "command": "inspect" }))["error"]["code"],
+        "not_started"
+    );
+    assert_eq!(
+        session.command(json!({ "id": "cancel-idle", "command": "cancel" }))["error"]["code"],
+        "not_active"
+    );
+    assert_eq!(
+        session.command(json!({ "id": "missing", "command": "output", "name": "absent" }))["error"]
+            ["code"],
+        "output_not_found"
+    );
     session.send_raw(b"not json\n");
     assert_eq!(session.read()["error"]["code"], "invalid_command");
+    session.send_raw(b"{\"id\":\"utf8\",\"command\":\"cancel\",\"x\":\xff}\n");
+    let invalid_utf8 = session.read();
+    assert_eq!(invalid_utf8["id"], Value::Null);
+    assert_eq!(invalid_utf8["error"]["code"], "invalid_command");
+    session.send_raw(b"{\"id\":\"crlf\",\"command\":\"cancel\"}\r\n");
+    assert_eq!(session.read()["error"]["code"], "not_active");
     let mut oversized = vec![b' '; playrust::session_protocol::MAX_ENVELOPE_BYTES + 1];
     oversized.push(b'\n');
     session.send_raw(&oversized);
@@ -136,6 +155,26 @@ fn malformed_validation_automation_and_settings_errors_recover() {
         "command": "submit",
         "flow": "version: 1\nname: fail\nsettings: { video: off, timeout: 1s }\nsteps: [{ assert: { text: { target: { css: body }, equals: wrong } } }]\n"
     }))["error"]["code"], "submission_failed");
+    let script = session.command(json!({
+        "id": "script",
+        "command": "submit",
+        "flow": "version: 1\nname: script\nsettings: { video: off }\nsteps: [{ evaluate: { script: 'throw new Error(\"expected\")' } }]\n"
+    }));
+    assert_eq!(script["error"]["code"], "submission_failed");
+    assert_eq!(
+        script["error"]["details"]["failures"][0]["category"],
+        "script"
+    );
+    let request = session.command(json!({
+        "id": "request",
+        "command": "submit",
+        "flow": "version: 1\nname: request\nsettings: { video: off }\nsteps: [{ request: { method: GET, url: 'http://127.0.0.1:1/unavailable', expected_status: 200 } }]\n"
+    }));
+    assert_eq!(request["error"]["code"], "submission_failed");
+    assert_eq!(
+        request["error"]["details"]["failures"][0]["category"],
+        "request"
+    );
     assert_eq!(session.command(json!({
         "id": "clean",
         "command": "submit",
@@ -204,6 +243,61 @@ fn close_during_submit_orders_submit_before_the_only_close_response() {
         "received a second close response"
     );
     assert_exit(session.finish(), 130);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+fn cancellation_ack_wins_a_racing_success() {
+    let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", "<!doctype html>")]);
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = Session::start(&directory.path().join("artifacts"));
+    session.send(json!({
+        "id": "submit",
+        "command": "submit",
+        "flow": format!("version: 1\nname: race\nsettings: {{ video: off }}\nsteps: [{{ open: {}/ }}, {{ evaluate: {{ script: 'return new Promise(resolve => setTimeout(() => resolve(1), 100))', save_as: result }} }}]\n", server.url)
+    }));
+    session.send(json!({ "id": "cancel", "command": "cancel" }));
+    assert_eq!(session.read()["result"]["cancelling"], true);
+    let submit = session.read();
+    assert_eq!(submit["id"], "submit");
+    assert_eq!(submit["error"]["code"], "cancelled");
+    assert_eq!(submit["error"]["details"]["status"], "interrupted");
+    assert_exit(session.finish(), 130);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+fn eof_during_submission_cancels_and_exits_130() {
+    let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", "<!doctype html>")]);
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = Session::start(&directory.path().join("artifacts"));
+    session.send(json!({
+        "id": "submit",
+        "command": "submit",
+        "flow": format!("version: 1\nname: eof\nsettings: {{ video: off, timeout: 30s }}\nsteps: [{{ open: {}/ }}, {{ wait_until_visible: {{ target: {{ css: '#never' }} }} }}]\n", server.url)
+    }));
+    session.close_input();
+    assert_eq!(session.read()["error"]["code"], "cancelled");
+    assert_exit(session.finish(), 130);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+fn artifact_failure_wins_cancellation() {
+    let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", "<!doctype html>")]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifacts = directory.path().join("not-a-directory");
+    std::fs::write(&artifacts, "blocked").unwrap();
+    let mut session = Session::start(&artifacts);
+    session.send(json!({
+        "id": "submit",
+        "command": "submit",
+        "flow": format!("version: 1\nname: artifact\nsettings: {{ video: off, timeout: 30s }}\nsteps: [{{ open: {}/ }}, {{ wait_until_visible: {{ target: {{ css: '#never' }} }} }}]\n", server.url)
+    }));
+    session.send(json!({ "id": "cancel", "command": "cancel" }));
+    assert_eq!(session.read()["result"]["cancelling"], true);
+    assert_eq!(session.read()["error"]["code"], "artifacts");
+    assert_exit(session.finish(), 4);
 }
 
 #[test]
@@ -280,6 +374,10 @@ impl Session {
     fn command(&mut self, value: Value) -> Value {
         self.send(value);
         self.read()
+    }
+
+    fn close_input(&mut self) {
+        drop(self.stdin.take());
     }
 
     fn finish(mut self) -> Output {

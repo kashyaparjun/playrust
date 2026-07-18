@@ -30,6 +30,7 @@ use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
 use chromiumoxide::cdp::js_protocol::runtime::{
     CallFunctionOnParams, EvaluateParams, ExecutionContextId, ReleaseObjectParams,
 };
+use chromiumoxide::error::CdpError;
 use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
@@ -1231,21 +1232,19 @@ async fn evaluate_page(
     match target {
         CdpTarget::Root(page) => match page.evaluate_function(params).await {
             Ok(result) => Ok(result.into_value::<Value>().ok()),
-            Err(_) => Err(StepError::new(
-                FailureCategory::Protocol,
+            Err(CdpError::JavascriptException(_)) => Err(StepError::new(
+                FailureCategory::Script,
                 "page script failed",
             )),
+            Err(error) => Err(protocol(error)),
         },
         CdpTarget::Oopif(_, _) => match target.execute(params).await {
             Ok(result) if result.exception_details.is_some() => Err(StepError::new(
-                FailureCategory::Protocol,
+                FailureCategory::Script,
                 "page script failed",
             )),
             Ok(result) => Ok(result.result.value),
-            Err(_) => Err(StepError::new(
-                FailureCategory::Protocol,
-                "page script failed",
-            )),
+            Err(error) => Err(protocol(error)),
         },
     }
 }
@@ -1262,7 +1261,7 @@ async fn http_request(
     let url = url::Url::parse(url)
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
-        .ok_or_else(|| StepError::new(FailureCategory::Protocol, "request URL is invalid"))?;
+        .ok_or_else(|| StepError::new(FailureCategory::Request, "request URL is invalid"))?;
     let method = reqwest::Method::from_bytes(method.as_bytes()).expect("compiled HTTP method");
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1279,12 +1278,15 @@ async fn http_request(
     let mut response = request
         .send()
         .await
-        .map_err(|_| StepError::new(FailureCategory::Protocol, "HTTP request failed"))?;
+        .map_err(|_| StepError::new(FailureCategory::Request, "HTTP request failed"))?;
     if response.status().as_u16() != expected_status {
-        return Err(StepError::assertion(format!(
-            "HTTP status was {}, expected {expected_status}",
-            response.status().as_u16()
-        )));
+        return Err(StepError::new(
+            FailureCategory::Request,
+            format!(
+                "HTTP status was {}, expected {expected_status}",
+                response.status().as_u16()
+            ),
+        ));
     }
     if !save_body {
         return Ok(None);
@@ -1294,7 +1296,7 @@ async fn http_request(
         .is_some_and(|length| length > MAX_RUNTIME_VALUE_BYTES as u64)
     {
         return Err(StepError::new(
-            FailureCategory::Protocol,
+            FailureCategory::Request,
             "HTTP response body exceeds the runtime value size limit",
         ));
     }
@@ -1302,7 +1304,7 @@ async fn http_request(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| StepError::new(FailureCategory::Protocol, "HTTP response body failed"))?
+        .map_err(|_| StepError::new(FailureCategory::Request, "HTTP response body failed"))?
     {
         if bytes
             .len()
@@ -1310,7 +1312,7 @@ async fn http_request(
             .is_none_or(|length| length > MAX_RUNTIME_VALUE_BYTES)
         {
             return Err(StepError::new(
-                FailureCategory::Protocol,
+                FailureCategory::Request,
                 "HTTP response body exceeds the runtime value size limit",
             ));
         }
@@ -3574,6 +3576,58 @@ mod tests {
             redirected_request.is_err(),
             "redirect target received x-api-key: {redirected_request:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn http_transport_status_and_body_failures_are_request_failures() {
+        let outputs = BTreeMap::new();
+        let headers = BTreeMap::new();
+        let invalid = http_request("GET", "not-a-url", &headers, None, 200, false, &outputs)
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.category, FailureCategory::Request);
+
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_url = format!("http://{}", unavailable.local_addr().unwrap());
+        drop(unavailable);
+        let transport = http_request(
+            "GET",
+            &unavailable_url,
+            &headers,
+            None,
+            200,
+            false,
+            &outputs,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(transport.category, FailureCategory::Request);
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_url = format!("http://{}", server.local_addr().unwrap());
+        tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned(),
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    MAX_RUNTIME_VALUE_BYTES + 1
+                ),
+            ] {
+                let (mut stream, _) = server.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request).await.unwrap();
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let status = http_request("GET", &server_url, &headers, None, 200, false, &outputs)
+            .await
+            .unwrap_err();
+        assert_eq!(status.category, FailureCategory::Request);
+        let body = http_request("GET", &server_url, &headers, None, 200, true, &outputs)
+            .await
+            .unwrap_err();
+        assert_eq!(body.category, FailureCategory::Request);
     }
 
     #[test]

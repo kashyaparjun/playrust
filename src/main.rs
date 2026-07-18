@@ -628,11 +628,7 @@ fn finish_report(
                     "error: could not remove stale report {}: {error}",
                     path.display()
                 );
-                return if exit_code == ExitCode::Interrupted {
-                    ExitCode::Interrupted
-                } else {
-                    ExitCode::Infrastructure
-                };
+                return ExitCode::Infrastructure;
             }
         }
     }
@@ -641,11 +637,7 @@ fn finish_report(
             Ok(path) => println!("JUnit: {}", path.display()),
             Err(error) => {
                 eprintln!("error: {error}");
-                return if exit_code == ExitCode::Interrupted {
-                    ExitCode::Interrupted
-                } else {
-                    ExitCode::Infrastructure
-                };
+                return ExitCode::Infrastructure;
             }
         }
     }
@@ -657,11 +649,7 @@ fn finish_report(
                     let _ = fs::remove_file(artifacts.join("junit.xml"));
                 }
                 eprintln!("error: {error}");
-                return if exit_code == ExitCode::Interrupted {
-                    ExitCode::Interrupted
-                } else {
-                    ExitCode::Infrastructure
-                };
+                return ExitCode::Infrastructure;
             }
         }
     }
@@ -675,11 +663,7 @@ fn finish_report(
                 let _ = fs::remove_file(artifacts.join("report.html"));
             }
             eprintln!("error: {error}");
-            return if exit_code == ExitCode::Interrupted {
-                ExitCode::Interrupted
-            } else {
-                ExitCode::Infrastructure
-            };
+            return ExitCode::Infrastructure;
         }
     }
     exit_code

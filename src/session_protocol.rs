@@ -276,6 +276,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 ));
                 let mut requested_close = None;
                 let mut input_closed = false;
+                let mut cancellation_requested = false;
                 let report = loop {
                     tokio::select! {
                         report = &mut execution => break report,
@@ -284,10 +285,12 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                                 Ok(Envelope::Line(line)) => match decode_request(&line) {
                                     Ok(Request { id, command: SessionCommand::Cancel }) => {
                                         cancellation.cancel();
+                                        cancellation_requested = true;
                                         Some(state.response(id, json!({ "cancelling": true })))
                                     }
                                     Ok(Request { id, command: SessionCommand::Close }) => {
                                         cancellation.cancel();
+                                        cancellation_requested = true;
                                         requested_close = Some(id);
                                         None
                                     }
@@ -312,12 +315,14 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                                 )),
                                 Ok(Envelope::Eof) => {
                                     cancellation.cancel();
+                                    cancellation_requested = true;
                                     input_closed = true;
                                     None
                                 }
                                 Err(error) => {
                                     eprintln!("error: read session command: {error}");
                                     cancellation.cancel();
+                                    cancellation_requested = true;
                                     exit_code = ExitCode::Infrastructure;
                                     input_closed = true;
                                     None
@@ -327,13 +332,14 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                                 && write_response(&mut stdout, &response).await.is_err()
                             {
                                 cancellation.cancel();
+                                cancellation_requested = true;
                                 exit_code = ExitCode::Infrastructure;
                             }
                         }
                     }
                 };
                 drop(execution);
-                let report = match report {
+                let mut report = match report {
                     Ok(report) => report,
                     Err(error) => {
                         let response =
@@ -345,6 +351,18 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         continue;
                     }
                 };
+                let fatal = report.failures.iter().any(|failure| {
+                    matches!(
+                        failure.category,
+                        crate::report::FailureCategory::BrowserLaunch
+                            | crate::report::FailureCategory::BrowserCrash
+                            | crate::report::FailureCategory::Protocol
+                            | crate::report::FailureCategory::Recording
+                    )
+                });
+                if cancellation_requested && !fatal {
+                    report.status = FlowStatus::Interrupted;
+                }
                 state.reports.push(report.clone());
                 if let Err(error) = state.write_report(&chromium) {
                     let response = state.error(
@@ -370,24 +388,15 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     close_session = true;
                     continue;
                 }
-                let fatal = report.failures.iter().any(|failure| {
-                    matches!(
-                        failure.category,
-                        crate::report::FailureCategory::BrowserLaunch
-                            | crate::report::FailureCategory::BrowserCrash
-                            | crate::report::FailureCategory::Protocol
-                            | crate::report::FailureCategory::Recording
-                    )
-                });
                 let response = if report.status == FlowStatus::Passed {
                     state.response(request.id, json!(report))
                 } else {
                     state.error(
                         request.id,
-                        if report.status == FlowStatus::Interrupted {
-                            "cancelled"
-                        } else if fatal {
+                        if fatal {
                             "browser"
+                        } else if report.status == FlowStatus::Interrupted {
+                            "cancelled"
                         } else {
                             "submission_failed"
                         },
@@ -626,12 +635,40 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_reader_accepts_the_documented_limit() {
-        let bytes = vec![b' '; MAX_ENVELOPE_BYTES];
+        let mut bytes = vec![b' '; MAX_ENVELOPE_BYTES];
+        bytes.push(b'\n');
         let mut reader = BufReader::new(bytes.as_slice());
         let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
             panic!("expected maximum-sized line");
         };
         assert_eq!(line.len(), MAX_ENVELOPE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn envelope_reader_counts_cr_and_accepts_crlf() {
+        let mut accepted = vec![b' '; MAX_ENVELOPE_BYTES - 1];
+        accepted.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(accepted.as_slice());
+        let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
+            panic!("expected CRLF line at the limit");
+        };
+        assert_eq!(line.len(), MAX_ENVELOPE_BYTES);
+        assert_eq!(line.last(), Some(&b'\r'));
+
+        let mut rejected = vec![b' '; MAX_ENVELOPE_BYTES];
+        rejected.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(rejected.as_slice());
+        assert!(matches!(
+            read_envelope(&mut reader).await.unwrap(),
+            Envelope::TooLarge
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_is_an_invalid_command_with_a_null_id() {
+        let error =
+            decode_request(b"{\"id\":\"lost\",\"command\":\"cancel\",\"x\":\xff}").unwrap_err();
+        assert_eq!(error.0, Value::Null);
     }
 
     #[test]

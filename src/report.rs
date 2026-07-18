@@ -29,8 +29,8 @@ impl ExitCode {
             Self::Success => 0,
             Self::Specification => 1,
             Self::Automation => 2,
-            Self::Infrastructure => 3,
-            Self::Interrupted => 4,
+            Self::Interrupted => 3,
+            Self::Infrastructure => 4,
         }
     }
 }
@@ -53,6 +53,8 @@ pub enum FailureCategory {
     Locator,
     Actionability,
     Assertion,
+    Script,
+    Request,
     Timeout,
     BrowserCrash,
     Recording,
@@ -69,6 +71,8 @@ impl FailureCategory {
             Self::Locator => "locator",
             Self::Actionability => "actionability",
             Self::Assertion => "assertion",
+            Self::Script => "script",
+            Self::Request => "request",
             Self::Timeout => "timeout",
             Self::BrowserCrash => "browser_crash",
             Self::Recording => "recording",
@@ -82,6 +86,8 @@ impl FailureCategory {
             | Self::Locator
             | Self::Actionability
             | Self::Assertion
+            | Self::Script
+            | Self::Request
             | Self::Timeout => ExitCode::Automation,
             Self::BrowserLaunch | Self::Protocol | Self::BrowserCrash | Self::Recording => {
                 ExitCode::Infrastructure
@@ -822,8 +828,10 @@ mod tests {
         );
         assert_eq!(
             aggregate_exit_code([ExitCode::Infrastructure, ExitCode::Interrupted]),
-            ExitCode::Interrupted
+            ExitCode::Infrastructure
         );
+        assert_eq!(FailureCategory::Script.exit_code(), ExitCode::Automation);
+        assert_eq!(FailureCategory::Request.exit_code(), ExitCode::Automation);
         assert_eq!(
             flow(FlowStatus::Failed, None).exit_code(),
             ExitCode::Infrastructure

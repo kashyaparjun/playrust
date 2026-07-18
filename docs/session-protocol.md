@@ -8,7 +8,7 @@ The client writes one UTF-8 JSON object per stdin line. Playrust writes one comp
 
 One command envelope may contain at most 1,048,576 bytes before its `LF`. The limit includes a `CR` in `CRLF`. The reader appends at most that many bytes to its command buffer; Tokio's `BufReader` may separately hold its fixed internal buffer. An oversized envelope is drained through its next `LF` without retaining the excess and receives a recoverable `envelope_too_large` error with `id: null`. Invalid UTF-8, malformed JSON, and invalid command shapes receive a recoverable `invalid_command` error. If the transport remains open, the next line is processed normally. An stdin read failure or stdout write failure is fatal and may prevent a response.
 
-EOF while idle closes the session without a response. EOF during a submission cancels and drains that submission before termination.
+EOF while idle closes the session without a response. EOF during a submission cancels and drains that submission, writes its `cancelled` response while stdout remains available, and terminates with exit 130 unless an infrastructure failure occurs.
 
 ## Commands
 
@@ -61,7 +61,7 @@ Submission failures use `error.details` for the complete `FlowReport`. Stable er
 | `not_active` | `cancel` arrived while idle. | Yes |
 | `not_started` | `inspect` arrived before the first valid submission. | Yes |
 | `output_not_found` | The named runtime output is unavailable. | Yes |
-| `submission_failed` | Recoverable automation or assertion failure. | Yes |
+| `submission_failed` | Recoverable automation, assertion, page-script, or HTTP-request failure. | Yes |
 | `cancelled` | Submission drained after cancellation. | No |
 | `browser` | Browser launch, protocol, crash, fatal submission, inspection, or disposal failure. | No |
 | `artifacts` | Session report persistence failed. | No |
@@ -70,11 +70,11 @@ Submission failures use `error.details` for the complete `FlowReport`. Stable er
 
 Only one submission executes at a time. While it is active, commands are handled in input order. Non-cancel/non-close commands receive `busy`. A malformed or oversized line receives its own error and does not cancel the submission.
 
-`cancel` is acknowledged immediately with `{cancelling:true}`. The submission then drains and receives `cancelled`; the session disposes its router/context and terminates with exit 130.
+`cancel` is acknowledged immediately with `{cancelling:true}`. That acknowledgement commits the active submission to terminal cancellation even if execution concurrently completes successfully. The submission then drains and receives `cancelled`; the session disposes its router/context and terminates with exit 130 unless an infrastructure failure occurs.
 
 An idle `close` disposes the OOPIF router and browser context before returning `{closed:true}`. During submission, `close` has no interim acknowledgement: it requests cancellation, waits for the submission to drain, writes the submission's `cancelled` response, disposes the router/context, then writes the one and only close response. A close during submission therefore terminates with exit 130 unless disposal or shutdown itself fails. No later command is accepted after a close is pending.
 
-Malformed commands, validation failures, settings conflicts, missing outputs, and ordinary automation/assertion failures are recoverable. A later successful close returns exit 0. Cancellation returns exit 130. Browser launch/crash, CDP protocol, recording, artifact, inspection, disposal, browser shutdown, and transport failures are fatal and return exit 4. A fatal infrastructure failure takes precedence over cancellation when both occur.
+Malformed commands, validation failures, settings conflicts, missing outputs, page JavaScript exceptions, HTTP transport/status/body failures, and ordinary automation/assertion failures are recoverable. Page JavaScript exceptions use failure category `script`; HTTP request failures use `request`. CDP command, connection, and browser failures remain category `protocol` or `browser_crash` and are fatal. A later successful close returns exit 0. Cancellation returns exit 130. Browser launch/crash, CDP protocol, recording, artifact, inspection, disposal, browser shutdown, and session transport failures are fatal and return exit 4. A fatal infrastructure failure takes precedence over cancellation when both occur.
 
 ## Versioning
 
