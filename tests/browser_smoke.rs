@@ -130,12 +130,29 @@ impl FixtureServer {
                         stream.set_nonblocking(false)?;
                         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
                         let mut request = [0; 4096];
-                        let _ = stream.read(&mut request)?;
-                        write!(
+                        match stream.read(&mut request) {
+                            Ok(0) => continue,
+                            Ok(_) => {}
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        if let Err(error) = write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
                             html.len()
-                        )?;
+                        ) && !matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ) {
+                            return Err(error);
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
