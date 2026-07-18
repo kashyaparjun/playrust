@@ -3,6 +3,9 @@ name = "playrust"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+description = "YAML-based Chromium browser testing automation"
+repository = "https://github.com/kashyaparjun/playrust"
+homepage = "https://github.com/kashyaparjun/playrust"
 
 [dependencies]
 anyhow = "1"

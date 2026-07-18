@@ -10,15 +10,33 @@ Playrust is a YAML-based web testing automation tool written in Rust. It runs se
 
 ## Install
 
-Build from source with Rust 1.89 or newer:
+Download the archive and matching `.sha256` file for your platform from the
+[GitHub release](https://github.com/kashyaparjun/playrust/releases). Verify it,
+extract it, and place `playrust` (or `playrust.exe`) on your `PATH`:
 
 ```sh
-cargo build --release
-cargo install --path .
-playrust browser install
+shasum -a 256 -c playrust-v*-*.sha256
 ```
 
-`playrust run` automatically installs pinned Chrome for Testing `151.0.7922.34` if needed. You can instead provide that exact build with `--browser PATH` or `PLAYRUST_CHROME`. Supported installation targets are Linux x86_64, macOS arm64/x86_64, and Windows x86_64.
+On Windows, compare `Get-FileHash .\playrust-v*-*.zip -Algorithm SHA256` with
+the checksum file. Release archives support Linux x86_64, macOS arm64/x86_64,
+and Windows x86_64.
+
+Alternatively, install a tagged version from source with Rust 1.89 or newer:
+
+```sh
+cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.1.0 playrust
+```
+
+For a local checkout:
+
+```sh
+cargo install --path .
+```
+
+Run `playrust browser install` to preinstall the browser. `playrust run` also
+installs pinned Chrome for Testing `151.0.7922.34` automatically if needed. You
+can instead provide that exact build with `--browser PATH` or `PLAYRUST_CHROME`.
 
 ## Quick start
 
