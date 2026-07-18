@@ -4,7 +4,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::browser::BrowserHost;
 use crate::browser_session::BrowserSession;
@@ -14,6 +14,9 @@ use crate::report::{
     write_aggregate_report,
 };
 use crate::runner::{CancellationToken, RunOptions};
+
+/// Maximum bytes before the newline in one NDJSON command envelope.
+pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -156,17 +159,32 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         artifacts: session_artifacts,
     };
     let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut input = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
     let mut session = None;
     let mut close_session = false;
+    let mut exit_code = ExitCode::Success;
 
     while !close_session {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
+        let line = match read_envelope(&mut input).await {
+            Ok(Envelope::Line(line)) => line,
+            Ok(Envelope::TooLarge) => {
+                let response = state.error(
+                    Value::Null,
+                    "envelope_too_large",
+                    format!("command envelope exceeds {MAX_ENVELOPE_BYTES} bytes"),
+                    Some(json!({ "max_bytes": MAX_ENVELOPE_BYTES })),
+                );
+                if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
+                    break;
+                }
+                continue;
+            }
+            Ok(Envelope::Eof) => break,
             Err(error) => {
                 eprintln!("error: read session command: {error}");
+                exit_code = ExitCode::Infrastructure;
                 break;
             }
         };
@@ -175,9 +193,9 @@ pub async fn run(options: SessionOptions) -> ExitCode {
             Err((id, message)) => {
                 let response = state.error(id, "invalid_command", message, None);
                 if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
                     break;
                 }
-                close_session = true;
                 continue;
             }
         };
@@ -199,6 +217,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         let response =
                             state.error(request.id, "validation", error.to_string(), None);
                         if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
                             break;
                         }
                         continue;
@@ -214,6 +233,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         None,
                     );
                     if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
                         break;
                     }
                     continue;
@@ -224,7 +244,10 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         Err(error) => {
                             let response =
                                 state.error(request.id, "browser", error.to_string(), None);
-                            let _ = write_response(&mut stdout, &response).await;
+                            if write_response(&mut stdout, &response).await.is_err() {
+                                eprintln!("error: write session response");
+                            }
+                            exit_code = ExitCode::Infrastructure;
                             close_session = true;
                             continue;
                         }
@@ -251,59 +274,72 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     &compiled,
                     &run_options,
                 ));
-                let mut requested_close = false;
+                let mut requested_close = None;
+                let mut input_closed = false;
                 let report = loop {
                     tokio::select! {
                         report = &mut execution => break report,
-                        command = lines.next_line() => {
+                        command = read_envelope(&mut input), if requested_close.is_none() && !input_closed => {
                             let response = match command {
-                                Ok(Some(line)) => match decode_request(&line) {
+                                Ok(Envelope::Line(line)) => match decode_request(&line) {
                                     Ok(Request { id, command: SessionCommand::Cancel }) => {
                                         cancellation.cancel();
-                                        state.response(id, json!({ "cancelling": true }))
+                                        Some(state.response(id, json!({ "cancelling": true })))
                                     }
                                     Ok(Request { id, command: SessionCommand::Close }) => {
                                         cancellation.cancel();
-                                        requested_close = true;
-                                        state.response(id, json!({ "closing": true }))
+                                        requested_close = Some(id);
+                                        None
                                     }
-                                    Ok(Request { id, .. }) => state.error(
+                                    Ok(Request { id, .. }) => Some(state.error(
                                         id,
                                         "busy",
                                         "one mutating submission is already active",
                                         None,
-                                    ),
-                                    Err((id, message)) => {
-                                        cancellation.cancel();
-                                        requested_close = true;
-                                        state.error(id, "invalid_command", message, None)
-                                    }
+                                    )),
+                                    Err((id, message)) => Some(state.error(
+                                        id,
+                                        "invalid_command",
+                                        message,
+                                        None,
+                                    )),
                                 },
-                                Ok(None) => {
+                                Ok(Envelope::TooLarge) => Some(state.error(
+                                    Value::Null,
+                                    "envelope_too_large",
+                                    format!("command envelope exceeds {MAX_ENVELOPE_BYTES} bytes"),
+                                    Some(json!({ "max_bytes": MAX_ENVELOPE_BYTES })),
+                                )),
+                                Ok(Envelope::Eof) => {
                                     cancellation.cancel();
-                                    requested_close = true;
-                                    continue;
+                                    input_closed = true;
+                                    None
                                 }
                                 Err(error) => {
                                     eprintln!("error: read session command: {error}");
                                     cancellation.cancel();
-                                    requested_close = true;
-                                    continue;
+                                    exit_code = ExitCode::Infrastructure;
+                                    input_closed = true;
+                                    None
                                 }
                             };
-                            if write_response(&mut stdout, &response).await.is_err() {
+                            if let Some(response) = response
+                                && write_response(&mut stdout, &response).await.is_err()
+                            {
                                 cancellation.cancel();
-                                requested_close = true;
+                                exit_code = ExitCode::Infrastructure;
                             }
                         }
                     }
                 };
+                drop(execution);
                 let report = match report {
                     Ok(report) => report,
                     Err(error) => {
                         let response =
                             state.error(request.id, "settings_conflict", error.to_string(), None);
                         if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
                             close_session = true;
                         }
                         continue;
@@ -318,19 +354,31 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         Some(json!(report)),
                     );
                     let _ = write_response(&mut stdout, &response).await;
+                    exit_code = ExitCode::Infrastructure;
+                    if let Some(close_id) = requested_close {
+                        let response = match session.take() {
+                            Some(opened) => match opened.close(&host).await {
+                                Ok(()) => state.response(close_id, json!({ "closed": true })),
+                                Err(close_error) => {
+                                    state.error(close_id, "browser", close_error.to_string(), None)
+                                }
+                            },
+                            None => state.response(close_id, json!({ "closed": true })),
+                        };
+                        let _ = write_response(&mut stdout, &response).await;
+                    }
                     close_session = true;
                     continue;
                 }
-                let fatal = report.status == FlowStatus::Interrupted
-                    || report.failures.iter().any(|failure| {
-                        matches!(
-                            failure.category,
-                            crate::report::FailureCategory::BrowserLaunch
-                                | crate::report::FailureCategory::BrowserCrash
-                                | crate::report::FailureCategory::Protocol
-                                | crate::report::FailureCategory::Recording
-                        )
-                    });
+                let fatal = report.failures.iter().any(|failure| {
+                    matches!(
+                        failure.category,
+                        crate::report::FailureCategory::BrowserLaunch
+                            | crate::report::FailureCategory::BrowserCrash
+                            | crate::report::FailureCategory::Protocol
+                            | crate::report::FailureCategory::Recording
+                    )
+                });
                 let response = if report.status == FlowStatus::Passed {
                     state.response(request.id, json!(report))
                 } else {
@@ -338,6 +386,8 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         request.id,
                         if report.status == FlowStatus::Interrupted {
                             "cancelled"
+                        } else if fatal {
+                            "browser"
                         } else {
                             "submission_failed"
                         },
@@ -346,9 +396,34 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     )
                 };
                 if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
                     close_session = true;
                 }
-                close_session |= fatal || requested_close;
+                if fatal {
+                    exit_code = ExitCode::Infrastructure;
+                } else if report.status == FlowStatus::Interrupted
+                    && exit_code != ExitCode::Infrastructure
+                {
+                    exit_code = ExitCode::Interrupted;
+                }
+                if let Some(close_id) = requested_close {
+                    let response = match session.take() {
+                        Some(opened) => match opened.close(&host).await {
+                            Ok(()) => state.response(close_id, json!({ "closed": true })),
+                            Err(error) => {
+                                exit_code = ExitCode::Infrastructure;
+                                state.error(close_id, "browser", error.to_string(), None)
+                            }
+                        },
+                        None => state.response(close_id, json!({ "closed": true })),
+                    };
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                    }
+                    close_session = true;
+                } else {
+                    close_session |= fatal || report.status == FlowStatus::Interrupted;
+                }
             }
             SessionCommand::Inspect {
                 accessibility,
@@ -362,6 +437,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         None,
                     );
                     if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
                         break;
                     }
                     continue;
@@ -379,12 +455,14 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     Ok(inspection) => {
                         let response = state.response(request.id, json!(inspection));
                         if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
                             break;
                         }
                     }
                     Err(error) => {
                         let response = state.error(request.id, "browser", error.to_string(), None);
                         let _ = write_response(&mut stdout, &response).await;
+                        exit_code = ExitCode::Infrastructure;
                         close_session = true;
                     }
                 }
@@ -403,6 +481,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     ),
                 };
                 if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
                     break;
                 }
             }
@@ -410,6 +489,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 let response =
                     state.error(request.id, "not_active", "no submission is active", None);
                 if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
                     break;
                 }
             }
@@ -419,11 +499,14 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 {
                     let response = state.error(request.id, "browser", error.to_string(), None);
                     let _ = write_response(&mut stdout, &response).await;
+                    exit_code = ExitCode::Infrastructure;
                     close_session = true;
                     continue;
                 }
                 let response = state.response(request.id, json!({ "closed": true }));
-                let _ = write_response(&mut stdout, &response).await;
+                if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
+                }
                 close_session = true;
             }
         }
@@ -433,18 +516,63 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         && let Err(error) = opened.close(&host).await
     {
         eprintln!("error: close browser session: {error}");
+        exit_code = ExitCode::Infrastructure;
     }
     if let Err(error) = host.shutdown().await {
         eprintln!("error: shut down Chromium: {error}");
-        ExitCode::Infrastructure
-    } else {
-        ExitCode::Success
+        exit_code = ExitCode::Infrastructure;
+    }
+    exit_code
+}
+
+enum Envelope {
+    Line(Vec<u8>),
+    TooLarge,
+    Eof,
+}
+
+async fn read_envelope(reader: &mut (impl AsyncBufRead + Unpin)) -> std::io::Result<Envelope> {
+    let mut line = Vec::with_capacity(8192);
+    let mut too_large = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() && !too_large {
+                Envelope::Eof
+            } else if too_large {
+                Envelope::TooLarge
+            } else {
+                Envelope::Line(line)
+            });
+        }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let content_end = end - usize::from(available[end - 1] == b'\n');
+        if !too_large {
+            let remaining = MAX_ENVELOPE_BYTES - line.len();
+            if content_end > remaining {
+                too_large = true;
+            } else {
+                line.extend_from_slice(&available[..content_end]);
+            }
+        }
+        let complete = available[end - 1] == b'\n';
+        reader.consume(end);
+        if complete {
+            return Ok(if too_large {
+                Envelope::TooLarge
+            } else {
+                Envelope::Line(line)
+            });
+        }
     }
 }
 
-fn decode_request(line: &str) -> Result<Request, (Value, String)> {
+fn decode_request(line: &[u8]) -> Result<Request, (Value, String)> {
     let value: Value =
-        serde_json::from_str(line).map_err(|error| (Value::Null, error.to_string()))?;
+        serde_json::from_slice(line).map_err(|error| (Value::Null, error.to_string()))?;
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     serde_json::from_value(value).map_err(|error| (id, error.to_string()))
 }
@@ -473,11 +601,37 @@ mod tests {
 
     #[test]
     fn requests_preserve_ids_and_reject_unknown_commands() {
-        let request = decode_request(r#"{"id":"a","command":"output","name":"value"}"#)
+        let request = decode_request(br#"{"id":"a","command":"output","name":"value"}"#)
             .expect("decode request");
         assert_eq!(request.id, "a");
-        let error = decode_request(r#"{"id":7,"command":"unknown"}"#).unwrap_err();
+        let error = decode_request(br#"{"id":7,"command":"unknown"}"#).unwrap_err();
         assert_eq!(error.0, 7);
+    }
+
+    #[tokio::test]
+    async fn envelope_reader_bounds_and_recovers_at_the_next_line() {
+        let mut bytes = vec![b'x'; MAX_ENVELOPE_BYTES + 1];
+        bytes.extend_from_slice(b"\n{}\n");
+        let mut reader = BufReader::new(bytes.as_slice());
+
+        assert!(matches!(
+            read_envelope(&mut reader).await.unwrap(),
+            Envelope::TooLarge
+        ));
+        let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
+            panic!("expected line after oversized envelope");
+        };
+        assert_eq!(line, b"{}");
+    }
+
+    #[tokio::test]
+    async fn envelope_reader_accepts_the_documented_limit() {
+        let bytes = vec![b' '; MAX_ENVELOPE_BYTES];
+        let mut reader = BufReader::new(bytes.as_slice());
+        let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
+            panic!("expected maximum-sized line");
+        };
+        assert_eq!(line.len(), MAX_ENVELOPE_BYTES);
     }
 
     #[test]

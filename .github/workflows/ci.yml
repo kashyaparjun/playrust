@@ -67,6 +67,7 @@ jobs:
           --test long_press_e2e
           --test recording_controls_e2e
           --test scripting_e2e
+          --test session_e2e
           --test scroll_until_visible_e2e
           --test storage_clearing_e2e
           --test swipe_e2e

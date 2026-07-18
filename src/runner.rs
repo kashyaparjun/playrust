@@ -455,7 +455,7 @@ impl SessionRuntime {
 
     pub(crate) async fn close(mut self, host: &BrowserHost) -> anyhow::Result<()> {
         if let Some(router) = self.active.router.take() {
-            let _ = tokio::time::timeout(SECONDARY_TIMEOUT, router.close()).await;
+            router.close().await;
         }
         host.dispose_context(self.context.take().expect("open session context"))
             .await
