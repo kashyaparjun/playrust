@@ -4268,7 +4268,6 @@ steps:
                 "only field",
             ),
             ("{ run: ./child.yaml }", ".subflow.yaml"),
-            ("{ run: /tmp/child.subflow.yaml }", "must be relative"),
         ] {
             fs::write(&root, format!("version: 1\nname: root\nsteps: [{step}]\n")).unwrap();
             let message = compile_file(&root, &BTreeMap::new())
@@ -4276,6 +4275,21 @@ steps:
                 .to_string();
             assert!(message.contains(expected), "{message}");
         }
+        let absolute_child = std::env::temp_dir().join("child.subflow.yaml");
+        fs::write(
+            &root,
+            format!(
+                "version: 1\nname: root\nsteps: [{{ run: '{}' }}]\n",
+                absolute_child.display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            compile_file(&root, &BTreeMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("must be relative")
+        );
         assert!(
             compile("version: 1\nname: memory\nsteps: [{ run: ./child.subflow.yaml }]\n")
                 .unwrap_err()

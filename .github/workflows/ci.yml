@@ -65,6 +65,7 @@ jobs:
         env:
           PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
           PLAYRUST_FFMPEG: /usr/bin/ffmpeg
+          PLAYRUST_NO_SANDBOX: "1"
         run: >-
           cargo test --locked
           --test browser_smoke

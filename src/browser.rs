@@ -147,6 +147,9 @@ impl BrowserHost {
             .chrome_executable(executable)
             .user_data_dir(profile.path())
             .viewport(Option::<ChromiumViewport>::None);
+        if std::env::var("PLAYRUST_NO_SANDBOX").as_deref() == Ok("1") {
+            config = config.no_sandbox();
+        }
         if headed {
             config = config.with_head();
         }
