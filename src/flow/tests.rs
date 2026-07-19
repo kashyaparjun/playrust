@@ -1040,6 +1040,41 @@ fn expands_nested_subflows_in_place_with_file_scoped_configuration() {
 }
 
 #[test]
+fn nested_subflows_validate_bounds_against_the_entrypoint_viewport() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root.yaml");
+    let child = directory.path().join("child.subflow.yaml");
+    let grandchild = directory.path().join("grandchild.subflow.yaml");
+    fs::write(
+        &child,
+        "version: 1\nname: child\nsteps: [{ run: ./grandchild.subflow.yaml }]\n",
+    )
+    .unwrap();
+    fs::write(
+        &grandchild,
+        "version: 1\nname: grandchild\nsteps: [{ click: { point: { x: 1400, y: 800 } } }]\n",
+    )
+    .unwrap();
+
+    fs::write(
+        &root,
+        "version: 1\nname: root\nsettings: { viewport: { width: 1601, height: 901 }, video: off }\nsteps: [{ run: ./child.subflow.yaml }]\n",
+    )
+    .unwrap();
+    assert!(compile_file(&root, &BTreeMap::new()).is_ok());
+
+    fs::write(
+        &root,
+        "version: 1\nname: root\nsettings: { viewport: { width: 800, height: 600 }, video: off }\nsteps: [{ run: ./child.subflow.yaml }]\n",
+    )
+    .unwrap();
+    let message = compile_file(&root, &BTreeMap::new())
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("outside viewport 800x600"), "{message}");
+}
+
+#[test]
 fn subflows_are_reusable_but_canonical_active_stack_cycles_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root.yaml");
@@ -1107,6 +1142,10 @@ fn rejects_unsafe_or_ambiguous_subflow_configuration() {
         ("{ timeout: 1s, run: ./child.subflow.yaml }", "only field"),
         (
             "{ run: ./child.subflow.yaml, open: https://x.test }",
+            "only field",
+        ),
+        (
+            "{ run: ./child.subflow.yaml, dialog: { action: accept } }",
             "only field",
         ),
         ("{ run: ./child.yaml }", ".subflow.yaml"),

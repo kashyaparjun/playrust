@@ -240,6 +240,40 @@ pub struct RawStep {
     pub assertion: Option<RawAssertion>,
 }
 
+impl RawStep {
+    fn operation_count(&self) -> usize {
+        [
+            self.run.is_some(),
+            self.open.is_some(),
+            self.click.is_some(),
+            self.double_click.is_some(),
+            self.fill.is_some(),
+            self.erase.is_some(),
+            self.select.is_some(),
+            self.scroll.is_some(),
+            self.scroll_until_visible.is_some(),
+            self.swipe.is_some(),
+            self.long_press.is_some(),
+            self.wait_until_visible.is_some(),
+            self.wait_until_stable.is_some(),
+            self.back.is_some(),
+            self.switch_page.is_some(),
+            self.switch_frame.is_some(),
+            self.press.is_some(),
+            self.screenshot.is_some(),
+            self.recording.is_some(),
+            self.dialog.is_some(),
+            self.clear.is_some(),
+            self.evaluate.is_some(),
+            self.request.is_some(),
+            self.assertion.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum RawRun {
@@ -1069,6 +1103,7 @@ fn compile_file_with_env_and_video(
     let mut state = ExpansionState {
         active: vec![(canonical, path.to_owned())],
         declared_cli_vars: BTreeSet::new(),
+        browser_settings: None,
     };
     let mut raw = read_flow(path)?;
     if let Some(video) = video {
@@ -1358,6 +1393,7 @@ fn compile_raw_inner(
 struct ExpansionState {
     active: Vec<(PathBuf, PathBuf)>,
     declared_cli_vars: BTreeSet<String>,
+    browser_settings: Option<(Viewport, VideoMode)>,
 }
 
 fn compile_raw_expanded(
@@ -1374,6 +1410,13 @@ fn compile_raw_expanded(
             "{}: subflows cannot set settings.viewport or settings.video",
             source_path.display()
         ));
+    }
+    if let Some((viewport, video)) = state.browser_settings {
+        raw.settings.viewport = Some(RawViewport {
+            width: viewport.width,
+            height: viewport.height,
+        });
+        raw.settings.video = Some(video);
     }
     if raw.steps.is_empty() {
         return invalid(format!(
@@ -1393,34 +1436,7 @@ fn compile_raw_expanded(
     for (offset, step) in raw.steps.iter_mut().enumerate() {
         step.source_index = Some(offset + 1);
         if let Some(run) = &step.run {
-            let operation_count = [
-                step.open.is_some(),
-                step.click.is_some(),
-                step.double_click.is_some(),
-                step.fill.is_some(),
-                step.erase.is_some(),
-                step.select.is_some(),
-                step.scroll.is_some(),
-                step.scroll_until_visible.is_some(),
-                step.swipe.is_some(),
-                step.long_press.is_some(),
-                step.wait_until_visible.is_some(),
-                step.wait_until_stable.is_some(),
-                step.back.is_some(),
-                step.switch_page.is_some(),
-                step.switch_frame.is_some(),
-                step.press.is_some(),
-                step.screenshot.is_some(),
-                step.recording.is_some(),
-                step.clear.is_some(),
-                step.evaluate.is_some(),
-                step.request.is_some(),
-                step.assertion.is_some(),
-            ]
-            .into_iter()
-            .filter(|present| *present)
-            .count();
-            if step.id.is_some() || step.timeout.is_some() || operation_count != 0 {
+            if step.id.is_some() || step.timeout.is_some() || step.operation_count() != 1 {
                 return invalid(format!(
                     "{}: step {} run must be the only field except when, while, repeat, and retry",
                     source_path.display(),
@@ -1473,6 +1489,9 @@ fn compile_raw_expanded(
         true,
     )
     .map_err(|error| with_path(&source_path, error))?;
+    if depth == 0 {
+        state.browser_settings = Some((flow.settings.viewport, flow.settings.video));
+    }
 
     let mut compiled = flow.steps.into_iter().peekable();
     let mut steps = Vec::new();
@@ -2200,35 +2219,7 @@ fn compile_operation(
     viewport: Viewport,
     inputs: &BTreeMap<String, Resolved<String>>,
 ) -> Result<Operation, FlowError> {
-    let operation_count = [
-        step.open.is_some(),
-        step.click.is_some(),
-        step.double_click.is_some(),
-        step.fill.is_some(),
-        step.erase.is_some(),
-        step.select.is_some(),
-        step.scroll.is_some(),
-        step.scroll_until_visible.is_some(),
-        step.swipe.is_some(),
-        step.long_press.is_some(),
-        step.wait_until_visible.is_some(),
-        step.wait_until_stable.is_some(),
-        step.back.is_some(),
-        step.switch_page.is_some(),
-        step.switch_frame.is_some(),
-        step.press.is_some(),
-        step.screenshot.is_some(),
-        step.recording.is_some(),
-        step.dialog.is_some(),
-        step.clear.is_some(),
-        step.evaluate.is_some(),
-        step.request.is_some(),
-        step.assertion.is_some(),
-    ]
-    .into_iter()
-    .filter(|present| *present)
-    .count();
-    if operation_count != 1 {
+    if step.operation_count() != 1 {
         return invalid(format!("step {index} must contain exactly one operation"));
     }
 

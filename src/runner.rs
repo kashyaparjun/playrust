@@ -52,7 +52,7 @@ use crate::flow::{
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
-    retryable, retryable_cdp_message, text_matches,
+    id_selector, retryable, retryable_cdp_message, text_matches,
 };
 use crate::oopif::{CdpTarget, OopifRouter};
 use crate::report::{
@@ -624,7 +624,7 @@ impl SessionRuntime {
             .filter(|value| stable_dom_id(value) && self.redactor.redact(value) == *value)
         {
             candidates.push(simple_locator(LocatorStrategy::Css(Resolved::new(
-                format!("#{}", css_identifier_escape(id)),
+                id_selector(id),
                 false,
             ))));
         }
@@ -653,7 +653,7 @@ impl SessionRuntime {
                     .filter(|value| stable_dom_id(value) && self.redactor.redact(value) == *value)
                     .map(|value| {
                         simple_locator(LocatorStrategy::Css(Resolved::new(
-                            format!("#{}", css_identifier_escape(value)),
+                            id_selector(value),
                             false,
                         )))
                     })
@@ -1099,18 +1099,6 @@ fn stable_dom_id(value: &str) -> bool {
         || value.len() >= 8 && value.chars().filter(char::is_ascii_digit).count() >= 6)
 }
 
-fn css_identifier_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|character| match character {
-            character if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') => {
-                vec![character]
-            }
-            character => vec!['\\', character],
-        })
-        .collect()
-}
-
 pub(crate) fn locator_json(locator: &Locator) -> Value {
     let mut object = serde_json::Map::new();
     match &locator.strategy {
@@ -1229,6 +1217,7 @@ async fn execute_flow(
     let page = active.page.clone();
 
     let mut primary = None;
+    let mut additional_failures = Vec::new();
     let mut redactor = std::mem::take(&mut session.redactor);
     redactor.extend(&flow.redactor);
     let mut runtime = RuntimeState {
@@ -1442,14 +1431,24 @@ async fn execute_flow(
             }
         }
         video_stop_at = Some(Instant::now());
-        let mut error = error.expect("failed attempt records an error");
+        let error = error.expect("failed attempt records an error");
         if let Some(visual) = &error.visual_artifacts {
             match publish_visual_artifacts(&options.artifact_directory, visual).await {
                 Ok(()) => {
                     artifacts.visual_actual = Some(path_text(&visual.actual_path));
                     artifacts.visual_diff = Some(path_text(&visual.diff_path));
                 }
-                Err(publication_error) => error = publication_error,
+                Err(publication_error) => additional_failures.push(
+                    step_failure(
+                        host,
+                        flow,
+                        &runtime.redactor,
+                        &active,
+                        step,
+                        publication_error,
+                    )
+                    .await,
+                ),
             }
         }
         artifacts.failure_screenshot =
@@ -1478,6 +1477,7 @@ async fn execute_flow(
     }
 
     let mut failures = primary.into_iter().collect::<Vec<_>>();
+    failures.append(&mut additional_failures);
     if let Some(error) = recording_error {
         failures.push(failure(flow, FailureCategory::Recording, error, None));
     }
@@ -2772,10 +2772,7 @@ async fn navigate_back(page: &Page, deadline: Instant) -> Result<(), StepError> 
         .await
         .map_err(protocol)?
         .result;
-    let target_index = history
-        .current_index
-        .checked_sub(1)
-        .ok_or_else(|| StepError::new(FailureCategory::Navigation, "no previous history entry"))?;
+    let target_index = previous_history_index(history.current_index)?;
     let target = history.entries.get(target_index as usize).ok_or_else(|| {
         StepError::new(
             FailureCategory::Protocol,
@@ -2813,6 +2810,13 @@ async fn navigate_back(page: &Page, deadline: Instant) -> Result<(), StepError> 
         }
         sleep_until_poll(deadline).await;
     }
+}
+
+fn previous_history_index(current_index: i64) -> Result<i64, StepError> {
+    current_index
+        .checked_sub(1)
+        .filter(|index| *index >= 0)
+        .ok_or_else(|| StepError::new(FailureCategory::Navigation, "no previous history entry"))
 }
 
 async fn dispatch_key(page: &Page, key: &Key, modifiers: &[Modifier]) -> Result<(), StepError> {

@@ -21,6 +21,37 @@ fn modifier_bits_follow_cdp() {
 }
 
 #[test]
+fn previous_history_index_rejects_the_first_entry() {
+    let error = previous_history_index(0).unwrap_err();
+    assert_eq!(error.category, FailureCategory::Navigation);
+    assert_eq!(error.message, "no previous history entry");
+    assert!(matches!(previous_history_index(1), Ok(0)));
+}
+
+#[tokio::test]
+async fn visual_publication_failure_does_not_replace_the_assertion() {
+    let directory = tempfile::tempdir().unwrap();
+    let blocked = directory.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let primary = StepError::assertion("visual screenshot assertion did not match").observed("5%");
+    let artifacts = VisualArtifacts {
+        actual_path: blocked.join("actual.png"),
+        diff_path: blocked.join("diff.png"),
+        actual_png: vec![1],
+        diff_png: vec![2],
+    };
+
+    let secondary = publish_visual_artifacts(&blocked, &artifacts)
+        .await
+        .unwrap_err();
+
+    assert_eq!(primary.category, FailureCategory::Assertion);
+    assert_eq!(primary.message, "visual screenshot assertion did not match");
+    assert_eq!(primary.last_observed.as_deref(), Some("5%"));
+    assert_eq!(secondary.category, FailureCategory::Protocol);
+}
+
+#[test]
 fn runtime_json_is_compact_secret_and_size_bounded() {
     let flow = compile_yaml_with_env(
             "version: 1\nname: x\nsteps:\n  - evaluate: { script: 'return 1', save_as: saved }\n  - fill: { target: { css: input }, value: 'prefix-${saved}' }\n",
@@ -607,6 +638,39 @@ async fn fill_replaces_all_supported_text_controls_in_chrome() {
         .unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(value, "replacement", "failed to replace #{id}");
     }
+
+    host.dispose_context(context).await.unwrap();
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn mixed_namespace_text_and_digit_ids_resolve_in_chrome() {
+    let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+    let host = BrowserHost::launch(chrome, false).await.unwrap();
+    let context = host
+        .create_context(Viewport::new(800, 600).unwrap(), None)
+        .await
+        .unwrap();
+    let page = context.page().clone();
+    page.set_content(
+        r#"<svg width="100" height="20"><text x="0" y="15">unrelated</text></svg>
+            <math><mtext>also unrelated</mtext></math>
+            <button id="2fa">Continue</button>"#,
+    )
+    .await
+    .unwrap();
+
+    let target = page.find_element(id_selector("2fa")).await.unwrap();
+    let locator = simple_locator(LocatorStrategy::Text {
+        value: Resolved::new("Continue".to_owned(), false),
+        match_kind: TextMatch::Exact,
+    });
+    let candidates = LocatorEngine::new(&page)
+        .resolve_all(&locator)
+        .await
+        .unwrap();
+    assert_eq!(candidates.backend_node_ids, [target.backend_node_id]);
 
     host.dispose_context(context).await.unwrap();
     host.shutdown().await.unwrap();

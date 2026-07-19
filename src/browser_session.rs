@@ -43,6 +43,7 @@ pub struct BrowserSession {
     dialogs: NativeDialogState,
     snapshots: SnapshotStore,
     recorder: Option<SessionRecorder>,
+    recording_enabled: bool,
     recording_warnings: Vec<String>,
 }
 
@@ -53,7 +54,8 @@ impl BrowserSession {
         let mut dialogs = NativeDialogState::new(options.dialog_policy);
         dialogs.bind(runtime.page()).await?;
         let mut recording_warnings = Vec::new();
-        let recorder = if options.video.enabled() {
+        let recording_enabled = options.video.enabled();
+        let recorder = if recording_enabled {
             let viewport = runtime.viewport();
             let config = VideoConfig {
                 mode: VideoMode::On,
@@ -78,6 +80,7 @@ impl BrowserSession {
             dialogs,
             snapshots: SnapshotStore::default(),
             recorder,
+            recording_enabled,
             recording_warnings,
         })
     }
@@ -302,22 +305,27 @@ impl BrowserSession {
         }
         let recording = match self.recorder.take() {
             Some(recorder) => recorder.finalize().await,
-            None => SessionRecordingFinish {
-                status: if self.recording_warnings.is_empty() {
-                    "off"
-                } else {
-                    "failed"
-                },
-                path: None,
-                partial_path: None,
-                warnings: self.recording_warnings.clone(),
-            },
+            None => {
+                missing_recording_finish(self.recording_enabled, self.recording_warnings.clone())
+            }
         };
         self.runtime.close(host).await?;
         Ok(BrowserSessionClose {
             warnings: self.recording_warnings,
             recording,
         })
+    }
+}
+
+fn missing_recording_finish(
+    recording_enabled: bool,
+    warnings: Vec<String>,
+) -> SessionRecordingFinish {
+    SessionRecordingFinish {
+        status: if recording_enabled { "failed" } else { "off" },
+        path: None,
+        partial_path: None,
+        warnings,
     }
 }
 
@@ -354,5 +362,18 @@ fn redact_json(value: &mut Value, runtime: &SessionRuntime) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_off_stays_off_when_unrelated_warnings_exist() {
+        let finish = missing_recording_finish(false, vec!["dialog warning".to_owned()]);
+        assert_eq!(finish.status, "off");
+        assert_eq!(finish.warnings, ["dialog warning"]);
+        assert_eq!(missing_recording_finish(true, Vec::new()).status, "failed");
     }
 }

@@ -26,6 +26,7 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const TEXT_MATCH_FUNCTION: &str = r#"function(expected, exact) {
     const normalize = value => value.replace(/\s+/gu, ' ').trim();
+    const text = element => element.innerText ?? element.textContent ?? '';
     const visible = element => {
         if (!element.isConnected || element.getClientRects().length === 0) return false;
         const ownStyle = getComputedStyle(element);
@@ -38,9 +39,9 @@ const TEXT_MATCH_FUNCTION: &str = r#"function(expected, exact) {
         return true;
     };
     const matches = value => exact ? value === expected : value.includes(expected);
-    if (!visible(this) || !matches(normalize(this.innerText))) return false;
+    if (!visible(this) || !matches(normalize(text(this)))) return false;
     return !Array.from(this.querySelectorAll('*')).some(element =>
-        visible(element) && matches(normalize(element.innerText))
+        visible(element) && matches(normalize(text(element)))
     );
 }"#;
 
@@ -893,6 +894,10 @@ pub fn test_id_selector(test_id: &str) -> String {
     format!("[data-testid=\"{}\"]", css_string_escape(test_id))
 }
 
+pub(crate) fn id_selector(id: &str) -> String {
+    format!("[id=\"{}\"]", css_string_escape(id))
+}
+
 fn css_string_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -1045,6 +1050,8 @@ mod tests {
             "[data-testid=\"quote\\\" slash\\\\ line\\a end\"]"
         );
         assert_eq!(test_id_selector("nul\0id"), "[data-testid=\"nul�id\"]");
+        assert_eq!(id_selector("2fa"), "[id=\"2fa\"]");
+        assert_eq!(id_selector("quote\"slash\\"), "[id=\"quote\\\"slash\\\\\"]");
     }
 
     #[test]
@@ -1065,6 +1072,7 @@ mod tests {
             TextMatch::Contains
         ));
         assert!(!text_matches("sign in", "Sign in", TextMatch::Exact));
+        assert!(TEXT_MATCH_FUNCTION.contains("innerText ?? element.textContent ?? ''"));
     }
 
     #[test]

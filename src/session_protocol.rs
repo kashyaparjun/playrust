@@ -312,13 +312,13 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         }
     }
     let stdin = tokio::io::stdin();
-    let mut input = BufReader::new(stdin);
+    let mut input = EnvelopeReader::new(BufReader::new(stdin));
     let mut stdout = tokio::io::stdout();
     let mut close_session = false;
     let mut exit_code = ExitCode::Success;
 
     while !close_session {
-        let line = match read_envelope(&mut input).await {
+        let line = match input.read_envelope().await {
             Ok(Envelope::Line(line)) => line,
             Ok(Envelope::TooLarge) => {
                 let response = state.error(
@@ -405,6 +405,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     continue;
                 }
                 compiled.settings.video = VideoMode::Off;
+                register_flow_secrets(&mut state.journal, &compiled);
 
                 state.submissions += 1;
                 let directory = state
@@ -432,7 +433,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 let report = loop {
                     tokio::select! {
                         report = &mut execution => break report,
-                        command = read_envelope(&mut input), if requested_close.is_none() && !input_closed => {
+                        command = input.read_envelope(), if requested_close.is_none() && !input_closed => {
                             let response = match command {
                                 Ok(Envelope::Line(line)) => match decode_request(&line) {
                                     Ok(Request { id, command: SessionCommand::Cancel }) => {
@@ -812,6 +813,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         continue;
                     }
                 };
+                register_flow_secrets(&mut state.journal, &flow);
                 if let Some(backend_node_id) = backend_node_id {
                     match opened.reference_matches(&flow, backend_node_id).await {
                         Ok(true) => {}
@@ -1281,6 +1283,12 @@ fn compile_interactive(step: &Value, session: &BrowserSession) -> Result<Compile
     .map_err(|error| error.to_string())
 }
 
+fn register_flow_secrets(journal: &mut JournalWriter, flow: &CompiledFlow) {
+    for value in flow.inputs.values().filter(|value| value.is_secret()) {
+        journal.register_secret(value.expose().clone());
+    }
+}
+
 fn replace_environment_values(
     value: &mut Value,
     secrets: &mut serde_json::Map<String, Value>,
@@ -1358,7 +1366,7 @@ fn export_bundle(
         message: error.to_string(),
         details: None,
     })?;
-    compile_inline_yaml(
+    let replay_flow = compile_inline_yaml(
         &replay.yaml,
         bundle.join("replay.yaml"),
         &BTreeMap::new(),
@@ -1369,6 +1377,7 @@ fn export_bundle(
         message: error.to_string(),
         details: None,
     })?;
+    register_flow_secrets(&mut state.journal, &replay_flow);
     if state.bundle.as_ref() != Some(&bundle) {
         match fs::create_dir(&bundle) {
             Ok(()) => {}
@@ -1523,41 +1532,57 @@ enum Envelope {
     Eof,
 }
 
-async fn read_envelope(reader: &mut (impl AsyncBufRead + Unpin)) -> std::io::Result<Envelope> {
-    let mut line = Vec::with_capacity(8192);
-    let mut too_large = false;
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(if line.is_empty() && !too_large {
-                Envelope::Eof
-            } else if too_large {
-                Envelope::TooLarge
-            } else {
-                Envelope::Line(line)
-            });
+struct EnvelopeReader<R> {
+    reader: R,
+    line: Vec<u8>,
+    too_large: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> EnvelopeReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            line: Vec::with_capacity(8192),
+            too_large: false,
         }
-        let end = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        let content_end = end - usize::from(available[end - 1] == b'\n');
-        if !too_large {
-            let remaining = MAX_ENVELOPE_BYTES - line.len();
-            if content_end > remaining {
-                too_large = true;
-            } else {
-                line.extend_from_slice(&available[..content_end]);
+    }
+
+    async fn read_envelope(&mut self) -> io::Result<Envelope> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.line.is_empty() && !self.too_large {
+                    return Ok(Envelope::Eof);
+                }
+                return Ok(self.take_envelope());
+            }
+            let end = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            let complete = available[end - 1] == b'\n';
+            let content_end = end - usize::from(complete);
+            if !self.too_large {
+                let remaining = MAX_ENVELOPE_BYTES - self.line.len();
+                if content_end > remaining {
+                    self.too_large = true;
+                } else {
+                    self.line.extend_from_slice(&available[..content_end]);
+                }
+            }
+            self.reader.consume(end);
+            if complete {
+                return Ok(self.take_envelope());
             }
         }
-        let complete = available[end - 1] == b'\n';
-        reader.consume(end);
-        if complete {
-            return Ok(if too_large {
-                Envelope::TooLarge
-            } else {
-                Envelope::Line(line)
-            });
+    }
+
+    fn take_envelope(&mut self) -> Envelope {
+        if std::mem::take(&mut self.too_large) {
+            self.line.clear();
+            Envelope::TooLarge
+        } else {
+            Envelope::Line(std::mem::replace(&mut self.line, Vec::with_capacity(8192)))
         }
     }
 }
@@ -1659,13 +1684,13 @@ mod tests {
     async fn envelope_reader_bounds_and_recovers_at_the_next_line() {
         let mut bytes = vec![b'x'; MAX_ENVELOPE_BYTES + 1];
         bytes.extend_from_slice(b"\n{}\n");
-        let mut reader = BufReader::new(bytes.as_slice());
+        let mut reader = EnvelopeReader::new(BufReader::new(bytes.as_slice()));
 
         assert!(matches!(
-            read_envelope(&mut reader).await.unwrap(),
+            reader.read_envelope().await.unwrap(),
             Envelope::TooLarge
         ));
-        let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
+        let Envelope::Line(line) = reader.read_envelope().await.unwrap() else {
             panic!("expected line after oversized envelope");
         };
         assert_eq!(line, b"{}");
@@ -1675,8 +1700,8 @@ mod tests {
     async fn envelope_reader_accepts_the_documented_limit() {
         let mut bytes = vec![b' '; MAX_ENVELOPE_BYTES];
         bytes.push(b'\n');
-        let mut reader = BufReader::new(bytes.as_slice());
-        let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
+        let mut reader = EnvelopeReader::new(BufReader::new(bytes.as_slice()));
+        let Envelope::Line(line) = reader.read_envelope().await.unwrap() else {
             panic!("expected maximum-sized line");
         };
         assert_eq!(line.len(), MAX_ENVELOPE_BYTES);
@@ -1686,8 +1711,8 @@ mod tests {
     async fn envelope_reader_counts_cr_and_accepts_crlf() {
         let mut accepted = vec![b' '; MAX_ENVELOPE_BYTES - 1];
         accepted.extend_from_slice(b"\r\n");
-        let mut reader = BufReader::new(accepted.as_slice());
-        let Envelope::Line(line) = read_envelope(&mut reader).await.unwrap() else {
+        let mut reader = EnvelopeReader::new(BufReader::new(accepted.as_slice()));
+        let Envelope::Line(line) = reader.read_envelope().await.unwrap() else {
             panic!("expected CRLF line at the limit");
         };
         assert_eq!(line.len(), MAX_ENVELOPE_BYTES);
@@ -1695,11 +1720,58 @@ mod tests {
 
         let mut rejected = vec![b' '; MAX_ENVELOPE_BYTES];
         rejected.extend_from_slice(b"\r\n");
-        let mut reader = BufReader::new(rejected.as_slice());
+        let mut reader = EnvelopeReader::new(BufReader::new(rejected.as_slice()));
         assert!(matches!(
-            read_envelope(&mut reader).await.unwrap(),
+            reader.read_envelope().await.unwrap(),
             Envelope::TooLarge
         ));
+    }
+
+    #[tokio::test]
+    async fn envelope_reader_preserves_partial_input_when_a_read_is_cancelled() {
+        let (read, mut write) = tokio::io::duplex(256);
+        let mut reader = EnvelopeReader::new(BufReader::new(read));
+        write
+            .write_all(b"{\"id\":\"cancel\",\"command\":\"")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), reader.read_envelope())
+                .await
+                .is_err()
+        );
+
+        write.write_all(b"cancel\"}\n").await.unwrap();
+        let Envelope::Line(line) = reader.read_envelope().await.unwrap() else {
+            panic!("expected completed envelope");
+        };
+        let request = decode_request(&line).unwrap();
+        assert!(matches!(request.command, SessionCommand::Cancel));
+        assert_eq!(request.id, "cancel");
+    }
+
+    #[test]
+    fn compiled_secrets_are_registered_with_the_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.ndjson");
+        let flow = crate::flow::compile_yaml_with_env(
+            "version: 1\nname: test\nsecrets: { password: { env: TEST_PASSWORD } }\nsteps: [{ open: https://example.test }]\n",
+            "test.yaml",
+            &BTreeMap::new(),
+            &BTreeMap::from([("TEST_PASSWORD".to_owned(), "secret-canary".to_owned())]),
+        )
+        .unwrap();
+        let mut journal = JournalWriter::open(&path).unwrap();
+        register_flow_secrets(&mut journal, &flow);
+        journal
+            .append(&JournalEvent::RecorderWarning {
+                warning: "value=secret-canary".to_owned(),
+            })
+            .unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("[REDACTED]"));
+        assert!(!contents.contains("secret-canary"));
     }
 
     #[test]
