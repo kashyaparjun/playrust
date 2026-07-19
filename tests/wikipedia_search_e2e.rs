@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use playrust::report::{AggregateStatus, FlowStatus};
-use support::{assert_png, assert_success, assert_vp9_video, ffmpeg_path, playrust, read_report};
+use support::{assert_h264_video, assert_png, assert_success, ffmpeg_path, playrust, read_report};
 
 const FLOW: &str = r##"version: 1
 name: wikipedia-search
@@ -99,7 +99,7 @@ fn search_flow_exercises_interactions_assertions_and_default_video() {
     let flow = &report.flows[0];
     assert_eq!(flow.status, FlowStatus::Passed);
     assert_png(Path::new(&flow.artifacts.screenshots[0]), (1280, 720));
-    assert_vp9_video(Path::new(
+    assert_h264_video(Path::new(
         flow.artifacts.recording.as_deref().expect("recording"),
     ));
 

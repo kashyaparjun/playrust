@@ -138,6 +138,14 @@ pub struct BrowserHost {
 
 impl BrowserHost {
     pub async fn launch(executable: impl AsRef<Path>, headed: bool) -> Result<Self> {
+        Self::launch_with_window(executable, headed, None).await
+    }
+
+    pub async fn launch_with_window(
+        executable: impl AsRef<Path>,
+        headed: bool,
+        window_size: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let profile = tempfile::Builder::new()
             .prefix("playrust-chromium-")
             .tempdir()
@@ -152,6 +160,9 @@ impl BrowserHost {
         }
         if headed {
             config = config.with_head();
+        }
+        if let Some((width, height)) = window_size {
+            config = config.window_size(width, height);
         }
         let config = config.build().map_err(anyhow::Error::msg)?;
         let (mut browser, mut handler) =

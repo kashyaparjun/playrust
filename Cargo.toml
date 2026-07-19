@@ -1,9 +1,9 @@
 [package]
 name = "playrust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-description = "YAML-based Chromium browser testing automation"
+description = "Chromium browser runtime for AI agents with audited, secret-safe, replayable sessions"
 repository = "https://github.com/kashyaparjun/playrust"
 homepage = "https://github.com/kashyaparjun/playrust"
 

@@ -232,6 +232,7 @@ pub struct RawStep {
     pub press: Option<RawPress>,
     pub screenshot: Option<RawScreenshot>,
     pub recording: Option<RecordingControl>,
+    pub dialog: Option<RawDialog>,
     pub clear: Option<ClearTarget>,
     pub evaluate: Option<RawEvaluate>,
     pub request: Option<RawRequest>,
@@ -407,6 +408,20 @@ pub struct RawLongPress {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawEmpty {}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawDialog {
+    pub action: NativeDialogResponse,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeDialogResponse {
+    Accept,
+    Dismiss,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -722,6 +737,10 @@ pub enum Operation {
         crop: Option<Crop>,
     },
     Recording(RecordingControl),
+    Dialog {
+        action: NativeDialogResponse,
+        text: Option<RuntimeValue>,
+    },
     Clear(ClearTarget),
     Evaluate {
         script: String,
@@ -951,9 +970,22 @@ pub fn compile_inline_yaml(
     cli_vars: &BTreeMap<String, String>,
     available_outputs: &BTreeSet<String>,
 ) -> Result<CompiledFlow, FlowError> {
+    compile_inline_yaml_with_video(source, source_path, cli_vars, available_outputs, None)
+}
+
+pub fn compile_inline_yaml_with_video(
+    source: &str,
+    source_path: impl Into<PathBuf>,
+    cli_vars: &BTreeMap<String, String>,
+    available_outputs: &BTreeSet<String>,
+    video: Option<VideoMode>,
+) -> Result<CompiledFlow, FlowError> {
     let environment = std::env::vars().collect();
     require_source_size(source.len())?;
-    let raw = parse_yaml(source)?;
+    let mut raw = parse_yaml(source)?;
+    if let Some(video) = video {
+        raw.settings.video = Some(video);
+    }
     if let Some((index, _)) = raw
         .steps
         .iter()
@@ -1769,6 +1801,9 @@ fn operation_runtime_values(operation: &Operation) -> Box<dyn Iterator<Item = &R
         Operation::Fill { value, .. } | Operation::Select { value, .. } => {
             Box::new(std::iter::once(value))
         }
+        Operation::Dialog {
+            text: Some(value), ..
+        } => Box::new(std::iter::once(value)),
         Operation::Evaluate { args, .. } => Box::new(args.iter()),
         Operation::Request {
             url, headers, body, ..
@@ -2184,6 +2219,7 @@ fn compile_operation(
         step.press.is_some(),
         step.screenshot.is_some(),
         step.recording.is_some(),
+        step.dialog.is_some(),
         step.clear.is_some(),
         step.evaluate.is_some(),
         step.request.is_some(),
@@ -2438,6 +2474,23 @@ fn compile_operation(
     }
     if let Some(control) = step.recording {
         return Ok(Operation::Recording(control));
+    }
+    if let Some(raw) = step.dialog {
+        if raw.text.is_some() && raw.action != NativeDialogResponse::Accept {
+            return invalid(format!(
+                "step {index} dialog text is only valid with action accept"
+            ));
+        }
+        return Ok(Operation::Dialog {
+            action: raw.action,
+            text: raw
+                .text
+                .as_deref()
+                .map(|text| {
+                    compile_runtime_value(&format!("step {index} dialog.text"), text, inputs)
+                })
+                .transpose()?,
+        });
     }
     if let Some(target) = step.clear {
         return Ok(Operation::Clear(target));
@@ -2981,7 +3034,7 @@ fn push_interpolated(context: &str, output: &mut String, value: &str) -> Result<
     Ok(())
 }
 
-fn parse_duration(context: &str, value: &str) -> Result<Duration, FlowError> {
+pub fn parse_duration(context: &str, value: &str) -> Result<Duration, FlowError> {
     let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
         (number, 1_u128)
     } else if let Some(number) = value.strip_suffix('s') {
@@ -3604,6 +3657,32 @@ steps:
                 "accepted clear value {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn native_dialog_responses_compile_and_validate_prompt_text() {
+        let flow = compile(
+            "version: 1\nname: dialogs\nvars: { answer: yes }\nsteps:\n  - dialog: { action: accept }\n  - dialog: { action: accept, text: '${answer}' }\n  - dialog: { action: dismiss }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            flow.steps[0].operation,
+            Operation::Dialog {
+                action: NativeDialogResponse::Accept,
+                text: None
+            }
+        ));
+        assert!(matches!(
+            flow.steps[2].operation,
+            Operation::Dialog {
+                action: NativeDialogResponse::Dismiss,
+                text: None
+            }
+        ));
+        assert!(
+            error("version: 1\nname: dialog\nsteps: [{ dialog: { action: dismiss, text: no } }]\n")
+                .contains("only valid with action accept")
+        );
     }
 
     #[test]

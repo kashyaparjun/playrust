@@ -985,8 +985,8 @@ mod tests {
             failure_screenshot: Some("artifacts/failure.png".to_owned()),
             visual_actual: Some("artifacts/__visual-2-actual.png".to_owned()),
             visual_diff: Some("artifacts/__visual-2-diff.png".to_owned()),
-            recording: Some("artifacts/recording.webm".to_owned()),
-            partial_recording: Some("artifacts/recording.partial.webm".to_owned()),
+            recording: Some("artifacts/recording.mp4".to_owned()),
+            partial_recording: Some("artifacts/recording.partial.mp4".to_owned()),
         };
         let report = AggregateReport::new(
             RunnerInfo {

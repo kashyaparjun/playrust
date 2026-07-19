@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chromiumoxide::Page;
-use chromiumoxide::cdp::browser_protocol::accessibility::GetFullAxTreeParams;
+use chromiumoxide::cdp::browser_protocol::accessibility::{
+    AxNode, AxPropertyName, AxValue, GetFullAxTreeParams,
+};
 use chromiumoxide::cdp::browser_protocol::dom::{
     BackendNodeId, DescribeNodeParams, GetContentQuadsParams, GetFrameOwnerParams,
     ResolveNodeParams,
@@ -20,10 +22,10 @@ use chromiumoxide::cdp::browser_protocol::input::{
     InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, EventScreencastFrame, FrameId, GetFrameTreeParams,
-    GetNavigationHistoryParams, NavigateParams, NavigateToHistoryEntryParams,
-    ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams, StopScreencastParams,
-    Viewport as ScreenshotViewport,
+    CaptureScreenshotFormat, EventJavascriptDialogOpening, EventScreencastFrame, FrameId,
+    GetFrameTreeParams, GetNavigationHistoryParams, HandleJavaScriptDialogParams, NavigateParams,
+    NavigateToHistoryEntryParams, ScreencastFrameAckParams, StartScreencastFormat,
+    StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
 use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
@@ -32,6 +34,7 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 };
 use chromiumoxide::error::CdpError;
 use chromiumoxide::keys::get_key_definition;
+use chromiumoxide::listeners::EventStream;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -43,9 +46,9 @@ use tokio::sync::{Notify, oneshot};
 use crate::browser::{BrowserContext, BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
-    Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey, Operation,
-    PageSwitch, RecordingControl, Redactor, RelationKind, RelativePoint, Resolved, TextMatch,
-    UrlExpectation, VideoMode, VisualExpectation, When,
+    Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey,
+    NativeDialogResponse, Operation, PageSwitch, RecordingControl, Redactor, RelationKind,
+    RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation, When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -55,11 +58,15 @@ use crate::oopif::{CdpTarget, OopifRouter};
 use crate::report::{
     ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, SafeText, StepContext,
 };
+use crate::session_snapshot::{
+    Bounds as SnapshotBounds, CapturedElement, CapturedSnapshot, LocatorIdentity,
+    Scroll as SnapshotScroll, SemanticNode, SemanticState, Viewport as SnapshotViewport,
+};
 use crate::video::{VideoConfig, VideoRecorder};
 use crate::visual;
 
 const SCREENSHOT_NAME: &str = "failure.png";
-const RECORDING_NAME: &str = "recording.webm";
+const RECORDING_NAME: &str = "recording.mp4";
 const SECONDARY_TIMEOUT: Duration = Duration::from_secs(2);
 const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 const FINAL_FRAME_DELAY: Duration = Duration::from_millis(250);
@@ -69,6 +76,41 @@ const INSPECT_AX_BYTES: usize = 256 * 1024;
 const INSPECT_PAGES: usize = 100;
 const INSPECT_TEXT_CHARS: usize = 16 * 1024;
 const INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_AX_DEPTH: i64 = 32;
+const SNAPSHOT_ELEMENTS: usize = 250;
+const SNAPSHOT_TEXT_CHARS: usize = 500;
+
+const SNAPSHOT_NODE_FUNCTION: &str = r#"function() {
+    const rect = this.getBoundingClientRect();
+    const style = getComputedStyle(this);
+    const visible = this.isConnected && rect.width > 0 && rect.height > 0 &&
+        style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity) !== 0;
+    const disabled = this.matches(':disabled') || this.closest('[inert]') !== null ||
+        this.closest('[aria-disabled="true"]') !== null;
+    const editable = this.isContentEditable ||
+        (this instanceof HTMLTextAreaElement && !this.readOnly && !this.disabled) ||
+        (this instanceof HTMLInputElement && !this.readOnly && !this.disabled);
+    const path = [];
+    for (let current = this; current instanceof Element && path.length < 8; current = current.parentElement) {
+        if (current.id && !/\d{6,}/u.test(current.id)) {
+            path.unshift(`#${CSS.escape(current.id)}`);
+            break;
+        }
+        const tag = current.tagName.toLowerCase();
+        const siblings = current.parentElement
+            ? Array.from(current.parentElement.children).filter(child => child.tagName === current.tagName)
+            : [];
+        path.unshift(siblings.length > 1 ? `${tag}:nth-of-type(${siblings.indexOf(current) + 1})` : tag);
+    }
+    return {
+        testId: this.getAttribute('data-testid'), id: this.id || null,
+        label: this.labels ? Array.from(this.labels).map(label => label.innerText.trim()).filter(Boolean).join(' ') || null : null,
+        ancestorTestId: this.parentElement?.closest('[data-testid]')?.getAttribute('data-testid') || null,
+        ancestorId: this.parentElement?.closest('[id]')?.id || null,
+        cssPath: path.join(' > '), visible, enabled: !disabled, editable,
+        rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+    };
+}"#;
 
 const FOCUS_FUNCTION: &str = r#"function() {
     if (!this.isConnected) return false;
@@ -156,6 +198,61 @@ struct ActiveFrame {
 struct PageSettings {
     viewport: Viewport,
     geolocation: Option<Geolocation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionSettings {
+    pub timeout: Duration,
+    pub viewport: crate::flow::Viewport,
+    pub geolocation: Option<Geolocation>,
+}
+
+impl SessionSettings {
+    pub fn from_flow(flow: &CompiledFlow) -> Self {
+        Self {
+            timeout: flow.settings.timeout,
+            viewport: flow.settings.viewport,
+            geolocation: flow.settings.geolocation,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct InteractiveStepResult {
+    pub url: String,
+    pub title: String,
+    pub outputs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct InteractiveStepError {
+    pub category: FailureCategory,
+    pub message: String,
+    pub last_observed: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotNodeMetadata {
+    test_id: Option<String>,
+    id: Option<String>,
+    label: Option<String>,
+    ancestor_test_id: Option<String>,
+    ancestor_id: Option<String>,
+    css_path: String,
+    visible: bool,
+    enabled: bool,
+    editable: bool,
+    rect: crate::locator::Rect,
+}
+
+#[derive(Clone, Copy)]
+struct SnapshotTransform {
+    origin: (f64, f64),
+    horizontal: (f64, f64),
+    vertical: (f64, f64),
 }
 
 impl ActiveContext {
@@ -332,10 +429,21 @@ pub struct SessionInspection {
 
 impl SessionRuntime {
     pub(crate) async fn open(host: &BrowserHost, flow: &CompiledFlow) -> anyhow::Result<Self> {
-        let viewport = Viewport::new(flow.settings.viewport.width, flow.settings.viewport.height)?;
-        let context = host
-            .create_context(viewport, flow.settings.geolocation)
-            .await?;
+        Self::open_settings(
+            host,
+            SessionSettings::from_flow(flow),
+            flow.redactor.clone(),
+        )
+        .await
+    }
+
+    pub(crate) async fn open_settings(
+        host: &BrowserHost,
+        settings: SessionSettings,
+        redactor: Redactor,
+    ) -> anyhow::Result<Self> {
+        let viewport = Viewport::new(settings.viewport.width, settings.viewport.height)?;
+        let context = host.create_context(viewport, settings.geolocation).await?;
         let router =
             match OopifRouter::connect(host.browser().websocket_address(), context.id().as_ref())
                 .await
@@ -351,10 +459,10 @@ impl SessionRuntime {
             context: Some(context),
             page_settings: PageSettings {
                 viewport,
-                geolocation: flow.settings.geolocation,
+                geolocation: settings.geolocation,
             },
             outputs: BTreeMap::new(),
-            redactor: flow.redactor.clone(),
+            redactor,
         })
     }
 
@@ -364,12 +472,360 @@ impl SessionRuntime {
             && self.page_settings.geolocation == flow.settings.geolocation
     }
 
+    pub(crate) fn page(&self) -> &Page {
+        &self.active.page
+    }
+
+    pub(crate) fn viewport(&self) -> Viewport {
+        self.page_settings.viewport
+    }
+
+    pub(crate) async fn capture_agent_snapshot(&self) -> anyhow::Result<CapturedSnapshot> {
+        let deadline = Instant::now() + INSPECTION_TIMEOUT;
+        loop {
+            match self.capture_agent_snapshot_once().await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error)
+                    if retryable_cdp_message(&error.to_string()) && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn capture_agent_snapshot_once(&self) -> anyhow::Result<CapturedSnapshot> {
+        let mut params = GetFullAxTreeParams::builder().depth(SNAPSHOT_AX_DEPTH);
+        if let Some(frame) = self.active.local_frame() {
+            params = params.frame_id(frame.clone());
+        }
+        let mut nodes = self
+            .active
+            .target()
+            .execute(params.build())
+            .await?
+            .nodes
+            .into_iter()
+            .filter(snapshot_ax_node)
+            .collect::<Vec<_>>();
+        let truncated = nodes.len() > SNAPSHOT_ELEMENTS;
+        nodes.truncate(SNAPSHOT_ELEMENTS);
+        let transform = snapshot_transform(&self.active)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let mut elements = Vec::new();
+        for node in nodes {
+            let Some(backend) = node.backend_dom_node_id else {
+                continue;
+            };
+            let metadata: SnapshotNodeMetadata =
+                match call_on_target(self.active.target(), backend, SNAPSHOT_NODE_FUNCTION, &[])
+                    .await
+                {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+            let role = ax_text(node.role.as_ref()).unwrap_or("generic");
+            let name = bounded_snapshot_text(ax_text(node.name.as_ref()));
+            let locator = self
+                .snapshot_locator(backend, role, name.as_deref(), &metadata, truncated)
+                .await?;
+            let identity_value = locator_json(&locator);
+            let identity = LocatorIdentity(serde_json::to_string(&identity_value)?);
+            elements.push(CapturedElement {
+                identity,
+                backend_node_id: *backend.inner(),
+                parent: None,
+                node: SemanticNode {
+                    role: role.to_owned(),
+                    name: name.map(|value| self.redactor.redact(&value)),
+                    value: bounded_snapshot_text(ax_text(node.value.as_ref()))
+                        .map(|value| self.redactor.redact(&value)),
+                    description: bounded_snapshot_text(ax_text(node.description.as_ref()))
+                        .map(|value| self.redactor.redact(&value)),
+                    bounds: Some(transform.bounds(metadata.rect)),
+                    visible: Some(metadata.visible),
+                    state: snapshot_state(&node, &metadata),
+                },
+            });
+        }
+        let [x, y, document_width, document_height]: [f64; 4] = evaluate_value(
+            &self.active,
+            "[scrollX, scrollY, document.documentElement.scrollWidth, document.documentElement.scrollHeight]",
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+        Ok(CapturedSnapshot {
+            viewport: SnapshotViewport {
+                width: self.page_settings.viewport.width,
+                height: self.page_settings.viewport.height,
+            },
+            scroll: SnapshotScroll {
+                x,
+                y,
+                document_width,
+                document_height,
+            },
+            elements,
+            truncated,
+        })
+    }
+
+    async fn snapshot_locator(
+        &self,
+        backend: BackendNodeId,
+        role: &str,
+        name: Option<&str>,
+        metadata: &SnapshotNodeMetadata,
+        prefer_css_path: bool,
+    ) -> anyhow::Result<Locator> {
+        if prefer_css_path
+            && !metadata.css_path.is_empty()
+            && self.redactor.redact(&metadata.css_path) == metadata.css_path.as_str()
+        {
+            return Ok(simple_locator(LocatorStrategy::Css(Resolved::new(
+                metadata.css_path.clone(),
+                false,
+            ))));
+        }
+        let mut candidates = Vec::new();
+        if let Some(test_id) = metadata
+            .test_id
+            .as_deref()
+            .filter(|value| !value.is_empty() && self.redactor.redact(value) == *value)
+        {
+            candidates.push(simple_locator(LocatorStrategy::TestId(Resolved::new(
+                test_id.to_owned(),
+                false,
+            ))));
+        }
+        if let Some(name) =
+            name.filter(|value| !value.is_empty() && self.redactor.redact(value) == *value)
+        {
+            candidates.push(simple_locator(LocatorStrategy::Role {
+                value: Resolved::new(role.to_owned(), false),
+                name: Some(Resolved::new(name.to_owned(), false)),
+            }));
+        }
+        if let Some(label) = metadata
+            .label
+            .as_deref()
+            .filter(|value| !value.is_empty() && self.redactor.redact(value) == *value)
+        {
+            candidates.push(simple_locator(LocatorStrategy::Label(Resolved::new(
+                label.to_owned(),
+                false,
+            ))));
+        }
+        if let Some(id) = metadata
+            .id
+            .as_deref()
+            .filter(|value| stable_dom_id(value) && self.redactor.redact(value) == *value)
+        {
+            candidates.push(simple_locator(LocatorStrategy::Css(Resolved::new(
+                format!("#{}", css_identifier_escape(id)),
+                false,
+            ))));
+        }
+        if !metadata.css_path.is_empty()
+            && self.redactor.redact(&metadata.css_path) == metadata.css_path.as_str()
+        {
+            candidates.push(simple_locator(LocatorStrategy::Css(Resolved::new(
+                metadata.css_path.clone(),
+                false,
+            ))));
+        }
+        let ancestor = metadata
+            .ancestor_test_id
+            .as_deref()
+            .filter(|value| !value.is_empty() && self.redactor.redact(value) == *value)
+            .map(|value| {
+                simple_locator(LocatorStrategy::TestId(Resolved::new(
+                    value.to_owned(),
+                    false,
+                )))
+            })
+            .or_else(|| {
+                metadata
+                    .ancestor_id
+                    .as_deref()
+                    .filter(|value| stable_dom_id(value) && self.redactor.redact(value) == *value)
+                    .map(|value| {
+                        simple_locator(LocatorStrategy::Css(Resolved::new(
+                            format!("#{}", css_identifier_escape(value)),
+                            false,
+                        )))
+                    })
+            });
+        if let Some(ancestor) = ancestor {
+            let mut relational = simple_locator(LocatorStrategy::Role {
+                value: Resolved::new(role.to_owned(), false),
+                name: name.map(|value| Resolved::new(value.to_owned(), false)),
+            });
+            relational.relations.push(crate::flow::LocatorRelation {
+                kind: RelationKind::Within,
+                locator: Box::new(ancestor),
+            });
+            candidates.push(relational);
+        }
+        candidates.push(simple_locator(LocatorStrategy::Role {
+            value: Resolved::new(role.to_owned(), false),
+            name: None,
+        }));
+        for locator in &candidates {
+            let resolved = self.active.locator().resolve_all(locator).await?;
+            if resolved.backend_node_ids.as_slice() == [backend] {
+                return Ok(locator.clone());
+            }
+        }
+        let mut locator = candidates.pop().expect("role candidate exists");
+        let all = self.active.locator().resolve_all(&locator).await?;
+        locator.index = all
+            .backend_node_ids
+            .iter()
+            .position(|node| *node == backend);
+        Ok(locator)
+    }
+
+    pub(crate) async fn execute_interactive<F>(
+        &mut self,
+        host: &BrowserHost,
+        flow: &CompiledFlow,
+        artifact_directory: &Path,
+        dialog_pending: F,
+    ) -> Result<InteractiveStepResult, InteractiveStepError>
+    where
+        F: Future<Output = ()>,
+    {
+        let step = flow.steps.first().expect("interactive flow has one step");
+        let context_id = self
+            .context
+            .as_ref()
+            .expect("open session context")
+            .id()
+            .clone();
+        let placeholder = ActiveContext::new(self.active.page.clone());
+        let mut active = std::mem::replace(&mut self.active, placeholder);
+        let mut redactor = std::mem::take(&mut self.redactor);
+        redactor.extend(&flow.redactor);
+        let mut runtime = RuntimeState {
+            outputs: std::mem::take(&mut self.outputs),
+            redactor,
+            page_settings: self.page_settings,
+            guard_results: BTreeMap::new(),
+            stopped_loops: BTreeSet::new(),
+            expects_dialog: false,
+            dialog_listener: None,
+        };
+        let deadline = Instant::now()
+            .checked_add(step.timeout)
+            .unwrap_or_else(Instant::now);
+        let result = tokio::select! {
+            biased;
+            _ = dialog_pending => Ok(None),
+            result = execute_step(
+                host,
+                &context_id,
+                &mut active,
+                step,
+                deadline,
+                artifact_directory,
+                &mut runtime,
+            ) => result,
+        };
+        self.active = active;
+        self.outputs = runtime.outputs;
+        self.redactor = runtime.redactor;
+        match result {
+            Ok(artifact) => Ok(InteractiveStepResult {
+                url: String::new(),
+                title: String::new(),
+                outputs: self.output_names().into_iter().collect(),
+                artifact: artifact.as_deref().map(path_text),
+            }),
+            Err(error) => Err(InteractiveStepError {
+                category: error.category,
+                message: self.redactor.redact(&error.message),
+                last_observed: error
+                    .last_observed
+                    .map(|value| self.redactor.redact(&value)),
+            }),
+        }
+    }
+
+    pub(crate) async fn current_url_title(&self) -> anyhow::Result<(String, String)> {
+        let url = self.active.url().await?.unwrap_or_default();
+        let title = evaluate_value::<String>(&self.active, "document.title")
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        Ok((self.redactor.redact(&url), self.redactor.redact(&title)))
+    }
+
+    pub(crate) async fn scroll_position(&self) -> anyhow::Result<SnapshotScroll> {
+        let [x, y, document_width, document_height]: [f64; 4] = evaluate_value(
+            &self.active,
+            "[scrollX, scrollY, document.documentElement.scrollWidth, document.documentElement.scrollHeight]",
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+        Ok(SnapshotScroll {
+            x,
+            y,
+            document_width,
+            document_height,
+        })
+    }
+
+    pub(crate) async fn reference_matches(
+        &self,
+        flow: &CompiledFlow,
+        backend_node_id: i64,
+    ) -> anyhow::Result<bool> {
+        let locator = operation_locator(&flow.steps[0].operation)
+            .ok_or_else(|| anyhow::anyhow!("interactive reference action has no locator"))?;
+        let resolved = self.active.locator().resolve_all(locator).await?;
+        Ok(resolved.backend_node_ids.as_slice() == [BackendNodeId::new(backend_node_id)])
+    }
+
+    pub(crate) async fn capture_agent_screenshot(
+        &self,
+        directory: &Path,
+        file_name: &str,
+        full_page: bool,
+    ) -> anyhow::Result<PathBuf> {
+        let bytes = if full_page && self.active.frame().is_none() {
+            self.active
+                .page
+                .screenshot(
+                    ScreenshotParams::builder()
+                        .format(CaptureScreenshotFormat::Png)
+                        .full_page(true)
+                        .build(),
+                )
+                .await?
+        } else {
+            screenshot_bytes(&self.active, None)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message))?
+        };
+        let path = directory.join(file_name);
+        publish_bytes(directory, &path, &bytes)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        Ok(path)
+    }
+
     pub(crate) fn output(&self, name: &str) -> Option<&Value> {
         self.outputs.get(name).map(Resolved::expose)
     }
 
     pub(crate) fn output_names(&self) -> BTreeSet<String> {
         self.outputs.keys().cloned().collect()
+    }
+
+    pub(crate) fn redact(&self, value: &str) -> String {
+        self.redactor.redact(value)
     }
 
     pub(crate) async fn inspect(
@@ -500,8 +956,207 @@ impl SessionRuntime {
     }
 }
 
+impl SnapshotTransform {
+    fn point(self, x: f64, y: f64) -> (f64, f64) {
+        (
+            self.origin.0 + self.horizontal.0 * x + self.vertical.0 * y,
+            self.origin.1 + self.horizontal.1 * x + self.vertical.1 * y,
+        )
+    }
+
+    fn bounds(self, rect: crate::locator::Rect) -> SnapshotBounds {
+        let corners = [
+            self.point(rect.x, rect.y),
+            self.point(rect.x + rect.width, rect.y),
+            self.point(rect.x, rect.y + rect.height),
+            self.point(rect.x + rect.width, rect.y + rect.height),
+        ];
+        let min_x = corners
+            .iter()
+            .map(|point| point.0)
+            .fold(f64::INFINITY, f64::min);
+        let max_x = corners
+            .iter()
+            .map(|point| point.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let min_y = corners
+            .iter()
+            .map(|point| point.1)
+            .fold(f64::INFINITY, f64::min);
+        let max_y = corners
+            .iter()
+            .map(|point| point.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        SnapshotBounds {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x,
+            height: max_y - min_y,
+        }
+    }
+}
+
+async fn snapshot_transform(active: &ActiveContext) -> Result<SnapshotTransform, StepError> {
+    if active.frames.is_empty() {
+        return Ok(SnapshotTransform {
+            origin: (0.0, 0.0),
+            horizontal: (1.0, 0.0),
+            vertical: (0.0, 1.0),
+        });
+    }
+    let origin = page_point(active, 0.0, 0.0).await?;
+    let horizontal = page_point(active, 1.0, 0.0).await?;
+    let vertical = page_point(active, 0.0, 1.0).await?;
+    Ok(SnapshotTransform {
+        origin,
+        horizontal: (horizontal.0 - origin.0, horizontal.1 - origin.1),
+        vertical: (vertical.0 - origin.0, vertical.1 - origin.1),
+    })
+}
+
 fn bounded_inspection_text(value: String) -> String {
     value.chars().take(INSPECT_TEXT_CHARS).collect()
+}
+
+fn snapshot_ax_node(node: &AxNode) -> bool {
+    if node.ignored || node.backend_dom_node_id.is_none() {
+        return false;
+    }
+    let role = ax_text(node.role.as_ref()).unwrap_or_default();
+    matches!(
+        role,
+        "button"
+            | "checkbox"
+            | "combobox"
+            | "link"
+            | "listbox"
+            | "menuitem"
+            | "option"
+            | "radio"
+            | "searchbox"
+            | "slider"
+            | "spinbutton"
+            | "switch"
+            | "tab"
+            | "textbox"
+            | "treeitem"
+    ) || ax_property(node, AxPropertyName::Focusable)
+        .is_some_and(|value| value == &Value::Bool(true))
+}
+
+fn ax_text(value: Option<&AxValue>) -> Option<&str> {
+    value?.value.as_ref()?.as_str()
+}
+
+fn bounded_snapshot_text(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(SNAPSHOT_TEXT_CHARS).collect())
+}
+
+fn ax_property(node: &AxNode, name: AxPropertyName) -> Option<&Value> {
+    node.properties
+        .as_ref()?
+        .iter()
+        .find(|property| property.name == name)?
+        .value
+        .value
+        .as_ref()
+}
+
+fn ax_bool(node: &AxNode, name: AxPropertyName) -> Option<bool> {
+    ax_property(node, name).and_then(Value::as_bool)
+}
+
+fn snapshot_state(node: &AxNode, metadata: &SnapshotNodeMetadata) -> SemanticState {
+    SemanticState {
+        enabled: Some(metadata.enabled),
+        editable: Some(metadata.editable),
+        checked: ax_bool(node, AxPropertyName::Checked),
+        selected: ax_bool(node, AxPropertyName::Selected),
+        focused: ax_bool(node, AxPropertyName::Focused),
+        expanded: ax_bool(node, AxPropertyName::Expanded),
+        pressed: ax_bool(node, AxPropertyName::Pressed),
+    }
+}
+
+fn simple_locator(strategy: LocatorStrategy) -> Locator {
+    Locator {
+        strategy,
+        index: None,
+        checked: None,
+        selected: None,
+        focused: None,
+        enabled: None,
+        relations: Vec::new(),
+    }
+}
+
+fn stable_dom_id(value: &str) -> bool {
+    !(value.is_empty()
+        || value.len() > 100
+        || value.chars().any(char::is_whitespace)
+        || value.len() >= 8 && value.chars().filter(char::is_ascii_digit).count() >= 6)
+}
+
+fn css_identifier_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            character if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') => {
+                vec![character]
+            }
+            character => vec!['\\', character],
+        })
+        .collect()
+}
+
+pub(crate) fn locator_json(locator: &Locator) -> Value {
+    let mut object = serde_json::Map::new();
+    match &locator.strategy {
+        LocatorStrategy::Css(value) => {
+            object.insert("css".into(), Value::String(value.expose().clone()));
+        }
+        LocatorStrategy::TestId(value) => {
+            object.insert("test_id".into(), Value::String(value.expose().clone()));
+        }
+        LocatorStrategy::Text { value, match_kind } => {
+            object.insert(
+                "text".into(),
+                serde_json::json!({
+                    "value": value.expose(),
+                    "match": match match_kind { TextMatch::Exact => "exact", TextMatch::Contains => "contains" }
+                }),
+            );
+        }
+        LocatorStrategy::Label(value) => {
+            object.insert("label".into(), Value::String(value.expose().clone()));
+        }
+        LocatorStrategy::Role { value, name } => {
+            object.insert(
+                "role".into(),
+                serde_json::json!({ "value": value.expose(), "name": name.as_ref().map(Resolved::expose) }),
+            );
+        }
+    }
+    for (name, value) in [
+        ("index", locator.index.map(|value| serde_json::json!(value))),
+        ("checked", locator.checked.map(Value::Bool)),
+        ("selected", locator.selected.map(Value::Bool)),
+        ("focused", locator.focused.map(Value::Bool)),
+        ("enabled", locator.enabled.map(Value::Bool)),
+    ] {
+        if let Some(value) = value {
+            object.insert(name.into(), value);
+        }
+    }
+    for relation in &locator.relations {
+        object.insert(
+            relation_name(relation.kind).into(),
+            locator_json(&relation.locator),
+        );
+    }
+    Value::Object(object)
 }
 
 /// Runs one compiled flow in a fresh incognito browser context.
@@ -582,6 +1237,11 @@ async fn execute_flow(
         page_settings: session.page_settings,
         guard_results: BTreeMap::new(),
         stopped_loops: BTreeSet::new(),
+        expects_dialog: flow
+            .steps
+            .iter()
+            .any(|step| matches!(step.operation, Operation::Dialog { .. })),
+        dialog_listener: None,
     };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut browser_status = host.subscribe_status();
@@ -891,6 +1551,8 @@ struct RuntimeState {
     page_settings: PageSettings,
     guard_results: BTreeMap<usize, bool>,
     stopped_loops: BTreeSet<usize>,
+    expects_dialog: bool,
+    dialog_listener: Option<EventStream<EventJavascriptDialogOpening>>,
 }
 
 async fn execute_step(
@@ -913,25 +1575,45 @@ async fn execute_step(
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
             let (x, y) = page_point(active, element.center.x, element.center.y).await?;
-            dispatch_click(&active.page, x, y, 1).await.map(|_| None)
+            dispatch_click(
+                &active.page,
+                x,
+                y,
+                1,
+                dialog_listener(&active.page, runtime).await?,
+            )
+            .await
+            .map(|_| None)
         }
-        Operation::ClickPoint { point } => {
-            dispatch_click(&active.page, f64::from(point.x), f64::from(point.y), 1)
-                .await
-                .map_err(|mut error| {
-                    error.message = format!(
-                        "viewport click at ({}, {}) failed: {}",
-                        point.x, point.y, error.message
-                    );
-                    error
-                })
-                .map(|_| None)
-        }
+        Operation::ClickPoint { point } => dispatch_click(
+            &active.page,
+            f64::from(point.x),
+            f64::from(point.y),
+            1,
+            dialog_listener(&active.page, runtime).await?,
+        )
+        .await
+        .map_err(|mut error| {
+            error.message = format!(
+                "viewport click at ({}, {}) failed: {}",
+                point.x, point.y, error.message
+            );
+            error
+        })
+        .map(|_| None),
         Operation::DoubleClick { target, position } => {
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
             let (x, y) = page_point(active, element.center.x, element.center.y).await?;
-            dispatch_click(&active.page, x, y, 2).await.map(|_| None)
+            dispatch_click(
+                &active.page,
+                x,
+                y,
+                2,
+                dialog_listener(&active.page, runtime).await?,
+            )
+            .await
+            .map(|_| None)
         }
         Operation::Fill { target, value } => {
             let value = resolve_runtime(value, &runtime.outputs)?;
@@ -1033,6 +1715,22 @@ async fn execute_step(
             FailureCategory::Protocol,
             "recording controls must be handled by the flow runner",
         )),
+        Operation::Dialog { action, text } => {
+            let mut params =
+                HandleJavaScriptDialogParams::new(matches!(action, NativeDialogResponse::Accept));
+            params.prompt_text = text
+                .as_ref()
+                .map(|text| resolve_runtime(text, &runtime.outputs))
+                .transpose()?
+                .map(|text| text.expose().to_owned());
+            active.target().execute(params).await.map_err(|error| {
+                StepError::new(
+                    FailureCategory::Actionability,
+                    format!("handle native dialog: {error}"),
+                )
+            })?;
+            Ok(None)
+        }
         Operation::Clear(ClearTarget::Cookies) => {
             host.browser()
                 .execute(
@@ -2207,7 +2905,30 @@ fn character_text(character: char, modifiers: &[Modifier]) -> (String, String) {
     (shifted.to_string(), unmodified)
 }
 
-async fn dispatch_click(page: &Page, x: f64, y: f64, clicks: i64) -> Result<(), StepError> {
+async fn dialog_listener<'a>(
+    page: &Page,
+    runtime: &'a mut RuntimeState,
+) -> Result<Option<&'a mut EventStream<EventJavascriptDialogOpening>>, StepError> {
+    if !runtime.expects_dialog {
+        return Ok(None);
+    }
+    if runtime.dialog_listener.is_none() {
+        runtime.dialog_listener = Some(
+            page.event_listener::<EventJavascriptDialogOpening>()
+                .await
+                .map_err(protocol)?,
+        );
+    }
+    Ok(runtime.dialog_listener.as_mut())
+}
+
+async fn dispatch_click(
+    page: &Page,
+    x: f64,
+    y: f64,
+    clicks: i64,
+    mut dialogs: Option<&mut EventStream<EventJavascriptDialogOpening>>,
+) -> Result<(), StepError> {
     page.move_mouse(chromiumoxide::layout::Point::new(x, y))
         .await
         .map_err(protocol)?;
@@ -2222,19 +2943,44 @@ async fn dispatch_click(page: &Page, x: f64, y: f64, clicks: i64) -> Result<(), 
                 .build()
                 .expect("all mandatory mouse event fields are set")
         };
-        let press_result = page
-            .execute(event(DispatchMouseEventType::MousePressed))
-            .await
-            .map(|_| ())
-            .map_err(protocol);
-        let release_result = page
-            .execute(event(DispatchMouseEventType::MouseReleased))
-            .await
-            .map(|_| ())
-            .map_err(protocol);
-        press_result.and(release_result)?;
+        if dispatch_mouse_event(
+            page,
+            event(DispatchMouseEventType::MousePressed),
+            dialogs.as_deref_mut(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        if dispatch_mouse_event(
+            page,
+            event(DispatchMouseEventType::MouseReleased),
+            dialogs.as_deref_mut(),
+        )
+        .await?
+        {
+            return Ok(());
+        }
     }
     Ok(())
+}
+
+async fn dispatch_mouse_event(
+    page: &Page,
+    event: DispatchMouseEventParams,
+    dialogs: Option<&mut EventStream<EventJavascriptDialogOpening>>,
+) -> Result<bool, StepError> {
+    let mut command = Box::pin(page.execute(event));
+    let Some(dialogs) = dialogs else {
+        return command.await.map(|_| false).map_err(protocol);
+    };
+    tokio::select! {
+        result = &mut command => result.map(|_| false).map_err(protocol),
+        dialog = dialogs.next() => match dialog {
+            Some(_) => Ok(true),
+            None => command.await.map(|_| false).map_err(protocol),
+        },
+    }
 }
 
 async fn assert(
@@ -2497,6 +3243,213 @@ struct VideoSession {
     partial_path: PathBuf,
 }
 
+struct ScreencastSource {
+    page: Page,
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+pub(crate) struct SessionRecorder {
+    recorder: Option<VideoRecorder>,
+    source: Option<ScreencastSource>,
+    output_path: PathBuf,
+    partial_path: PathBuf,
+    viewport_width: u32,
+    viewport_height: u32,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionRecordingFinish {
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_path: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+impl SessionRecorder {
+    pub(crate) async fn start(config: VideoConfig, page: &Page) -> Result<Self, String> {
+        tokio::fs::create_dir_all(
+            config
+                .output_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .await
+        .map_err(|error| format!("create recording directory: {error}"))?;
+        let recorder = VideoRecorder::start(&config)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut session = Self {
+            output_path: config.output_path.clone(),
+            partial_path: config.partial_path(),
+            recorder: Some(recorder),
+            source: None,
+            viewport_width: config.viewport_width,
+            viewport_height: config.viewport_height,
+            warnings: Vec::new(),
+        };
+        session.bind(page).await?;
+        Ok(session)
+    }
+
+    pub(crate) async fn bind(&mut self, page: &Page) -> Result<(), String> {
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.page.target_id() == page.target_id())
+        {
+            return Ok(());
+        }
+        self.stop_source().await;
+        let Some(recorder) = &self.recorder else {
+            return Ok(());
+        };
+        let mut events = page
+            .event_listener::<EventScreencastFrame>()
+            .await
+            .map_err(|error| format!("listen for screencast frames: {error}"))?;
+        page.execute(
+            StartScreencastParams::builder()
+                .format(StartScreencastFormat::Jpeg)
+                .quality(90)
+                .max_width(i64::from(self.viewport_width))
+                .max_height(i64::from(self.viewport_height))
+                .every_nth_frame(1)
+                .build(),
+        )
+        .await
+        .map_err(|error| format!("start screencast: {error}"))?;
+        let sink = recorder.frame_sink();
+        let task_page = page.clone();
+        let (stop, mut stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return Ok(()),
+                    event = events.next() => {
+                        let Some(event) = event else {
+                            return Err("screencast event stream closed".to_owned());
+                        };
+                        task_page
+                            .execute(ScreencastFrameAckParams::new(event.session_id))
+                            .await
+                            .map_err(|error| format!("acknowledge screencast frame: {error}"))?;
+                        let jpeg = base64::engine::general_purpose::STANDARD
+                            .decode(event.data.as_ref() as &[u8])
+                            .map_err(|error| format!("decode screencast frame: {error}"))?;
+                        sink.push_frame(jpeg);
+                    }
+                }
+            }
+        });
+        self.source = Some(ScreencastSource {
+            page: page.clone(),
+            stop: Some(stop),
+            task,
+        });
+        Ok(())
+    }
+
+    async fn stop_source(&mut self) {
+        let Some(mut source) = self.source.take() else {
+            return;
+        };
+        if let Some(error) = stop_screencast(&source.page).await {
+            self.warnings.push(error);
+        }
+        if let Some(stop) = source.stop.take() {
+            let _ = stop.send(());
+        }
+        match tokio::time::timeout(SECONDARY_TIMEOUT, &mut source.task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => self.warnings.push(error),
+            Ok(Err(error)) => self
+                .warnings
+                .push(format!("screencast task failed: {error}")),
+            Err(_) => {
+                source.task.abort();
+                self.warnings
+                    .push("screencast task shutdown timed out".to_owned());
+            }
+        }
+    }
+
+    pub(crate) async fn finalize(mut self) -> SessionRecordingFinish {
+        let final_frame = if let Some(source) = &self.source {
+            settle_video(&source.page).await;
+            match source
+                .page
+                .screenshot(
+                    ScreenshotParams::builder()
+                        .format(CaptureScreenshotFormat::Jpeg)
+                        .quality(90)
+                        .build(),
+                )
+                .await
+            {
+                Ok(frame) => Some(frame),
+                Err(error) => {
+                    self.warnings
+                        .push(format!("capture final recording frame: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.stop_source().await;
+        if let (Some(recorder), Some(frame)) = (&self.recorder, final_frame) {
+            recorder.push_frame(frame);
+        }
+        let result = match self.recorder.take() {
+            Some(recorder) => {
+                tokio::time::timeout(
+                    VIDEO_FINALIZE_TIMEOUT,
+                    recorder.finalize(Instant::now(), false),
+                )
+                .await
+            }
+            None => return self.finish_result(None),
+        };
+        let path = match result {
+            Ok(Ok(path)) => path,
+            Ok(Err(error)) => {
+                self.warnings.push(error.to_string());
+                None
+            }
+            Err(_) => {
+                self.warnings
+                    .push("video finalization timed out".to_owned());
+                None
+            }
+        };
+        self.finish_result(path)
+    }
+
+    fn finish_result(self, path: Option<PathBuf>) -> SessionRecordingFinish {
+        let partial = self
+            .partial_path
+            .exists()
+            .then(|| path_text(&self.partial_path));
+        let complete = path.or_else(|| self.output_path.exists().then(|| self.output_path.clone()));
+        SessionRecordingFinish {
+            status: if complete.is_some() {
+                "complete"
+            } else if partial.is_some() {
+                "partial"
+            } else {
+                "failed"
+            },
+            path: complete.as_deref().map(path_text),
+            partial_path: partial,
+            warnings: self.warnings,
+        }
+    }
+}
+
 enum VideoStartup {
     Ready(Option<VideoSession>),
     Cancelled(Option<Result<Option<PathBuf>, VideoFinishError>>),
@@ -2665,7 +3618,7 @@ async fn start_video(
     let command = page.execute(
         StartScreencastParams::builder()
             .format(StartScreencastFormat::Jpeg)
-            .quality(80)
+            .quality(90)
             .max_width(i64::from(flow.settings.viewport.width))
             .max_height(i64::from(flow.settings.viewport.height))
             .every_nth_frame(1)
@@ -3021,6 +3974,14 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Screenshot { .. } => "screenshot",
         Operation::Recording(RecordingControl::Start) => "recording.start",
         Operation::Recording(RecordingControl::Stop) => "recording.stop",
+        Operation::Dialog {
+            action: NativeDialogResponse::Accept,
+            ..
+        } => "dialog.accept",
+        Operation::Dialog {
+            action: NativeDialogResponse::Dismiss,
+            ..
+        } => "dialog.dismiss",
         Operation::Clear(ClearTarget::Cookies) => "clear.cookies",
         Operation::Clear(ClearTarget::Storage) => "clear.storage",
         Operation::Clear(ClearTarget::Indexeddb) => "clear.indexeddb",
@@ -3060,6 +4021,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
         | Operation::Screenshot { .. }
         | Operation::Recording(_)
+        | Operation::Dialog { .. }
         | Operation::Clear(_)
         | Operation::Evaluate { .. }
         | Operation::Request { .. }
@@ -3838,6 +4800,26 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_bounds_are_viewport_relative_for_scaled_and_rotated_frames() {
+        let bounds = SnapshotTransform {
+            origin: (100.0, 20.0),
+            horizontal: (0.0, 2.0),
+            vertical: (-3.0, 0.0),
+        }
+        .bounds(crate::locator::Rect {
+            x: 10.0,
+            y: 5.0,
+            width: 20.0,
+            height: 10.0,
+        });
+
+        assert_eq!(bounds.x, 55.0);
+        assert_eq!(bounds.y, 40.0);
+        assert_eq!(bounds.width, 30.0);
+        assert_eq!(bounds.height, 40.0);
+    }
+
+    #[test]
     fn fill_clears_text_controls_without_unsupported_select_or_change_events() {
         assert!(PREPARE_FILL_FUNCTION.contains("HTMLInputElement.prototype, 'value'"));
         assert!(PREPARE_FILL_FUNCTION.contains("HTMLTextAreaElement.prototype, 'value'"));
@@ -3949,6 +4931,8 @@ steps:
             },
             guard_results: BTreeMap::new(),
             stopped_loops: BTreeSet::new(),
+            expects_dialog: false,
+            dialog_listener: None,
         };
         for step in &flow.steps {
             execute_step(

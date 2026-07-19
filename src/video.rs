@@ -87,16 +87,16 @@ impl VideoConfig {
                 "video output path must include a file name".into(),
             ));
         }
-        if self.output_path.extension() != Some(OsStr::new("webm")) {
+        if self.output_path.extension() != Some(OsStr::new("mp4")) {
             return Err(VideoError::InvalidConfig(
-                "video output path must end in .webm".into(),
+                "video output path must end in .mp4".into(),
             ));
         }
         Ok(())
     }
 
     pub fn partial_path(&self) -> PathBuf {
-        self.output_path.with_extension("partial.webm")
+        self.output_path.with_extension("partial.mp4")
     }
 }
 
@@ -116,8 +116,8 @@ pub enum VideoError {
     PreflightTimeout(Duration),
     #[error("FFmpeg preflight failed: {0}")]
     Preflight(String),
-    #[error("FFmpeg does not provide the required libvpx-vp9 encoder")]
-    Vp9Unavailable,
+    #[error("FFmpeg does not provide the required libx264 encoder")]
+    H264Unavailable,
     #[error("timed out waiting {0:?} for the first video frame")]
     FirstFrameTimeout(Duration),
     #[error("video frame writer failed: {0}")]
@@ -140,7 +140,7 @@ pub enum VideoError {
     },
 }
 
-/// Checks that the configured executable starts and exposes the VP9 encoder used by Playrust.
+/// Checks that the configured executable starts and exposes the H.264 encoder used by Playrust.
 pub async fn preflight_ffmpeg(config: &VideoConfig) -> Result<(), VideoError> {
     config.validate()?;
     if !config.mode.enabled() {
@@ -171,9 +171,9 @@ pub async fn preflight_ffmpeg(config: &VideoConfig) -> Result<(), VideoError> {
     if !result
         .stdout
         .split(|byte| byte.is_ascii_whitespace())
-        .any(|word| word == b"libvpx-vp9")
+        .any(|word| word == b"libx264")
     {
-        return Err(VideoError::Vp9Unavailable);
+        return Err(VideoError::H264Unavailable);
     }
     Ok(())
 }
@@ -195,11 +195,17 @@ pub struct VideoRecorder {
     output_path: PathBuf,
     partial_path: PathBuf,
     child: Child,
+    frame_sink: VideoFrameSink,
+    writer: JoinHandle<Result<(), VideoError>>,
+    stderr: JoinHandle<String>,
+}
+
+/// A cloneable input for a recorder that can outlive any one screencast source.
+#[derive(Clone)]
+pub struct VideoFrameSink {
     shared: Arc<Mutex<SharedState>>,
     writer_notify: Arc<Notify>,
     first_frame_notify: Arc<Notify>,
-    writer: JoinHandle<Result<(), VideoError>>,
-    stderr: JoinHandle<String>,
 }
 
 impl VideoRecorder {
@@ -236,66 +242,53 @@ impl VideoRecorder {
         let first_frame_notify = Arc::new(Notify::new());
         let writer = tokio::spawn(write_frames(shared.clone(), writer_notify.clone(), stdin));
         let stderr = tokio::spawn(capture_stderr(child_stderr));
+        let frame_sink = VideoFrameSink {
+            shared,
+            writer_notify,
+            first_frame_notify,
+        };
 
         Ok(Self {
             mode: config.mode,
             output_path: config.output_path.clone(),
             partial_path,
             child,
-            shared,
-            writer_notify,
-            first_frame_notify,
+            frame_sink,
             writer,
             stderr,
         })
     }
 
+    /// Returns a frame input that can be moved between screencast source tasks.
+    pub fn frame_sink(&self) -> VideoFrameSink {
+        self.frame_sink.clone()
+    }
+
     /// Replaces any queued frame without blocking the CDP event loop.
     pub fn push_frame_at(&self, jpeg: Vec<u8>, received_at: Instant) {
-        let mut shared = self.shared.lock().expect("video frame state poisoned");
-        if shared.stop_at.is_some() {
-            return;
-        }
-        shared.latest = Some(PendingFrame { jpeg, received_at });
-        shared.first_frame_received = true;
-        drop(shared);
-        self.writer_notify.notify_one();
-        self.first_frame_notify.notify_one();
+        self.frame_sink.push_frame_at(jpeg, received_at);
     }
 
     pub fn push_frame(&self, jpeg: Vec<u8>) {
-        self.push_frame_at(jpeg, Instant::now());
+        self.frame_sink.push_frame(jpeg);
     }
 
     pub async fn wait_for_first_frame(&self, wait: Duration) -> Result<(), VideoError> {
-        let deadline = time::Instant::now() + wait;
-        loop {
-            let notified = self.first_frame_notify.notified();
-            if self
-                .shared
-                .lock()
-                .expect("video frame state poisoned")
-                .first_frame_received
-            {
-                return Ok(());
-            }
-            if time::timeout_at(deadline, notified).await.is_err() {
-                return Err(VideoError::FirstFrameTimeout(wait));
-            }
-        }
+        self.frame_sink.wait_for_first_frame(wait).await
     }
 
-    /// Flushes the last frame through `stop_at`, then publishes or removes the completed WebM.
+    /// Stops accepting frames. Repeated calls preserve the first stop boundary.
+    pub fn begin_finalization(&self, stop_at: Instant) {
+        self.frame_sink.begin_finalization(stop_at);
+    }
+
+    /// Flushes the last frame through `stop_at`, then publishes or removes the completed MP4.
     pub async fn finalize(
         mut self,
         stop_at: Instant,
         flow_failed: bool,
     ) -> Result<Option<PathBuf>, VideoError> {
-        {
-            let mut shared = self.shared.lock().expect("video frame state poisoned");
-            shared.stop_at = Some(stop_at);
-        }
-        self.writer_notify.notify_one();
+        self.begin_finalization(stop_at);
 
         let deadline = time::Instant::now() + PROCESS_TIMEOUT;
         let writer_result = match time::timeout_at(deadline, &mut self.writer).await {
@@ -349,6 +342,52 @@ impl VideoRecorder {
             publish(&self.partial_path, &self.output_path).await?;
             Ok(Some(self.output_path.clone()))
         }
+    }
+}
+
+impl VideoFrameSink {
+    /// Replaces any queued frame without blocking the source event loop.
+    pub fn push_frame_at(&self, jpeg: Vec<u8>, received_at: Instant) {
+        let mut shared = self.shared.lock().expect("video frame state poisoned");
+        if shared.stop_at.is_some() {
+            return;
+        }
+        shared.latest = Some(PendingFrame { jpeg, received_at });
+        shared.first_frame_received = true;
+        drop(shared);
+        self.writer_notify.notify_one();
+        self.first_frame_notify.notify_one();
+    }
+
+    pub fn push_frame(&self, jpeg: Vec<u8>) {
+        self.push_frame_at(jpeg, Instant::now());
+    }
+
+    pub async fn wait_for_first_frame(&self, wait: Duration) -> Result<(), VideoError> {
+        let deadline = time::Instant::now() + wait;
+        loop {
+            let notified = self.first_frame_notify.notified();
+            if self
+                .shared
+                .lock()
+                .expect("video frame state poisoned")
+                .first_frame_received
+            {
+                return Ok(());
+            }
+            if time::timeout_at(deadline, notified).await.is_err() {
+                return Err(VideoError::FirstFrameTimeout(wait));
+            }
+        }
+    }
+
+    pub fn begin_finalization(&self, stop_at: Instant) {
+        self.shared
+            .lock()
+            .expect("video frame state poisoned")
+            .stop_at
+            .get_or_insert(stop_at);
+        self.writer_notify.notify_one();
     }
 }
 
@@ -435,6 +474,7 @@ struct FramePacer {
     started_at: Option<Instant>,
     latest_received_at: Option<Instant>,
     latest_jpeg: Vec<u8>,
+    latest_emitted: bool,
     emitted: u64,
 }
 
@@ -449,6 +489,7 @@ impl FramePacer {
             self.started_at = Some(received_at);
             self.latest_received_at = Some(received_at);
             self.latest_jpeg = jpeg;
+            self.latest_emitted = false;
             return self.emit_until(received_at, output).await;
         }
         if self
@@ -460,6 +501,7 @@ impl FramePacer {
         self.emit_until(received_at, output).await?;
         self.latest_received_at = Some(received_at);
         self.latest_jpeg = jpeg;
+        self.latest_emitted = false;
         Ok(())
     }
 
@@ -468,7 +510,16 @@ impl FramePacer {
         stop_at: Instant,
         output: &mut W,
     ) -> Result<(), VideoError> {
-        self.emit_until(stop_at, output).await
+        self.emit_until(stop_at, output).await?;
+        if self.started_at.is_some() && !self.latest_emitted {
+            output
+                .write_all(&self.latest_jpeg)
+                .await
+                .map_err(|error| VideoError::FrameWriter(error.to_string()))?;
+            self.emitted += 1;
+            self.latest_emitted = true;
+        }
+        Ok(())
     }
 
     async fn emit_until<W: AsyncWrite + Unpin>(
@@ -486,6 +537,7 @@ impl FramePacer {
                 .await
                 .map_err(|error| VideoError::FrameWriter(error.to_string()))?;
             self.emitted += 1;
+            self.latest_emitted = true;
         }
         Ok(())
     }
@@ -523,13 +575,15 @@ fn ffmpeg_arguments(config: &VideoConfig, partial_path: &Path) -> Vec<OsString> 
         filter.into(),
         "-an".into(),
         "-c:v".into(),
-        "libvpx-vp9".into(),
+        "libx264".into(),
+        "-crf".into(),
+        "20".into(),
+        "-preset".into(),
+        "veryfast".into(),
         "-pix_fmt".into(),
         "yuv420p".into(),
-        "-deadline".into(),
-        "realtime".into(),
-        "-row-mt".into(),
-        "1".into(),
+        "-movflags".into(),
+        "+faststart".into(),
         "-y".into(),
         partial_path.as_os_str().to_owned(),
     ]
@@ -552,7 +606,7 @@ mod tests {
         VideoConfig {
             mode: VideoMode::On,
             ffmpeg_path: "ffmpeg".into(),
-            output_path: "recording.webm".into(),
+            output_path: "recording.mp4".into(),
             viewport_width: 1280,
             viewport_height: 720,
         }
@@ -616,6 +670,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pacing_emits_a_frame_received_at_the_stop_boundary() {
+        let start = Instant::now();
+        let mut output = Vec::new();
+        let mut pacer = FramePacer::default();
+
+        pacer.receive(vec![1], start, &mut output).await.unwrap();
+        pacer
+            .receive(vec![2], start + Duration::from_millis(10), &mut output)
+            .await
+            .unwrap();
+        pacer
+            .finish(start + Duration::from_millis(10), &mut output)
+            .await
+            .unwrap();
+
+        assert_eq!(output, vec![1, 2]);
+    }
+
+    #[tokio::test]
     async fn stderr_capture_keeps_the_prefix_and_drains_the_rest() {
         let input = vec![b'x'; MAX_STDERR_BYTES as usize + 1024];
         let captured = capture_stderr(std::io::Cursor::new(input)).await;
@@ -626,8 +699,8 @@ mod tests {
     #[tokio::test]
     async fn publication_can_remove_an_existing_windows_destination() {
         let directory = tempfile::tempdir().unwrap();
-        let partial = directory.path().join("recording.partial.webm");
-        let output = directory.path().join("recording.webm");
+        let partial = directory.path().join("recording.partial.mp4");
+        let output = directory.path().join("recording.mp4");
 
         tokio::fs::write(&partial, b"new").await.unwrap();
         tokio::fs::write(&output, b"old").await.unwrap();
@@ -637,8 +710,40 @@ mod tests {
         assert!(!partial.exists());
     }
 
+    #[tokio::test]
+    async fn failed_publication_retains_the_partial_recording() {
+        let directory = tempfile::tempdir().unwrap();
+        let partial = directory.path().join("recording.partial.mp4");
+        let output = directory.path().join("missing/recording.mp4");
+
+        tokio::fs::write(&partial, b"partial").await.unwrap();
+
+        assert!(publish(&partial, &output).await.is_err());
+        assert_eq!(tokio::fs::read(&partial).await.unwrap(), b"partial");
+    }
+
     #[test]
-    fn ffmpeg_arguments_pipe_mjpeg_and_normalize_vp9_output() {
+    fn finalization_signal_is_idempotent_and_rejects_late_frames() {
+        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let sink = VideoFrameSink {
+            shared: shared.clone(),
+            writer_notify: Arc::new(Notify::new()),
+            first_frame_notify: Arc::new(Notify::new()),
+        };
+        let first_stop = Instant::now();
+
+        sink.begin_finalization(first_stop);
+        sink.begin_finalization(first_stop + Duration::from_secs(1));
+        sink.push_frame_at(vec![1], first_stop);
+
+        let state = shared.lock().unwrap();
+        assert_eq!(state.stop_at, Some(first_stop));
+        assert!(state.latest.is_none());
+        assert!(!state.first_frame_received);
+    }
+
+    #[test]
+    fn ffmpeg_arguments_pipe_mjpeg_and_publish_compatible_h264() {
         let value = config();
         let partial = value.partial_path();
         let arguments: Vec<_> = ffmpeg_arguments(&value, &partial)
@@ -646,7 +751,7 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
 
-        assert_eq!(partial, PathBuf::from("recording.partial.webm"));
+        assert_eq!(partial, PathBuf::from("recording.partial.mp4"));
         assert_eq!(
             arguments,
             vec![
@@ -665,15 +770,17 @@ mod tests {
                 "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
                 "-an",
                 "-c:v",
-                "libvpx-vp9",
+                "libx264",
+                "-crf",
+                "20",
+                "-preset",
+                "veryfast",
                 "-pix_fmt",
                 "yuv420p",
-                "-deadline",
-                "realtime",
-                "-row-mt",
-                "1",
+                "-movflags",
+                "+faststart",
                 "-y",
-                "recording.partial.webm",
+                "recording.partial.mp4",
             ]
         );
     }

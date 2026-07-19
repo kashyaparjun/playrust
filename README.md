@@ -1,6 +1,15 @@
 # Playrust
 
-Playrust is a YAML-based web testing automation tool written in Rust. It runs sequential flows in isolated Chromium browser contexts, waits for actions and assertions, and produces machine-readable artifacts.
+Playrust is a browser runtime for AI agents where every session leaves behind an audited, secret-safe, replayable test. An agent drives Chromium interactively over a JSON protocol; Playrust records everything, keeps credentials out of the model's hands, and on export compiles the successful actions into a canonical YAML flow that replays deterministically in CI.
+
+## Why Playrust
+
+- **The session trace is the product.** Every session produces an append-only redacted audit journal, continuous video, and an exported `replay.yaml` distilled from the successful actions — an agent's one-off browsing session becomes a regression test plus evidence.
+- **A secret firewall at the wire.** Agents send `{"env":"NAME"}` instead of plaintext; the model never sees, logs, or exports credential values. Exported flows declare them as environment-backed secrets.
+- **Replay fidelity by construction.** Interactive sessions and YAML replay share one execution core — the same locators, actionability, timeouts, and redaction — so the exported flow replays what actually happened, not an approximation of it.
+- **Flows are data, not programs.** The YAML format has no code execution, bounded loops, immutable inputs, and full static validation (`playrust check`), so machine-authored flows are safe to accept, diff, and run without code review.
+
+Playrust is a single static binary with a pinned Chrome for Testing build — no Node, no version-skew matrix. A Claude Code skill for driving sessions ships in [`skills/playrust-agent`](skills/playrust-agent/SKILL.md).
 
 ## Demo
 
@@ -25,7 +34,7 @@ and Windows x86_64.
 Alternatively, install a tagged version from source with Rust 1.89 or newer:
 
 ```sh
-cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.1.0 playrust
+cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.2.0 playrust
 ```
 
 For a local checkout:
@@ -38,9 +47,38 @@ Run `playrust browser install` to preinstall the browser. `playrust run` also
 installs pinned Chrome for Testing `151.0.7922.34` automatically if needed. You
 can instead provide that exact build with `--browser PATH` or `PLAYRUST_CHROME`.
 
-## Quick start
+## Agent sessions
 
-Serve the included page in one terminal:
+`playrust session --protocol ndjson` is the interactive agent interface. It eagerly opens one isolated Chromium context, reads one JSON command per stdin line, and writes one JSON response per stdout line; diagnostics go only to stderr. Every response contains the command `id`, `ok`, stable `session_id`, monotonically increasing `revision`, and either `result` or a structured `error`.
+
+Session defaults match YAML: a `1280x720` viewport and `10s` action timeout. Video defaults to `on` and records continuously from session startup through close; use `--video off` to disable it. Dialog handling defaults to `--dialog-policy explicit`; `accept` and `dismiss` handle dialogs automatically for the entire session, with accepted prompts receiving an empty value.
+
+The normal agent loop is open, snapshot, act on a current reference, scroll and resnapshot as needed, handle dialogs, export, then close:
+
+```json
+{"id":1,"command":"act","action":{"open":{"url":"https://example.com"}}}
+{"id":2,"command":"snapshot","screenshot":"viewport","accessibility":true}
+{"id":3,"command":"act","action":{"click":{"ref":"e12"}}}
+{"id":4,"command":"scroll","y":700}
+{"id":5,"command":"snapshot","screenshot":"viewport","accessibility":true}
+{"id":6,"command":"dialog","action":"accept"}
+{"id":7,"command":"export","name":"example-run"}
+{"id":8,"command":"close"}
+```
+
+Snapshots contain compact semantic context and interactive elements with temporary `eN` references. References belong only to the latest snapshot, are never reused, and become stale after a newer snapshot, a successful mutation, navigation, page/frame switch, or node detachment. Take a new snapshot before every ref-based action; never treat a reference as a selector. This is deliberate: the agent structurally cannot act on a stale view of the page.
+
+With explicit dialog handling, an action that opens a native dialog succeeds and reports it. While a dialog is pending, `act`, `scroll`, and `submit` return recoverable `dialog_pending`; `snapshot`, `dialog`, `export`, and `close` remain available. A blocked snapshot returns dialog metadata and `capture_status: "blocked_by_dialog"` instead of hanging.
+
+`fill` and `select` accept literal values or environment-backed values such as `{"env":"TEST_PASSWORD"}`. Playrust resolves and redacts environment values; responses, journals, reports, and exported YAML contain the environment-variable name, never its plaintext value.
+
+`export` is nonterminal and writes `<artifacts>/<name>/` with canonical `replay.yaml`, `session.ndjson`, `report.json`, referenced screenshots, and a pending recording result. Always export before close: `close` finalizes `recording.mp4` (or documents a partial recording) and the report into that bundle. If no export was requested, close uses the normal `session-<id>/` artifact directory. Validate exported flows with `playrust check <bundle>/replay.yaml`; replay them in a fresh browser with `playrust run`.
+
+`submit`, `inspect`, `output`, and `cancel` remain protocol v1 compatibility commands. `submit` still accepts a complete inline YAML V1 flow, but must match the established session viewport/geolocation and does not start or stop the continuous recorder. `inspect` retains its existing raw response shape and is deprecated in favor of `snapshot`. See [`docs/session-protocol.md`](docs/session-protocol.md) for command/result shapes, recovery rules, stable errors, and the 1 MiB envelope limit.
+
+## Running and replaying flows
+
+Exported `replay.yaml` bundles — and hand-written flows — run headlessly with `playrust run`. Serve the included page in one terminal:
 
 ```sh
 python3 -m http.server 8000 --directory examples
@@ -62,36 +100,17 @@ playrust run <path> [--headed] [--jobs N] [--browser PATH]
                     [--var NAME=VALUE] [--video MODE]
                     [--ffmpeg-path PATH] [--artifacts DIR] [--junit] [--html]
 playrust session --protocol ndjson [--headed] [--browser PATH]
+                    [--viewport WIDTHxHEIGHT] [--timeout DURATION]
+                    [--video on|off]
+                    [--dialog-policy explicit|accept|dismiss]
                     [--ffmpeg-path PATH] [--artifacts DIR]
 ```
 
 `run` defaults to headless mode, retained video recording, up to four concurrent flows, and `./playrust-artifacts`. Use `--video off` to disable recording or `--jobs 1` for sequential execution. Exit codes are `0` for success, `2` for invalid input/specification, `3` for an automation or assertion failure, `4` for infrastructure/recording failure, and `130` when interrupted.
 
-## Persistent sessions
-
-`playrust session --protocol ndjson` keeps one isolated Chromium context open in the foreground. It reads one JSON command per stdin line and writes one JSON response per stdout line; diagnostics go only to stderr. Every response contains the command `id`, `ok`, stable `session_id`, monotonically increasing `revision`, and either `result` or a structured `error`.
-
-Commands use these forms:
-
-```json
-{"id":"1","command":"submit","flow":"version: 1\nname: open\nsettings: { video: off }\nsteps: [{ open: https://example.com }]\n","variables":{}}
-{"id":"2","command":"inspect","accessibility":true,"screenshot":true}
-{"id":"3","command":"output","name":"saved_value"}
-{"id":"4","command":"cancel"}
-{"id":"5","command":"close"}
-```
-
-`submit` accepts one complete inline YAML V1 flow. Browser storage, tabs, active tab/frame, page JavaScript state, and saved runtime outputs persist into later submissions. Guards, loop state, retries, recording, and artifacts are new for each submission. The first valid submission fixes viewport and geolocation; a later conflict is rejected before execution. A later flow may consume an earlier saved output with `${name}`, and `output` explicitly returns its JSON value.
-
-Only one submission mutates the session at a time. While it runs, `cancel` and `close` are accepted; other commands return `busy`. Malformed commands, validation errors, settings conflicts, page-script exceptions, HTTP request failures, and ordinary automation failures leave the session available. Once active cancellation is acknowledged, that submission is terminally cancelled and the process exits 130 even if execution concurrently finishes; infrastructure failures still win with exit 4. Browser/CDP protocol, recording, artifact, session transport, or inspection failures close the session. Accessibility inspection is bounded to depth 8, 500 nodes, and 256 KiB; page listings are bounded to 100. An optional inspection screenshot returns its artifact path rather than embedding image bytes. See [`docs/session-protocol.md`](docs/session-protocol.md) for the complete wire contract and 1 MiB command-envelope limit.
-
-Session artifacts are written under `<artifacts>/session-<id>/`, with separate `submission-NNNNNN/` and `inspection-NNNNNN/` directories. The session-level `report.json` is atomically replaced after every completed submission and aggregates all submission reports.
-
-The first session slice accepts inline flows only. `run` subflows and screenshot assertions with workspace baseline files are explicitly rejected. Other filesystem-backed flow discovery remains available through `playrust run`.
-
 ## YAML V1
 
-Every file requires `version: 1`, a non-empty `name`, and non-empty `steps`. Unknown fields, duplicate keys, aliases, merge keys, unresolved inputs, and multiple operations in one step are rejected. A step may also have a unique `id` and a `timeout` using an integer followed by `ms`, `s`, or `m`.
+This is the format sessions export and `run` executes — flows are bounded, statically checkable data, never code. Every file requires `version: 1`, a non-empty `name`, and non-empty `steps`. Unknown fields, duplicate keys, aliases, merge keys, unresolved inputs, and multiple operations in one step are rejected. A step may also have a unique `id` and a `timeout` using an integer followed by `ms`, `s`, or `m`.
 
 Defaults are a `10s` timeout, `1280x720` viewport, and video `on`.
 
@@ -190,6 +209,7 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 | Screenshot | `screenshot: { name: dashboard }` |
 | Start recording | `recording: start` |
 | Stop recording | `recording: stop` |
+| Handle native dialog | `dialog: { action: accept }`, `dialog: { action: dismiss }`, or `dialog: { action: accept, text: "${answer}" }` |
 | Clear cookies | `clear: cookies` |
 | Clear local and session storage | `clear: storage` |
 | Clear IndexedDB | `clear: indexeddb` |
@@ -203,6 +223,8 @@ Click, double click, fill, erase, select, swipe, long press, and press wait for 
 Scroll sends one wheel input at the viewport center; positive values move right/down and negative values move left/up, and at least one axis must be non-zero. `scroll_until_visible` repeats one bounded wheel delta until its unique target is visible or the step deadline expires, allowing a target that is initially absent from a virtualized list. Its `x` and `y` values, and swipe offsets, are limited to `-10000..=10000` CSS pixels and cannot both be zero. A swipe endpoint must remain inside the viewport. Swipe defaults to `300ms`; long press defaults to `500ms`; either duration must be positive and at most `10s`, and must fit within the remaining step deadline.
 
 `wait_until_visible` is the explicit positive visibility wait; set a longer step `timeout` when the normal flow timeout is too short. `wait_until_stable` waits for a unique visible target whose bounding box is unchanged across two polling samples. Both use the same locator polling and deadline diagnostics as actionability. Back navigates one browser-history entry and fails when there is no previous entry. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
+
+`dialog` responds to a pending native `alert`, `confirm`, `prompt`, or `beforeunload` dialog. Prompt text is optional and is valid only with `action: accept`. The step fails as an automation error when no dialog is pending.
 
 `switch_page: popup` waits for exactly one page opened by the active page; `switch_page: opener` returns to its opener. `{ name: value }` matches the exact `window.name`, and `{ url: value }` matches one exact resolved HTTP(S) URL; a relative URL requires `base_url`. Named and URL selectors search only the current flow's isolated browser context and fail if multiple pages match. Page switching requires `settings.video: off` because chromiumoxide cannot safely hand an active screencast between page targets. The configured viewport and geolocation are applied to each newly active page. Locators, URL assertions and failure diagnostics, screenshots, storage clearing, and subsequent actions use the active page. The isolated browser context owns and cleans up every page.
 
@@ -318,9 +340,9 @@ Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`
 
 With no recording steps, video still covers the whole flow. To record one deliberate segment, add exactly one ordered `recording: start` / `recording: stop` pair; `check` rejects unmatched, reversed, or repeated controls after subflows are expanded. `--video off` makes a valid pair a no-op. A failure or interruption before `stop` still finalizes and reports the active recording. A completed manual recording remains reportable if a later step fails, and `retain-on-failure` removes it only after the entire flow passes.
 
-Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libvpx-vp9` encoder. Playrust records the fixed page viewport as silent 15 FPS WebM/VP9; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
+Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libx264` encoder. Playrust records the fixed page viewport as silent 15 FPS MP4/H.264 for broad player compatibility; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 
-Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically write `<artifacts>/junit.xml`; automation failures are JUnit failures, while invalid specifications, infrastructure failures, and interruptions are JUnit errors. Pass `--html` to atomically write `<artifacts>/report.html`, a self-contained static summary with inline CSS, no scripts or external resources, and plain-text artifact paths. Optional reports are removed when their flags are omitted, so stale output cannot be mistaken for the current run. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. A failed screenshot assertion retains `__visual-<step>-actual.png` and a `__visual-<step>-diff.png` whose changed pixels are red, reported as `visual_actual` and `visual_diff`; diagnostics do not expose the baseline path. Per-flow directories may also contain `failure.png`, `recording.webm`, or `recording.partial.webm` when finalization fails. Change the root with `--artifacts DIR`.
+Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically write `<artifacts>/junit.xml`; automation failures are JUnit failures, while invalid specifications, infrastructure failures, and interruptions are JUnit errors. Pass `--html` to atomically write `<artifacts>/report.html`, a self-contained static summary with inline CSS, no scripts or external resources, and plain-text artifact paths. Optional reports are removed when their flags are omitted, so stale output cannot be mistaken for the current run. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. A failed screenshot assertion retains `__visual-<step>-actual.png` and a `__visual-<step>-diff.png` whose changed pixels are red, reported as `visual_actual` and `visual_diff`; diagnostics do not expose the baseline path. Per-flow directories may also contain `failure.png`, `recording.mp4`, or `recording.partial.mp4` when finalization fails. Change the root with `--artifacts DIR`.
 
 ## Boundaries
 

@@ -51,7 +51,7 @@ pub fn assert_png(path: &Path, expected: (u32, u32)) {
     );
 }
 
-pub fn assert_vp9_video(path: &Path) {
+pub fn assert_h264_video(path: &Path) {
     let ffprobe = env::var_os("PLAYRUST_FFPROBE").unwrap_or_else(|| "ffprobe".into());
     let output = Command::new(ffprobe)
         .args([
@@ -69,7 +69,7 @@ pub fn assert_vp9_video(path: &Path) {
         .expect("run ffprobe");
     assert_success("ffprobe", &output);
     let metadata = String::from_utf8_lossy(&output.stdout);
-    assert!(metadata.contains("codec_name=vp9"), "{metadata}");
+    assert!(metadata.contains("codec_name=h264"), "{metadata}");
     assert!(metadata.contains("width=1280"), "{metadata}");
     assert!(metadata.contains("height=720"), "{metadata}");
 }

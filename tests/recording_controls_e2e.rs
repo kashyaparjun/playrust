@@ -125,7 +125,7 @@ async fn preflight(flow: &playrust::flow::CompiledFlow, ffmpeg: &Path, directory
     preflight_ffmpeg(&VideoConfig {
         mode: flow.settings.video,
         ffmpeg_path: ffmpeg.to_owned(),
-        output_path: directory.join("recording.webm"),
+        output_path: directory.join("recording.mp4"),
         viewport_width: flow.settings.viewport.width,
         viewport_height: flow.settings.viewport.height,
     })

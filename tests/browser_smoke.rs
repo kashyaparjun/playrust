@@ -453,7 +453,7 @@ steps:
     preflight_ffmpeg(&VideoConfig {
         mode: flow.settings.video,
         ffmpeg_path: ffmpeg.clone(),
-        output_path: artifacts.path().join("recording.webm"),
+        output_path: artifacts.path().join("recording.mp4"),
         viewport_width: flow.settings.viewport.width,
         viewport_height: flow.settings.viewport.height,
     })
@@ -503,7 +503,7 @@ steps:
         String::from_utf8_lossy(&probe.stderr)
     );
     let metadata = String::from_utf8_lossy(&probe.stdout);
-    assert!(metadata.contains("codec_name=vp9"), "{metadata}");
+    assert!(metadata.contains("codec_name=h264"), "{metadata}");
     assert!(metadata.contains("width=800"), "{metadata}");
     assert!(metadata.contains("height=600"), "{metadata}");
 }

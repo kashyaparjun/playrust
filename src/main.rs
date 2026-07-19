@@ -11,6 +11,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use playrust::browser::BrowserHost;
 use playrust::flow::{
     CompiledFlow, FlowError, VideoMode, compile_file, compile_file_with_video, discover_flow_files,
+    parse_duration,
 };
 use playrust::install::{PINNED_CHROME_VERSION, install_browser, resolve_or_install_browser};
 use playrust::report::{
@@ -97,12 +98,65 @@ struct SessionArgs {
     /// Path to the pinned Chrome for Testing executable.
     #[arg(long)]
     browser: Option<PathBuf>,
-    /// Path to FFmpeg when inline submissions enable video.
+    /// Fixed viewport for the interactive session.
+    #[arg(long, default_value = "1280x720", value_name = "WIDTHxHEIGHT")]
+    viewport: SessionViewport,
+    /// Default timeout for interactive actions.
+    #[arg(long, default_value = "10s", value_parser = parse_session_timeout)]
+    timeout: Duration,
+    /// Record one continuous session video.
+    #[arg(long, value_enum, default_value_t = SessionVideoMode::On)]
+    video: SessionVideoMode,
+    /// Native JavaScript dialog handling policy.
+    #[arg(long, value_enum, default_value_t = SessionDialogPolicy::Explicit)]
+    dialog_policy: SessionDialogPolicy,
+    /// Path to FFmpeg for continuous session recording.
     #[arg(long)]
     ffmpeg_path: Option<PathBuf>,
     /// Root directory for session artifacts.
     #[arg(long, default_value = DEFAULT_ARTIFACTS)]
     artifacts: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SessionVideoMode {
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SessionDialogPolicy {
+    Explicit,
+    Accept,
+    Dismiss,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SessionViewport {
+    width: u32,
+    height: u32,
+}
+
+impl FromStr for SessionViewport {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (width, height) = value
+            .split_once('x')
+            .ok_or_else(|| "viewport must use WIDTHxHEIGHT".to_owned())?;
+        let width = width
+            .parse::<u32>()
+            .map_err(|_| "viewport width must be a positive integer".to_owned())?;
+        let height = height
+            .parse::<u32>()
+            .map_err(|_| "viewport height must be a positive integer".to_owned())?;
+        playrust::browser::Viewport::new(width, height).map_err(|error| error.to_string())?;
+        Ok(Self { width, height })
+    }
+}
+
+fn parse_session_timeout(value: &str) -> Result<Duration, String> {
+    parse_duration("session timeout", value).map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -182,6 +236,12 @@ async fn main() {
 }
 
 async fn session(args: SessionArgs) -> ExitCode {
+    if matches!(args.video, SessionVideoMode::On)
+        && (!args.viewport.width.is_multiple_of(2) || !args.viewport.height.is_multiple_of(2))
+    {
+        eprintln!("error: session video requires even viewport width and height");
+        return ExitCode::Specification;
+    }
     let browser = match resolve_or_install_browser(args.browser.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
@@ -196,6 +256,25 @@ async fn session(args: SessionArgs) -> ExitCode {
                 headed: args.headed,
                 artifacts: args.artifacts,
                 ffmpeg_path: args.ffmpeg_path,
+                settings: playrust::runner::SessionSettings {
+                    timeout: args.timeout,
+                    viewport: playrust::flow::Viewport {
+                        width: args.viewport.width,
+                        height: args.viewport.height,
+                    },
+                    geolocation: None,
+                },
+                video: match args.video {
+                    SessionVideoMode::On => VideoMode::On,
+                    SessionVideoMode::Off => VideoMode::Off,
+                },
+                dialog_policy: match args.dialog_policy {
+                    SessionDialogPolicy::Explicit => {
+                        playrust::session_dialog::DialogPolicy::Explicit
+                    }
+                    SessionDialogPolicy::Accept => playrust::session_dialog::DialogPolicy::Accept,
+                    SessionDialogPolicy::Dismiss => playrust::session_dialog::DialogPolicy::Dismiss,
+                },
             })
             .await
         }
@@ -340,7 +419,7 @@ async fn run(args: RunArgs) -> ExitCode {
         let preflight = VideoConfig {
             mode: VideoMode::On,
             ffmpeg_path: ffmpeg_path.clone(),
-            output_path: args.artifacts.join("preflight.webm"),
+            output_path: args.artifacts.join("preflight.mp4"),
             viewport_width: first_video.flow.settings.viewport.width,
             viewport_height: first_video.flow.settings.viewport.height,
         };
@@ -786,6 +865,59 @@ mod tests {
     }
 
     #[test]
+    fn session_cli_defaults_and_overrides_are_bounded() {
+        let cli = Cli::try_parse_from(["playrust", "session", "--protocol", "ndjson"])
+            .expect("default session CLI");
+        let Command::Session(defaults) = cli.command else {
+            panic!("expected session command");
+        };
+        assert_eq!(
+            (defaults.viewport.width, defaults.viewport.height),
+            (1280, 720)
+        );
+        assert_eq!(defaults.timeout, Duration::from_secs(10));
+        assert!(matches!(defaults.video, SessionVideoMode::On));
+        assert!(matches!(
+            defaults.dialog_policy,
+            SessionDialogPolicy::Explicit
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "playrust",
+                "session",
+                "--protocol",
+                "ndjson",
+                "--viewport",
+                "bad",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "playrust",
+                "session",
+                "--protocol",
+                "ndjson",
+                "--video",
+                "retain-on-failure",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "playrust",
+                "session",
+                "--protocol",
+                "ndjson",
+                "--dialog-policy",
+                "ignore",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn video_override_is_applied_before_viewport_validation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("odd.yaml");
@@ -853,7 +985,7 @@ mod tests {
                     completed.fetch_add(1, Ordering::SeqCst);
                     ArtifactPaths {
                         directory: format!("flow-{index}"),
-                        recording: Some(format!("flow-{index}/recording.webm")),
+                        recording: Some(format!("flow-{index}/recording.mp4")),
                         ..ArtifactPaths::default()
                     }
                 }
@@ -879,8 +1011,8 @@ mod tests {
                     .and_then(|report| report.recording.as_deref()))
                 .collect::<Vec<_>>(),
             vec![
-                Some("flow-0/recording.webm"),
-                Some("flow-1/recording.webm"),
+                Some("flow-0/recording.mp4"),
+                Some("flow-1/recording.mp4"),
                 None,
                 None,
             ]
@@ -922,7 +1054,7 @@ mod tests {
                             .join("started")
                             .to_string_lossy()
                             .into_owned(),
-                        recording: Some("started/recording.webm".to_owned()),
+                        recording: Some("started/recording.mp4".to_owned()),
                         ..ArtifactPaths::default()
                     },
                 }),
@@ -934,7 +1066,7 @@ mod tests {
         assert_eq!(reports[0].duration_ms, 42);
         assert_eq!(
             reports[0].artifacts.recording.as_deref(),
-            Some("started/recording.webm")
+            Some("started/recording.mp4")
         );
         assert_eq!(reports[1].status, FlowStatus::Interrupted);
         assert_eq!(

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use playrust::report::FlowStatus;
-use support::{assert_png, assert_success, assert_vp9_video, ffmpeg_path, playrust, read_report};
+use support::{assert_h264_video, assert_png, assert_success, ffmpeg_path, playrust, read_report};
 
 const FLOW: &str = r##"version: 1
 name: wikipedia-navigation
@@ -56,7 +56,7 @@ fn navigation_flow_uses_environment_defaults_and_cropped_artifacts() {
     let flow = &report.flows[0];
     assert_eq!(flow.status, FlowStatus::Passed);
     assert_png(Path::new(&flow.artifacts.screenshots[0]), (640, 360));
-    assert_vp9_video(Path::new(
+    assert_h264_video(Path::new(
         flow.artifacts.recording.as_deref().expect("recording"),
     ));
 }

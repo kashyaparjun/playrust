@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use playrust::report::FlowStatus;
-use support::{assert_png, assert_vp9_video, ffmpeg_path, playrust, read_report};
+use support::{assert_h264_video, assert_png, ffmpeg_path, playrust, read_report};
 
 const FLOW: &str = r##"version: 1
 name: wikipedia-redaction-failure
@@ -71,7 +71,7 @@ fn failed_flow_redacts_secrets_and_retains_debug_artifacts() {
         ),
         (1280, 720),
     );
-    assert_vp9_video(Path::new(
+    assert_h264_video(Path::new(
         flow.artifacts.recording.as_deref().expect("recording"),
     ));
 }
