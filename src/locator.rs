@@ -11,7 +11,7 @@ use chromiumoxide::cdp::browser_protocol::dom::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{FrameId, GetFrameTreeParams};
 use chromiumoxide::cdp::js_protocol::runtime::{
-    CallArgument, CallFunctionOnParams, ReleaseObjectParams,
+    CallArgument, CallFunctionOnParams, ExceptionDetails, ReleaseObjectParams,
 };
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
@@ -25,6 +25,7 @@ use crate::oopif::CdpTarget;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const TEXT_MATCH_FUNCTION: &str = r#"function(expected, exact) {
+  try {
     const normalize = value => value.replace(/\s+/gu, ' ').trim();
     const text = element => element.innerText ?? element.textContent ?? '';
     const visible = element => {
@@ -43,6 +44,9 @@ const TEXT_MATCH_FUNCTION: &str = r#"function(expected, exact) {
     return !Array.from(this.querySelectorAll('*')).some(element =>
         visible(element) && matches(normalize(text(element)))
     );
+  } catch {
+    return false;
+  }
 }"#;
 
 const FORM_CONTROL_FUNCTION: &str = r#"function() {
@@ -757,7 +761,7 @@ impl<'page> LocatorEngine<'page> {
         if let Some(exception) = response.exception_details {
             return Err(LocatorError::Protocol(format!(
                 "page function threw: {}",
-                exception.text
+                exception_message(&exception)
             )));
         }
         let value = response.result.value.ok_or_else(|| {
@@ -792,7 +796,7 @@ impl<'page> LocatorEngine<'page> {
         if let Some(exception) = response.exception_details {
             return Err(LocatorError::Protocol(format!(
                 "page relation function threw: {}",
-                exception.text
+                exception_message(&exception)
             )));
         }
         serde_json::from_value(response.result.value.ok_or_else(|| {
@@ -1016,6 +1020,14 @@ fn protocol(error: impl fmt::Display) -> LocatorError {
     LocatorError::Protocol(error.to_string())
 }
 
+fn exception_message(exception: &ExceptionDetails) -> &str {
+    exception
+        .exception
+        .as_ref()
+        .and_then(|object| object.description.as_deref())
+        .unwrap_or(&exception.text)
+}
+
 pub(crate) fn retryable(error: &LocatorError) -> bool {
     let LocatorError::Protocol(message) = error else {
         return false;
@@ -1073,6 +1085,27 @@ mod tests {
         ));
         assert!(!text_matches("sign in", "Sign in", TextMatch::Exact));
         assert!(TEXT_MATCH_FUNCTION.contains("innerText ?? element.textContent ?? ''"));
+        assert!(TEXT_MATCH_FUNCTION.contains("catch"));
+    }
+
+    #[test]
+    fn javascript_exception_description_is_preferred_over_uncaught() {
+        let exception = serde_json::from_value(serde_json::json!({
+            "exceptionId": 1,
+            "text": "Uncaught",
+            "lineNumber": 2,
+            "columnNumber": 3,
+            "exception": {
+                "type": "object",
+                "description": "TypeError: incompatible node\n    at text (<anonymous>:2:3)"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            exception_message(&exception),
+            "TypeError: incompatible node\n    at text (<anonymous>:2:3)"
+        );
     }
 
     #[test]

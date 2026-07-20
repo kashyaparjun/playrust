@@ -645,7 +645,7 @@ async fn fill_replaces_all_supported_text_controls_in_chrome() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn mixed_namespace_text_and_digit_ids_resolve_in_chrome() {
+async fn incompatible_and_mixed_namespace_nodes_do_not_break_text_locators_in_chrome() {
     let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let context = host
@@ -654,7 +654,13 @@ async fn mixed_namespace_text_and_digit_ids_resolve_in_chrome() {
         .unwrap();
     let page = context.page().clone();
     page.set_content(
-        r#"<svg width="100" height="20"><text x="0" y="15">unrelated</text></svg>
+        r#"<script>
+              customElements.define('poison-text', class extends HTMLElement {
+                get innerText() { throw new TypeError('incompatible text node'); }
+              });
+            </script>
+            <poison-text>unrelated</poison-text>
+            <svg width="100" height="20"><text x="0" y="15">unrelated</text></svg>
             <math><mtext>also unrelated</mtext></math>
             <button id="2fa">Continue</button>"#,
     )
