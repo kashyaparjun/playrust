@@ -34,7 +34,7 @@ and Windows x86_64.
 Alternatively, install a tagged version from source with Rust 1.89 or newer:
 
 ```sh
-cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.2.0 playrust
+cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.2.1 playrust
 ```
 
 For a local checkout:
