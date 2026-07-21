@@ -42,6 +42,8 @@ pub const MAX_RUNTIME_VALUE_BYTES: usize = 64 * 1024;
 pub const MAX_HTTP_HEADERS: usize = 100;
 /// Maximum timeout accepted for flow settings or an individual step.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Maximum deliberate dwell time for one pause step.
+pub const MAX_PAUSE_DURATION: Duration = Duration::from_secs(60);
 pub const MAX_GESTURE_DELTA: i32 = 10_000;
 pub const MAX_GESTURE_DURATION: Duration = Duration::from_secs(10);
 pub const DEFAULT_SWIPE_DURATION: Duration = Duration::from_millis(300);
@@ -226,6 +228,7 @@ pub struct RawStep {
     pub long_press: Option<RawLongPress>,
     pub wait_until_visible: Option<RawTargetAction>,
     pub wait_until_stable: Option<RawTargetAction>,
+    pub pause: Option<String>,
     pub back: Option<RawEmpty>,
     pub switch_page: Option<RawPageSwitch>,
     pub switch_frame: Option<RawFrameSwitch>,
@@ -256,6 +259,7 @@ impl RawStep {
             self.long_press.is_some(),
             self.wait_until_visible.is_some(),
             self.wait_until_stable.is_some(),
+            self.pause.is_some(),
             self.back.is_some(),
             self.switch_page.is_some(),
             self.switch_frame.is_some(),
@@ -757,6 +761,9 @@ pub enum Operation {
     },
     WaitUntilStable {
         target: Locator,
+    },
+    Pause {
+        duration: Duration,
     },
     Back,
     SwitchPage(PageSwitch),
@@ -2354,6 +2361,18 @@ fn compile_operation(
                 inputs,
             )?,
         });
+    }
+    if let Some(raw) = step.pause {
+        let context = format!("step {index} pause");
+        let value = interpolate(&context, &raw, inputs)?;
+        let duration = parse_duration(&context, value.expose())?;
+        if duration > MAX_PAUSE_DURATION {
+            return invalid(format!(
+                "{context} must not exceed {} seconds",
+                MAX_PAUSE_DURATION.as_secs()
+            ));
+        }
+        return Ok(Operation::Pause { duration });
     }
     if let Some(raw) = step.wait_until_visible {
         return Ok(Operation::WaitUntilVisible {

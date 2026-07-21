@@ -1521,6 +1521,16 @@ async fn settle_video(page: &Page) {
     tokio::time::sleep(FINAL_FRAME_DELAY).await;
 }
 
+async fn pause_until(duration: Duration, deadline: Instant) -> Result<(), StepError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if duration > remaining {
+        tokio::time::sleep(remaining).await;
+        return Err(StepError::new(FailureCategory::Timeout, "step deadline expired").deadline());
+    }
+    tokio::time::sleep(duration).await;
+    Ok(())
+}
+
 async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
     match cancellation {
         Some(cancellation) => cancellation.cancelled().await,
@@ -1677,6 +1687,7 @@ async fn execute_step(
                 .await
                 .map(|_| None)
         }
+        Operation::Pause { duration } => pause_until(*duration, deadline).await.map(|_| None),
         Operation::Back if active.frame().is_some() => Err(StepError::new(
             FailureCategory::Navigation,
             "back navigation is unsupported inside a frame; switch_frame to main first",
@@ -3966,6 +3977,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::LongPress { .. } => "long_press",
         Operation::WaitUntilVisible { .. } => "wait_until_visible",
         Operation::WaitUntilStable { .. } => "wait_until_stable",
+        Operation::Pause { .. } => "pause",
         Operation::Back => "back",
         Operation::SwitchPage(PageSwitch::Popup) => "switch_page.popup",
         Operation::SwitchPage(PageSwitch::Opener) => "switch_page.opener",
@@ -4024,6 +4036,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::SwitchPage(_)
         | Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
         | Operation::Screenshot { .. }
+        | Operation::Pause { .. }
         | Operation::Recording(_)
         | Operation::Dialog { .. }
         | Operation::Clear(_)

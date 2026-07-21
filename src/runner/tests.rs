@@ -1,10 +1,31 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::flow::{compile_file, compile_yaml_with_env};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn pause_waits_until_duration_and_honors_deadline() {
+    let started = Instant::now();
+    assert!(
+        pause_until(
+            Duration::from_millis(25),
+            Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_ok()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    let error = pause_until(
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_millis(10),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.category, FailureCategory::Timeout);
+}
 
 #[test]
 fn modifier_bits_follow_cdp() {
