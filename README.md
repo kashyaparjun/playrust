@@ -188,7 +188,7 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 
 | Action | Form |
 | --- | --- |
-| Navigate | `open: /path` (requires `base_url`) or an absolute HTTP(S) URL |
+| Navigate | `open: /path` (requires `base_url`) or an absolute HTTP(S) URL; optionally `open: { url: /path, wait_until: { visible: { css: '#ready' } } }` or `stable` |
 | Click | `click: { target: { test_id: submit }, position: { x: 8, y: 12 } }` |
 | Click viewport point | `click: { point: { x: 100, y: 200 } }` |
 | Double click | `double_click: { target: { test_id: item }, position: { x: 8, y: 12 } }` |

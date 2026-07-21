@@ -214,7 +214,7 @@ pub struct RawStep {
     pub r#while: Option<RawWhile>,
     pub repeat: Option<usize>,
     pub retry: Option<usize>,
-    pub open: Option<String>,
+    pub open: Option<RawOpen>,
     pub click: Option<RawClick>,
     pub double_click: Option<RawClick>,
     pub fill: Option<RawFill>,
@@ -238,6 +238,27 @@ pub struct RawStep {
     pub request: Option<RawRequest>,
     #[serde(rename = "assert")]
     pub assertion: Option<RawAssertion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawOpen {
+    Url(String),
+    Options(RawOpenOptions),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawOpenOptions {
+    pub url: String,
+    pub wait_until: Option<RawOpenWaitUntil>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawOpenWaitUntil {
+    pub visible: Option<RawLocator>,
+    pub stable: Option<RawLocator>,
 }
 
 impl RawStep {
@@ -710,6 +731,7 @@ pub enum Expression {
 pub enum Operation {
     Open {
         url: Resolved<Url>,
+        wait_until: Option<OpenWaitUntil>,
     },
     Click {
         target: Locator,
@@ -790,6 +812,12 @@ pub enum Operation {
         save_as: Option<String>,
     },
     Assert(Assertion),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpenWaitUntil {
+    Visible(Locator),
+    Stable(Locator),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2224,8 +2252,12 @@ fn compile_operation(
     }
 
     if let Some(raw) = step.open {
-        let value = interpolate(&format!("step {index} open"), &raw, inputs)?;
-        require_non_empty(&format!("step {index} open"), value.expose())?;
+        let (raw_url, raw_wait_until) = match raw {
+            RawOpen::Url(url) => (url, None),
+            RawOpen::Options(options) => (options.url, options.wait_until),
+        };
+        let value = interpolate(&format!("step {index} open.url"), &raw_url, inputs)?;
+        require_non_empty(&format!("step {index} open.url"), value.expose())?;
         let (url, base_secret) = match Url::parse(value.expose()) {
             Ok(url) => (
                 validate_http_url(&format!("step {index} open"), url)?,
@@ -2247,8 +2279,25 @@ fn compile_operation(
             }
             Err(_) => return invalid(format!("step {index} open is not a valid URL")),
         };
+        let wait_until = raw_wait_until
+            .map(|wait| match (wait.visible, wait.stable) {
+                (Some(_), Some(_)) => Err(FlowError::Invalid(format!(
+                    "step {index} open.wait_until must contain exactly one condition"
+                ))),
+                (Some(target), None) => Ok(OpenWaitUntil::Visible(compile_locator(
+                    target, index, inputs,
+                )?)),
+                (None, Some(target)) => Ok(OpenWaitUntil::Stable(compile_locator(
+                    target, index, inputs,
+                )?)),
+                (None, None) => Err(FlowError::Invalid(format!(
+                    "step {index} open.wait_until must contain visible or stable"
+                ))),
+            })
+            .transpose()?;
         return Ok(Operation::Open {
             url: Resolved::new(url, value.secret || base_secret),
+            wait_until,
         });
     }
     if let Some(raw) = step.click {

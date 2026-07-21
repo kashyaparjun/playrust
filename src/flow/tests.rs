@@ -14,6 +14,37 @@ fn error(source: &str) -> String {
 }
 
 #[test]
+fn compiles_open_wait_until_visible_and_stable_mapping_forms() {
+    let flow = compile("version: 1\nname: x\nbase_url: https://example.test\nsteps:\n  - open: { url: /dashboard, wait_until: { visible: { css: '#ready' } } }\n  - open: { url: https://example.test/other, wait_until: { stable: { test_id: content } } }\n").unwrap();
+    assert!(matches!(
+        flow.steps[0].operation,
+        Operation::Open {
+            wait_until: Some(OpenWaitUntil::Visible(_)),
+            ..
+        }
+    ));
+    assert!(matches!(
+        flow.steps[1].operation,
+        Operation::Open {
+            wait_until: Some(OpenWaitUntil::Stable(_)),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scalar_open_remains_backward_compatible() {
+    let flow = compile("version: 1\nname: x\nsteps: [{ open: https://example.test }]\n").unwrap();
+    assert!(matches!(
+        flow.steps[0].operation,
+        Operation::Open {
+            wait_until: None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn inline_flows_can_consume_prior_outputs_but_not_workspace_files() {
     let available = BTreeSet::from(["prior".to_owned()]);
     let flow = compile_inline_yaml(
@@ -98,7 +129,7 @@ steps:
     assert_eq!(flow.steps.len(), 15);
     assert!(matches!(
         &flow.steps[0].operation,
-        Operation::Open { url } if url.expose().as_str() == "https://example.test/home"
+        Operation::Open { url, .. } if url.expose().as_str() == "https://example.test/home"
     ));
     assert!(matches!(
         &flow.steps[3].operation,
@@ -1027,7 +1058,7 @@ fn expands_nested_subflows_in_place_with_file_scoped_configuration() {
     assert_eq!(flow.steps[2].timeout, DEFAULT_TIMEOUT);
     assert!(matches!(
         &flow.steps[1].operation,
-        Operation::Open { url } if url.expose().as_str() == "https://child.test/base/page"
+        Operation::Open { url, .. } if url.expose().as_str() == "https://child.test/base/page"
     ));
     assert!(matches!(
         &flow.steps[2].operation,

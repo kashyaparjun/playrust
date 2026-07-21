@@ -47,8 +47,9 @@ use crate::browser::{BrowserContext, BrowserHost, BrowserStatus, Geolocation, Vi
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
     Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey,
-    NativeDialogResponse, Operation, PageSwitch, RecordingControl, Redactor, RelationKind,
-    RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation, When,
+    NativeDialogResponse, OpenWaitUntil, Operation, PageSwitch, RecordingControl, Redactor,
+    RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
+    When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -1568,9 +1569,22 @@ async fn execute_step(
         return Ok(None);
     }
     match &step.operation {
-        Operation::Open { url } => navigate(active, url.expose().as_str(), deadline)
-            .await
-            .map(|_| None),
+        Operation::Open { url, wait_until } => {
+            navigate(active, url.expose().as_str(), deadline).await?;
+            if let Some(wait_until) = wait_until {
+                match wait_until {
+                    OpenWaitUntil::Visible(target) => {
+                        wait_actionable(active, target, Actionability::VISIBLE, None, deadline)
+                            .await?;
+                    }
+                    OpenWaitUntil::Stable(target) => {
+                        wait_actionable(active, target, Actionability::STABLE, None, deadline)
+                            .await?;
+                    }
+                }
+            }
+            Ok(None)
+        }
         Operation::Click { target, position } => {
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
