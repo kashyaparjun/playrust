@@ -645,6 +645,86 @@ pub struct CompiledFlow {
     pub redactor: Redactor,
 }
 
+pub const SECRET_RECORDING_WARNING: &str =
+    "WARNING: video or screenshots may capture secret-derived or runtime-output-derived values";
+
+impl CompiledFlow {
+    /// Returns a stable, value-free warning for flows whose captured artifacts may contain
+    /// sensitive input or runtime output values.
+    pub fn recording_warnings(&self) -> Vec<&'static str> {
+        let captures = self.settings.video != VideoMode::Off
+            || self
+                .steps
+                .iter()
+                .any(|step| matches!(step.operation, Operation::Screenshot { .. }));
+        if captures
+            && self
+                .steps
+                .iter()
+                .any(|step| sensitive_operation(&step.operation))
+        {
+            vec![SECRET_RECORDING_WARNING]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn sensitive_operation(operation: &Operation) -> bool {
+    match operation {
+        Operation::Open { url } => url.is_secret(),
+        Operation::SwitchPage(PageSwitch::Name(name)) => name.is_secret(),
+        Operation::SwitchPage(PageSwitch::Url(url)) => url.is_secret(),
+        Operation::Fill { target, value } | Operation::Select { target, value } => {
+            sensitive_locator(target) || value.is_secret()
+        }
+        Operation::Dialog { text, .. } => text.as_ref().is_some_and(RuntimeValue::is_secret),
+        Operation::Evaluate { args, .. } => args.iter().any(RuntimeValue::is_secret),
+        Operation::Request {
+            url, headers, body, ..
+        } => {
+            url.is_secret()
+                || headers.values().any(RuntimeValue::is_secret)
+                || body.as_ref().is_some_and(RuntimeValue::is_secret)
+        }
+        Operation::Assert(Assertion::Text {
+            target, expected, ..
+        }) => sensitive_locator(target) || expected.is_secret(),
+        Operation::Assert(Assertion::Url(expectation)) => match expectation {
+            UrlExpectation::Equals(url) => url.is_secret(),
+            UrlExpectation::Path(path) => path.is_secret(),
+        },
+        Operation::Click { target, .. }
+        | Operation::DoubleClick { target, .. }
+        | Operation::Erase { target }
+        | Operation::ScrollUntilVisible { target, .. }
+        | Operation::Swipe { target, .. }
+        | Operation::LongPress { target, .. }
+        | Operation::WaitUntilVisible { target }
+        | Operation::WaitUntilStable { target }
+        | Operation::Press { target, .. }
+        | Operation::SwitchFrame(FrameSwitch::Target(target)) => sensitive_locator(target),
+        _ => false,
+    }
+}
+
+fn sensitive_locator(locator: &Locator) -> bool {
+    let strategy_sensitive = match &locator.strategy {
+        LocatorStrategy::Css(value)
+        | LocatorStrategy::TestId(value)
+        | LocatorStrategy::Label(value) => value.is_secret(),
+        LocatorStrategy::Text { value, .. } => value.is_secret(),
+        LocatorStrategy::Role { value, name } => {
+            value.is_secret() || name.as_ref().is_some_and(Resolved::is_secret)
+        }
+    };
+    strategy_sensitive
+        || locator
+            .relations
+            .iter()
+            .any(|relation| sensitive_locator(&relation.locator))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowSettings {
     pub timeout: Duration,

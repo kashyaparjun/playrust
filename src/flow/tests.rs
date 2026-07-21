@@ -14,6 +14,39 @@ fn error(source: &str) -> String {
 }
 
 #[test]
+fn warns_when_recording_can_capture_secret_or_runtime_output_values() {
+    let secret = compile_yaml_with_env(
+        "version: 1\nname: secret\nsecrets: { token: { env: TOKEN } }\nsteps: [{ fill: { target: { css: '#token' }, value: '${token}' } }]\n",
+        "flows/example.yaml",
+        &BTreeMap::new(),
+        &BTreeMap::from([(String::from("TOKEN"), String::from("canary-secret"))]),
+    )
+    .unwrap();
+    assert_eq!(secret.recording_warnings().len(), 1);
+    let warning_json = serde_json::to_string(&secret.recording_warnings()).unwrap();
+    assert!(warning_json.contains("WARNING"));
+    assert!(!warning_json.contains("canary-secret"));
+
+    let output = compile(
+        "version: 1\nname: output\nsteps:\n  - evaluate: { script: 'return args[0]', args: [token], save_as: token }\n  - fill: { target: { css: '#token' }, value: '${token}' }\n",
+    )
+    .unwrap();
+    assert_eq!(output.recording_warnings().len(), 1);
+}
+
+#[test]
+fn does_not_warn_when_sensitive_values_have_no_recording_or_screenshot() {
+    let flow = compile_yaml_with_env(
+        "version: 1\nname: safe\nsettings: { video: off }\nsecrets: { token: { env: TOKEN } }\nsteps: [{ fill: { target: { css: '#token' }, value: '${token}' } }]\n",
+        "flows/example.yaml",
+        &BTreeMap::new(),
+        &BTreeMap::from([(String::from("TOKEN"), String::from("canary-secret"))]),
+    )
+    .unwrap();
+    assert!(flow.recording_warnings().is_empty());
+}
+
+#[test]
 fn inline_flows_can_consume_prior_outputs_but_not_workspace_files() {
     let available = BTreeSet::from(["prior".to_owned()]);
     let flow = compile_inline_yaml(

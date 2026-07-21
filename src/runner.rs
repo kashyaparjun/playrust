@@ -4109,6 +4109,11 @@ fn report(
             FlowStatus::Failed
         },
         failures,
+        warnings: flow
+            .recording_warnings()
+            .into_iter()
+            .map(SafeText::public)
+            .collect(),
         artifacts,
     }
 }

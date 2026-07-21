@@ -108,6 +108,8 @@ playrust session --protocol ndjson [--headed] [--browser PATH]
 
 `run` defaults to headless mode, retained video recording, up to four concurrent flows, and `./playrust-artifacts`. Use `--video off` to disable recording or `--jobs 1` for sequential execution. Exit codes are `0` for success, `2` for invalid input/specification, `3` for an automation or assertion failure, `4` for infrastructure/recording failure, and `130` when interrupted.
 
+When video recording or screenshots are enabled, Playrust reports a prominent, value-free warning if a flow uses a secret-derived or runtime-output-derived value. The warning is printed to stdout and stored in the flow's `warnings` array in `report.json`; it never includes the value itself. Disable video and omit screenshots when captured artifacts must not contain sensitive data.
+
 ## YAML V1
 
 This is the format sessions export and `run` executes — flows are bounded, statically checkable data, never code. Every file requires `version: 1`, a non-empty `name`, and non-empty `steps`. Unknown fields, duplicate keys, aliases, merge keys, unresolved inputs, and multiple operations in one step are rejected. A step may also have a unique `id` and a `timeout` using an integer followed by `ms`, `s`, or `m`.

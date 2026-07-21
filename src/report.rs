@@ -267,6 +267,9 @@ pub struct FlowReport {
     pub status: FlowStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<Failure>,
+    /// Value-free warnings about sensitive data appearing in captured artifacts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SafeText>,
     pub artifacts: ArtifactPaths,
 }
 
@@ -551,6 +554,7 @@ mod tests {
                 .map(|category| Failure::new(category, SafeText::public("failed")))
                 .into_iter()
                 .collect(),
+            warnings: Vec::new(),
             artifacts: ArtifactPaths::default(),
         }
     }
