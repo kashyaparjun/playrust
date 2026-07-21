@@ -244,7 +244,7 @@ pub struct RawStep {
 #[serde(untagged)]
 pub enum RawOpen {
     Url(String),
-    Options(RawOpenOptions),
+    Options(Box<RawOpenOptions>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
