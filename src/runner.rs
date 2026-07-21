@@ -47,8 +47,9 @@ use crate::browser::{BrowserContext, BrowserHost, BrowserStatus, Geolocation, Vi
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
     Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey,
-    NativeDialogResponse, Operation, PageSwitch, RecordingControl, Redactor, RelationKind,
-    RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation, When,
+    NativeDialogResponse, Operation, PageSwitch, PresentationOverlays, RecordingControl, Redactor,
+    RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
+    When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -717,6 +718,7 @@ impl SessionRuntime {
             stopped_loops: BTreeSet::new(),
             expects_dialog: false,
             dialog_listener: None,
+            presentation_overlays: PresentationOverlays::default(),
         };
         let deadline = Instant::now()
             .checked_add(step.timeout)
@@ -1231,6 +1233,7 @@ async fn execute_flow(
             .iter()
             .any(|step| matches!(step.operation, Operation::Dialog { .. })),
         dialog_listener: None,
+        presentation_overlays: flow.settings.overlays,
     };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut browser_status = host.subscribe_status();
@@ -1413,6 +1416,15 @@ async fn execute_flow(
             };
             match result {
                 Ok(Ok(screenshot)) => {
+                    if runtime.presentation_overlays != PresentationOverlays::default() {
+                        let _ = update_presentation_overlay(
+                            &active,
+                            step,
+                            &runtime.presentation_overlays,
+                            &runtime.redactor,
+                        )
+                        .await;
+                    }
                     if let Some(path) = screenshot {
                         artifacts.screenshots.push(path_text(&path));
                     }
@@ -1553,6 +1565,58 @@ struct RuntimeState {
     stopped_loops: BTreeSet<usize>,
     expects_dialog: bool,
     dialog_listener: Option<EventStream<EventJavascriptDialogOpening>>,
+    presentation_overlays: PresentationOverlays,
+}
+
+async fn update_presentation_overlay(
+    active: &ActiveContext,
+    step: &CompiledStep,
+    overlays: &PresentationOverlays,
+    redactor: &Redactor,
+) -> Result<(), StepError> {
+    let url = if overlays.url {
+        redactor.redact(&active.url().await.map_err(protocol)?.unwrap_or_default())
+    } else {
+        String::new()
+    };
+    let step_text = if overlays.step {
+        format!(
+            "Step {}{}",
+            step.index,
+            step.id
+                .as_deref()
+                .map_or(String::new(), |id| format!(" · {id}"))
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        r#"(() => {{
+            const id = 'playrust-presentation-overlay';
+            let root = document.getElementById(id);
+            if (!root) {{
+                root = document.createElement('div');
+                root.id = id;
+                root.style.cssText = 'position:fixed;z-index:2147483647;left:0;right:0;top:0;pointer-events:none;font:600 14px sans-serif;color:white;text-shadow:0 1px 2px #000';
+                document.documentElement.appendChild(root);
+            }}
+            root.replaceChildren();
+            const line = document.createElement('div');
+            line.style.cssText = 'display:flex;gap:16px;padding:10px 14px;background:rgba(0,0,0,.72);white-space:nowrap;overflow:hidden';
+            const add = value => {{ if (value) {{ const item = document.createElement('span'); item.textContent = value; line.appendChild(item); }} }};
+            add({step}); add({url}); root.appendChild(line);
+            if ({pointer}) {{
+                let cursor = document.getElementById(id + '-pointer');
+                if (!cursor) {{ cursor = document.createElement('div'); cursor.id = id + '-pointer'; document.documentElement.appendChild(cursor); document.addEventListener('pointermove', event => {{ cursor.style.left = event.clientX + 'px'; cursor.style.top = event.clientY + 'px'; }}); }}
+                cursor.style.cssText = 'position:fixed;z-index:2147483647;width:18px;height:18px;border:3px solid #ff3b30;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;left:50%;top:50%';
+            }}
+        }})()"#,
+        step = serde_json::to_string(&step_text).expect("overlay step serializes"),
+        url = serde_json::to_string(&url).expect("overlay URL serializes"),
+        pointer = overlays.pointer,
+    );
+    active.page.evaluate(script).await.map_err(protocol)?;
+    Ok(())
 }
 
 async fn execute_step(

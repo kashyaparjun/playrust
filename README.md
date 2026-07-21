@@ -120,7 +120,10 @@ settings:
   viewport: { width: 1280, height: 720 }
   video: retain-on-failure
   geolocation: { latitude: 51.5074, longitude: -0.1278, accuracy: 10 }
+  overlays: { step: true, url: true, pointer: true }
 ```
+
+Presentation overlays are opt-in and are rendered into the page before the next screencast frame. `step` shows the compiled step number and non-secret id, `url` shows the current URL after redaction, and `pointer` draws a movable pointer marker. They affect recordings only; with all options omitted (the default), page output and recordings are unchanged. Never put secrets or runtime outputs in step ids or URLs intended for presentation.
 
 `geolocation` is optional. Latitude must be between `-90` and `90`, longitude between `-180` and `180`, and accuracy must be a non-negative number in meters; accuracy defaults to `0`. When set, Playrust grants geolocation permission only in that flow's isolated browser context and applies the coordinates to its page before any steps run.
 
