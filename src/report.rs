@@ -519,7 +519,7 @@ pub fn write_html_report(
         }
     })?;
     temporary
-        .write_all(html::render(report).as_bytes())
+        .write_all(html::render(report, artifacts_root).as_bytes())
         .map_err(WriteReportError::Flush)?;
     temporary.flush().map_err(WriteReportError::Flush)?;
     temporary
@@ -739,7 +739,7 @@ mod tests {
             vec![passed, failed, flow(FlowStatus::Interrupted, None)],
         );
 
-        let html = html::render(&report);
+        let html = html::render(&report, Path::new("/tmp/nonexistent"));
 
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.ends_with('\n'));
@@ -762,6 +762,44 @@ mod tests {
         assert!(!html.contains(" href="));
         assert!(!html.contains(" src="));
         assert!(!html.contains('\u{1}'));
+    }
+
+    #[test]
+    fn html_embeds_existing_media_with_safe_relative_paths_and_marks_missing_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let screenshot = directory.path().join("flow-a").join("shot.png");
+        let recording = directory.path().join("flow-a").join("recording.mp4");
+        fs::create_dir_all(screenshot.parent().unwrap()).unwrap();
+        fs::write(&screenshot, b"png").unwrap();
+        fs::write(&recording, b"mp4").unwrap();
+        let mut artifact_report = flow(FlowStatus::Passed, None);
+        artifact_report.artifacts = ArtifactPaths {
+            directory: "artifacts".to_owned(),
+            screenshots: vec![screenshot.display().to_string()],
+            recording: Some(recording.display().to_string()),
+            failure_screenshot: Some(directory.path().join("missing.png").display().to_string()),
+            ..ArtifactPaths::default()
+        };
+        let report = AggregateReport::new(
+            RunnerInfo {
+                name: "playrust".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            1,
+            None,
+            1,
+            vec![artifact_report],
+        );
+
+        let html = html::render(&report, directory.path());
+
+        assert!(html.contains("href=\"flow-a/shot.png\""));
+        assert!(html.contains("src=\"flow-a/shot.png\""));
+        assert!(html.contains("<video controls"));
+        assert!(html.contains("src=\"flow-a/recording.mp4\""));
+        assert!(html.contains("Missing artifact"));
+        assert!(!html.contains(&format!("href=\"{}", directory.path().display())));
+        assert!(!html.contains(&format!("src=\"{}", directory.path().display())));
     }
 
     #[test]
