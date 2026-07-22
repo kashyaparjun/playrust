@@ -1147,6 +1147,7 @@ fn prepare_action(
             | "switch_frame"
             | "wait_until_visible"
             | "wait_until_stable"
+            | "pause"
             | "assert"
     ) {
         return Err(validation_error(format!(

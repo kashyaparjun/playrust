@@ -1,10 +1,73 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::flow::{compile_file, compile_yaml_with_env};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test]
+async fn pause_waits_until_duration_and_honors_deadline() {
+    let started = Instant::now();
+    assert!(
+        pause_until(
+            Duration::from_millis(25),
+            Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_ok()
+    );
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    let error = pause_until(
+        Duration::from_secs(1),
+        Instant::now() + Duration::from_millis(10),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.category, FailureCategory::Timeout);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn cancelling_an_in_flight_compiled_pause_interrupts_the_flow() {
+    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let host = BrowserHost::launch(chrome, false).await.unwrap();
+    let flow = crate::flow::compile_yaml(
+        "version: 1\nname: cancelled-pause\nsettings: { timeout: 30s, video: off }\nsteps: [{ pause: 20s }]\n",
+        "cancelled-pause.yaml",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let cancellation = CancellationToken::new();
+    let (pause_started, pause_started_rx) = tokio::sync::oneshot::channel();
+    let pause_started = Arc::new(Mutex::new(Some(pause_started)));
+    let mut options = RunOptions::new(artifacts.path()).with_cancellation(cancellation.clone());
+    options.step_started_observer = Some(StepStartedObserver(Arc::new(move |operation| {
+        if operation == "pause"
+            && let Some(sender) = pause_started.lock().unwrap().take()
+        {
+            let _ = sender.send(());
+        }
+    })));
+    let run = run_flow(&host, &flow, &options);
+    let cancel_during_pause = async {
+        tokio::time::timeout(Duration::from_secs(5), pause_started_rx)
+            .await
+            .expect("runner should enter the pause")
+            .expect("pause observer should remain open");
+        cancellation.cancel();
+    };
+    let (report, ()) = tokio::time::timeout(Duration::from_secs(7), async {
+        tokio::join!(run, cancel_during_pause)
+    })
+    .await
+    .expect("cancelled pause should return promptly");
+    assert_eq!(report.status, FlowStatus::Interrupted);
+    host.shutdown().await.unwrap();
+}
 
 #[test]
 fn modifier_bits_follow_cdp() {

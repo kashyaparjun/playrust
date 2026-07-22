@@ -377,6 +377,19 @@ pub struct RunOptions {
     pub artifact_directory: PathBuf,
     pub ffmpeg_path: Option<PathBuf>,
     pub cancellation: Option<CancellationToken>,
+    #[cfg(test)]
+    step_started_observer: Option<StepStartedObserver>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StepStartedObserver(Arc<dyn Fn(&'static str) + Send + Sync>);
+
+#[cfg(test)]
+impl fmt::Debug for StepStartedObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StepStartedObserver")
+    }
 }
 
 impl RunOptions {
@@ -385,6 +398,8 @@ impl RunOptions {
             artifact_directory: artifact_directory.into(),
             ffmpeg_path: None,
             cancellation: None,
+            #[cfg(test)]
+            step_started_observer: None,
         }
     }
 
@@ -1398,8 +1413,11 @@ async fn execute_flow(
                     error = Some(protocol(browser_error));
                     break;
                 }
-                result = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
+                result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    #[cfg(test)]
+                    if let Some(observer) = &options.step_started_observer {
+                        (observer.0)(operation_name(&step.operation));
+                    }
                     execute_step(
                         host,
                         &context_id,
@@ -1408,8 +1426,8 @@ async fn execute_flow(
                         deadline,
                         &options.artifact_directory,
                         &mut runtime,
-                    ),
-                ) => result,
+                    ).await
+                }) => result,
             };
             match result {
                 Ok(Ok(screenshot)) => {
@@ -1519,6 +1537,16 @@ async fn settle_video(page: &Page) {
     )
     .await;
     tokio::time::sleep(FINAL_FRAME_DELAY).await;
+}
+
+async fn pause_until(duration: Duration, deadline: Instant) -> Result<(), StepError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if duration > remaining {
+        tokio::time::sleep(remaining).await;
+        return Err(StepError::new(FailureCategory::Timeout, "step deadline expired").deadline());
+    }
+    tokio::time::sleep(duration).await;
+    Ok(())
 }
 
 async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
@@ -1677,6 +1705,7 @@ async fn execute_step(
                 .await
                 .map(|_| None)
         }
+        Operation::Pause { duration } => pause_until(*duration, deadline).await.map(|_| None),
         Operation::Back if active.frame().is_some() => Err(StepError::new(
             FailureCategory::Navigation,
             "back navigation is unsupported inside a frame; switch_frame to main first",
@@ -3966,6 +3995,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::LongPress { .. } => "long_press",
         Operation::WaitUntilVisible { .. } => "wait_until_visible",
         Operation::WaitUntilStable { .. } => "wait_until_stable",
+        Operation::Pause { .. } => "pause",
         Operation::Back => "back",
         Operation::SwitchPage(PageSwitch::Popup) => "switch_page.popup",
         Operation::SwitchPage(PageSwitch::Opener) => "switch_page.opener",
@@ -4024,6 +4054,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::SwitchPage(_)
         | Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
         | Operation::Screenshot { .. }
+        | Operation::Pause { .. }
         | Operation::Recording(_)
         | Operation::Dialog { .. }
         | Operation::Clear(_)
