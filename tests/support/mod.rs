@@ -74,6 +74,28 @@ pub fn assert_h264_video(path: &Path) {
     assert!(metadata.contains("height=720"), "{metadata}");
 }
 
+pub fn video_duration(path: &Path) -> Duration {
+    let ffprobe = env::var_os("PLAYRUST_FFPROBE").unwrap_or_else(|| "ffprobe".into());
+    let output = Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert_success("ffprobe", &output);
+    let seconds: f64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("numeric video duration");
+    Duration::from_secs_f64(seconds)
+}
+
 pub fn ffmpeg_path() -> String {
     env::var_os("PLAYRUST_FFMPEG")
         .unwrap_or_else(|| "ffmpeg".into())

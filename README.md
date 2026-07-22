@@ -201,6 +201,7 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 | Long press | `long_press: { target: { test_id: menu }, duration: 500ms }` |
 | Wait until visible | `wait_until_visible: { target: { css: .late } }` |
 | Wait until stable | `wait_until_stable: { target: { css: .animated } }` |
+| Deliberate pause | `pause: 1500ms` |
 | Navigate back | `back: {}` |
 | Switch page | `switch_page: popup`, `switch_page: opener`, `switch_page: { name: checkout }`, or `switch_page: { url: /checkout }` |
 | Enter iframe | `switch_frame: { target: { css: "#checkout" } }` |
@@ -223,6 +224,8 @@ Click, double click, fill, erase, select, swipe, long press, and press wait for 
 Scroll sends one wheel input at the viewport center; positive values move right/down and negative values move left/up, and at least one axis must be non-zero. `scroll_until_visible` repeats one bounded wheel delta until its unique target is visible or the step deadline expires, allowing a target that is initially absent from a virtualized list. Its `x` and `y` values, and swipe offsets, are limited to `-10000..=10000` CSS pixels and cannot both be zero. A swipe endpoint must remain inside the viewport. Swipe defaults to `300ms`; long press defaults to `500ms`; either duration must be positive and at most `10s`, and must fit within the remaining step deadline.
 
 `wait_until_visible` is the explicit positive visibility wait; set a longer step `timeout` when the normal flow timeout is too short. `wait_until_stable` waits for a unique visible target whose bounding box is unchanged across two polling samples. Both use the same locator polling and deadline diagnostics as actionability. Back navigates one browser-history entry and fails when there is no previous entry. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
+
+`pause` adds deliberate dwell time after a page is ready, for example so a recorded demo remains readable. Unlike the readiness waits above, it does not inspect the page or wait for a condition. Its duration must be positive and at most `60s`; the step stops early with the normal interruption or timeout result when flow cancellation or its step deadline occurs. Pause is an action and cannot use assertion retries.
 
 `dialog` responds to a pending native `alert`, `confirm`, `prompt`, or `beforeunload` dialog. Prompt text is optional and is valid only with `action: accept`. The step fails as an automation error when no dialog is pending.
 
@@ -346,6 +349,6 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 
 ## Boundaries
 
-Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports popup, opener, exact named/URL page selection, and the tested same-origin and cross-origin frame behavior described above. Shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Swipe and long press retain mouse semantics because desktop Chrome touch emulation synthesizes an additional, timing-incompatible mouse sequence. Flows are sequential and do not provide sleeps, mutable variables, unbounded loops, transactional subflow retries, dynamic paths, plugins, arbitrary host expressions, or a JavaScript sandbox.
+Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports popup, opener, exact named/URL page selection, and the tested same-origin and cross-origin frame behavior described above. Shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Swipe and long press retain mouse semantics because desktop Chrome touch emulation synthesizes an additional, timing-incompatible mouse sequence. Flows are sequential and provide only bounded, cancellable pauses—not unbounded sleeps—and do not provide mutable variables, unbounded loops, transactional subflow retries, dynamic paths, plugins, arbitrary host expressions, or a JavaScript sandbox.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.

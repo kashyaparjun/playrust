@@ -25,6 +25,21 @@ async fn pause_waits_until_duration_and_honors_deadline() {
     .await
     .unwrap_err();
     assert_eq!(error.category, FailureCategory::Timeout);
+
+    let cancellation = CancellationToken::new();
+    let cancel = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+    });
+    let started = Instant::now();
+    tokio::select! {
+        _ = wait_for_cancellation(Some(&cancellation)) => {}
+        _ = pause_until(Duration::from_secs(1), Instant::now() + Duration::from_secs(2)) => {
+            panic!("pause completed before cancellation");
+        }
+    }
+    assert!(started.elapsed() < Duration::from_millis(500));
 }
 
 #[test]
