@@ -377,6 +377,19 @@ pub struct RunOptions {
     pub artifact_directory: PathBuf,
     pub ffmpeg_path: Option<PathBuf>,
     pub cancellation: Option<CancellationToken>,
+    #[cfg(test)]
+    step_started_observer: Option<StepStartedObserver>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StepStartedObserver(Arc<dyn Fn(&'static str) + Send + Sync>);
+
+#[cfg(test)]
+impl fmt::Debug for StepStartedObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StepStartedObserver")
+    }
 }
 
 impl RunOptions {
@@ -385,6 +398,8 @@ impl RunOptions {
             artifact_directory: artifact_directory.into(),
             ffmpeg_path: None,
             cancellation: None,
+            #[cfg(test)]
+            step_started_observer: None,
         }
     }
 
@@ -1398,8 +1413,11 @@ async fn execute_flow(
                     error = Some(protocol(browser_error));
                     break;
                 }
-                result = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
+                result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    #[cfg(test)]
+                    if let Some(observer) = &options.step_started_observer {
+                        (observer.0)(operation_name(&step.operation));
+                    }
                     execute_step(
                         host,
                         &context_id,
@@ -1408,8 +1426,8 @@ async fn execute_flow(
                         deadline,
                         &options.artifact_directory,
                         &mut runtime,
-                    ),
-                ) => result,
+                    ).await
+                }) => result,
             };
             match result {
                 Ok(Ok(screenshot)) => {

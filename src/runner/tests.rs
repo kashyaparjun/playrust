@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -25,21 +27,46 @@ async fn pause_waits_until_duration_and_honors_deadline() {
     .await
     .unwrap_err();
     assert_eq!(error.category, FailureCategory::Timeout);
+}
 
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn cancelling_an_in_flight_compiled_pause_interrupts_the_flow() {
+    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let host = BrowserHost::launch(chrome, false).await.unwrap();
+    let flow = crate::flow::compile_yaml(
+        "version: 1\nname: cancelled-pause\nsettings: { timeout: 30s, video: off }\nsteps: [{ pause: 20s }]\n",
+        "cancelled-pause.yaml",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
     let cancellation = CancellationToken::new();
-    let cancel = cancellation.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        cancel.cancel();
-    });
-    let started = Instant::now();
-    tokio::select! {
-        _ = wait_for_cancellation(Some(&cancellation)) => {}
-        _ = pause_until(Duration::from_secs(1), Instant::now() + Duration::from_secs(2)) => {
-            panic!("pause completed before cancellation");
+    let (pause_started, pause_started_rx) = tokio::sync::oneshot::channel();
+    let pause_started = Arc::new(Mutex::new(Some(pause_started)));
+    let mut options = RunOptions::new(artifacts.path()).with_cancellation(cancellation.clone());
+    options.step_started_observer = Some(StepStartedObserver(Arc::new(move |operation| {
+        if operation == "pause"
+            && let Some(sender) = pause_started.lock().unwrap().take()
+        {
+            let _ = sender.send(());
         }
-    }
-    assert!(started.elapsed() < Duration::from_millis(500));
+    })));
+    let run = run_flow(&host, &flow, &options);
+    let cancel_during_pause = async {
+        tokio::time::timeout(Duration::from_secs(5), pause_started_rx)
+            .await
+            .expect("runner should enter the pause")
+            .expect("pause observer should remain open");
+        cancellation.cancel();
+    };
+    let (report, ()) = tokio::time::timeout(Duration::from_secs(7), async {
+        tokio::join!(run, cancel_during_pause)
+    })
+    .await
+    .expect("cancelled pause should return promptly");
+    assert_eq!(report.status, FlowStatus::Interrupted);
+    host.shutdown().await.unwrap();
 }
 
 #[test]
