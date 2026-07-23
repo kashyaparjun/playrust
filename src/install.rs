@@ -608,13 +608,13 @@ fn extract_zip(archive: &Path, output: &mut File) -> Result<bool, InstallError> 
     Ok(false)
 }
 
-fn set_executable(path: &Path) -> io::Result<()> {
+fn set_executable(_path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(path)?.permissions();
+        let mut permissions = fs::metadata(_path)?.permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)?;
+        fs::set_permissions(_path, permissions)?;
     }
     Ok(())
 }
