@@ -19,17 +19,41 @@ Playrust is a single static binary with a pinned Chrome for Testing build — no
 
 ## Install
 
-Download the archive and matching `.sha256` file for your platform from the
-[GitHub release](https://github.com/kashyaparjun/playrust/releases). Verify it,
-extract it, and place `playrust` (or `playrust.exe`) on your `PATH`:
+Download one release archive and its matching `.sha256` file from the
+[GitHub release](https://github.com/kashyaparjun/playrust/releases). The local
+installer verifies SHA-256 before it reads the archive, extracts only the
+platform binary, rejects unsafe archive paths, and installs an architecture-
+independent `playrust` name (or `playrust.exe` on Windows):
 
 ```sh
-shasum -a 256 -c playrust-v*-*.sha256
+playrust install \
+  --archive ./playrust-v0.2.1-x86_64-unknown-linux-gnu.tar.gz \
+  --checksum ./playrust-v0.2.1-x86_64-unknown-linux-gnu.tar.gz.sha256 \
+  --destination ~/.local/bin
 ```
 
-On Windows, compare `Get-FileHash .\playrust-v*-*.zip -Algorithm SHA256` with
-the checksum file. Release archives support Linux x86_64, macOS arm64/x86_64,
-and Windows x86_64.
+Use explicit filenames rather than wildcards so the archive and checksum
+cannot be mixed between platforms. The command accepts `.tar.gz`, `.tgz`, and
+`.zip` archives and reports a clear error for missing, malformed, or mismatched
+checksums.
+
+To manually verify a downloaded archive before installing, use the command for
+your operating system:
+
+```sh
+sha256sum -c playrust-v0.2.1-x86_64-unknown-linux-gnu.tar.gz.sha256  # Linux
+shasum -a 256 -c playrust-v0.2.1-aarch64-apple-darwin.tar.gz.sha256    # macOS
+```
+
+```powershell
+$actual = (Get-FileHash .\playrust-v0.2.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+$expected = (Get-Content .\playrust-v0.2.1-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToLower()
+if ($actual -ne $expected) { throw "SHA-256 mismatch" }
+"SHA-256 verified: $actual"
+```
+
+Release archives support Linux x86_64, macOS arm64/x86_64, and Windows x86_64.
+Never skip checksum verification when installing a downloaded binary.
 
 Alternatively, install a tagged version from source with Rust 1.89 or newer:
 
