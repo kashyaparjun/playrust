@@ -413,15 +413,15 @@ pub fn install_release(
             error,
         }
     })?;
-    let mut output = staged.as_file_mut();
+    let output = staged.as_file_mut();
     let found = match archive
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
     {
-        name if name.ends_with(".zip") => extract_zip(archive, &mut output)?,
+        name if name.ends_with(".zip") => extract_zip(archive, output)?,
         name if name.ends_with(".tar.gz") || name.ends_with(".tgz") => {
-            extract_tar(archive, &mut output)?
+            extract_tar(archive, output)?
         }
         _ => {
             return Err(InstallError::UnsupportedArchive {
