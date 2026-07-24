@@ -1561,3 +1561,71 @@ fn open_wait_until_requires_a_url() {
     let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { wait_until: { visible: { css: a } } }\n";
     assert!(compile(source).is_err());
 }
+
+fn compile_with_env(source: &str, environment: &[(&str, &str)]) -> CompiledFlow {
+    let environment: BTreeMap<String, String> = environment
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    compile_yaml_with_env(source, "flows/example.yaml", &BTreeMap::new(), &environment)
+        .expect("compile")
+}
+
+#[test]
+fn recording_secret_warning_is_absent_when_video_is_off() {
+    let flow = compile_with_env(
+        "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsettings: { video: off }\nsteps:\n  - fill: { target: { css: email }, value: '${token}' }\n",
+        &[("TOKEN", "supersecret")],
+    );
+    assert!(flow.recording_secret_warning().is_none());
+}
+
+#[test]
+fn recording_secret_warning_is_present_for_a_secret_fill_with_video_on() {
+    let flow = compile_with_env(
+        "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsettings: { video: on }\nsteps:\n  - fill: { target: { css: email }, value: '${token}' }\n",
+        &[("TOKEN", "supersecret")],
+    );
+    let warning = flow.recording_secret_warning().expect("warning");
+    assert!(warning.contains("secret-derived"));
+    assert!(!warning.contains("supersecret"));
+}
+
+#[test]
+fn recording_secret_warning_is_present_for_a_runtime_output_fill() {
+    let flow = compile_with_env(
+        "version: 1\nname: x\nsettings: { video: on }\nsteps:\n  - evaluate: { script: 'return 1', save_as: later }\n  - fill: { target: { css: input }, value: '${later}' }\n",
+        &[],
+    );
+    assert!(flow.recording_secret_warning().is_some());
+}
+
+#[test]
+fn recording_secret_warning_is_absent_for_a_plain_fill_with_video_on() {
+    let flow = compile_with_env(
+        "version: 1\nname: x\nvars: { name: arjun }\nsettings: { video: on }\nsteps:\n  - fill: { target: { css: input }, value: '${name}' }\n",
+        &[],
+    );
+    assert!(flow.recording_secret_warning().is_none());
+}
+
+#[test]
+fn recording_secret_warning_is_present_for_a_secret_evaluate_arg() {
+    let flow = compile_with_env(
+        "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsettings: { video: on }\nsteps:\n  - evaluate: { script: 'return args[0]', args: ['${token}'] }\n",
+        &[("TOKEN", "supersecret")],
+    );
+    assert!(flow.recording_secret_warning().is_some());
+}
+
+#[test]
+fn recording_secret_warning_is_absent_when_secrets_are_only_used_in_requests() {
+    let flow = compile_with_env(
+        "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsettings: { video: on }\nsteps:\n  - request: { method: GET, url: https://api.test/, headers: { Authorization: 'Bearer ${token}' }, expected_status: 200 }\n",
+        &[("TOKEN", "supersecret")],
+    );
+    assert!(
+        flow.recording_secret_warning().is_none(),
+        "request-only secret usage should not trip the page-rendering warning"
+    );
+}

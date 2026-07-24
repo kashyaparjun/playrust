@@ -639,6 +639,12 @@ fn setup_failure_reports(
                 category,
                 SafeText::public(run.flow.redactor.redact(&message)),
             )],
+            warnings: run
+                .flow
+                .recording_secret_warning()
+                .into_iter()
+                .map(|w| w.to_owned())
+                .collect(),
             artifacts: ArtifactPaths {
                 directory: run
                     .options
@@ -665,6 +671,7 @@ fn specification_report(file: &Path, artifacts: &Path, message: String) -> FlowR
             FailureCategory::Specification,
             SafeText::public(message),
         )],
+        warnings: Vec::new(),
         artifacts: ArtifactPaths {
             directory: artifacts.to_string_lossy().into_owned(),
             ..ArtifactPaths::default()
@@ -679,6 +686,12 @@ fn interrupted_report(run: &FlowRun) -> FlowReport {
         duration_ms: 0,
         status: FlowStatus::Interrupted,
         failures: Vec::new(),
+        warnings: run
+            .flow
+            .recording_secret_warning()
+            .into_iter()
+            .map(|w| w.to_owned())
+            .collect(),
         artifacts: ArtifactPaths {
             directory: run
                 .options
@@ -842,6 +855,9 @@ fn print_results(report: &AggregateReport) {
         }
         if let Some(path) = &report.artifacts.partial_recording {
             println!("  Partial recording: {}", terminal_text(path));
+        }
+        for warning in &report.warnings {
+            println!("  warning: {}", terminal_text(warning));
         }
     }
 }
@@ -1077,6 +1093,7 @@ mod tests {
                     duration_ms: 42,
                     status: FlowStatus::Passed,
                     failures: Vec::new(),
+                    warnings: Vec::new(),
                     artifacts: ArtifactPaths {
                         directory: directory
                             .path()

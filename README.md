@@ -366,7 +366,7 @@ Treat flow files as executable test configuration. They can navigate to private 
 
 ## Video and artifacts
 
-Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`, which keeps every recording and prints its path after the flow finishes. `retain-on-failure` removes recordings for passing flows. Set a mode in YAML or override all flows with `--video MODE`.
+Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`, which keeps every recording and prints its path after the flow finishes. `retain-on-failure` removes recordings for passing flows. Set a mode in YAML or override all flows with `--video MODE`. When recording is enabled and a flow exposes a secret-derived or runtime-output-derived value to the page (via `fill`, `select`, `dialog` text, `evaluate` args, or a secret `open` URL), Playrust prints a prominent `warning:` line for that flow and records a non-secret `warnings` entry in `report.json`. The warning never contains the secret; disable recording with `--video off` to fully avoid capturing rendered page content.
 
 With no recording steps, video still covers the whole flow. To record one deliberate segment, add exactly one ordered `recording: start` / `recording: stop` pair; `check` rejects unmatched, reversed, or repeated controls after subflows are expanded. `--video off` makes a valid pair a no-op. A failure or interruption before `stop` still finalizes and reports the active recording. A completed manual recording remains reportable if a later step fails, and `retain-on-failure` removes it only after the entire flow passes.
 

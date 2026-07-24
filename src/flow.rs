@@ -674,6 +674,40 @@ pub struct CompiledFlow {
     pub redactor: Redactor,
 }
 
+/// The static warning emitted when visual recording is enabled for a flow that
+/// exposes a secret-derived or runtime-output-derived value to the page, where
+/// it could be rendered into a screenshot or video. The warning never contains
+/// a secret value itself.
+pub const RECORDING_SECRET_WARNING: &str = "video/screenshots are enabled for a flow using secret-derived values; rendered page content may contain sensitive data";
+
+impl CompiledFlow {
+    /// Returns a recording/secret warning when recording is enabled and the
+    /// flow exposes a secret-tainted value to the page (fill, select, dialog
+    /// prompt text, evaluate arguments, or a secret navigation URL), or
+    /// `None` otherwise. Recording is taken from `settings.video`, which the
+    /// CLI `--video` override bakes in at compile time.
+    pub fn recording_secret_warning(&self) -> Option<&'static str> {
+        if !self.settings.video.enabled() {
+            return None;
+        }
+        self.steps
+            .iter()
+            .any(|step| operation_exposes_secret_tainted_value(&step.operation))
+            .then_some(RECORDING_SECRET_WARNING)
+    }
+}
+
+fn operation_exposes_secret_tainted_value(operation: &Operation) -> bool {
+    match operation {
+        Operation::Open { url, .. } => url.is_secret(),
+        Operation::Fill { value, .. } => value.is_secret(),
+        Operation::Select { value, .. } => value.is_secret(),
+        Operation::Dialog { text, .. } => text.as_ref().is_some_and(|value| value.is_secret()),
+        Operation::Evaluate { args, .. } => args.iter().any(|value| value.is_secret()),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowSettings {
     pub timeout: Duration,

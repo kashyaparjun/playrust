@@ -4171,6 +4171,11 @@ fn report(
     failures: Vec<Failure>,
     interrupted: bool,
 ) -> FlowReport {
+    let warnings = flow
+        .recording_secret_warning()
+        .into_iter()
+        .map(|warning| warning.to_owned())
+        .collect();
     FlowReport {
         name: flow.name.clone(),
         path: path_text(&flow.source),
@@ -4183,6 +4188,7 @@ fn report(
             FlowStatus::Failed
         },
         failures,
+        warnings,
         artifacts,
     }
 }
