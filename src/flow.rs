@@ -165,18 +165,7 @@ pub struct RawSettings {
     pub viewport: Option<RawViewport>,
     pub video: Option<VideoMode>,
     pub geolocation: Option<RawGeolocation>,
-    pub overlays: Option<RawPresentationOverlays>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawPresentationOverlays {
-    #[serde(default)]
-    pub step: bool,
-    #[serde(default)]
-    pub url: bool,
-    #[serde(default)]
-    pub pointer: bool,
+    pub overlays: Option<PresentationOverlays>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -666,10 +655,14 @@ pub struct FlowSettings {
     pub overlays: PresentationOverlays,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PresentationOverlays {
+    #[serde(default)]
     pub step: bool,
+    #[serde(default)]
     pub url: bool,
+    #[serde(default)]
     pub pointer: bool,
 }
 
@@ -1270,16 +1263,7 @@ fn compile_raw_inner(
             .map_err(|error| FlowError::Invalid(error.to_string()))
         })
         .transpose()?;
-    let overlays = raw
-        .settings
-        .overlays
-        .map_or_else(PresentationOverlays::default, |value| {
-            PresentationOverlays {
-                step: value.step,
-                url: value.url,
-                pointer: value.pointer,
-            }
-        });
+    let overlays = raw.settings.overlays.unwrap_or_default();
 
     let base_url = raw
         .base_url
