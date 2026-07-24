@@ -1417,6 +1417,7 @@ async fn execute_flow(
             match result {
                 Ok(Ok(screenshot)) => {
                     if runtime.presentation_overlays != PresentationOverlays::default() {
+                        // Overlay rendering is presentation-only; a failed inject must not fail the flow.
                         let _ = update_presentation_overlay(
                             &active,
                             step,
@@ -1590,6 +1591,11 @@ async fn update_presentation_overlay(
     } else {
         String::new()
     };
+    // ponytail: values are JSON-serialized before injection; any new dynamic
+    // value must go through serde_json::to_string to stay injection-safe.
+    // ponytail: the pointermove listener is added once and never removed —
+    // overlays are constant per flow, so the leak ceiling is one listener per
+    // flow. Remove the listener on toggle-off if overlays become mid-flow mutable.
     let script = format!(
         r#"(() => {{
             const id = 'playrust-presentation-overlay';
