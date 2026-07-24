@@ -305,7 +305,15 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         for warning in opened.recording_warnings() {
             if let Err(error) = state.append(JournalEvent::RecorderWarning { warning }) {
                 eprintln!("error: write recorder warning: {error}");
-                let _ = session.take().expect("eager session").close(&host).await;
+                // Invariant: `session.take()` is Some because this block
+                // holds a borrow of `session` via `opened`, and the session is
+                // opened at startup before this loop and only taken on close
+                // (which exits the function).
+                let _ = session
+                    .take()
+                    .expect("recorder warning path holds an open session")
+                    .close(&host)
+                    .await;
                 let _ = host.shutdown().await;
                 return ExitCode::Infrastructure;
             }
@@ -422,11 +430,21 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                             .unwrap_or_else(|| PathBuf::from("ffmpeg")),
                     );
                 }
-                let mut execution = Box::pin(session.as_mut().expect("session opened").execute(
-                    &host,
-                    &compiled,
-                    &run_options,
-                ));
+                let Some(active_session) = session.as_mut() else {
+                    let response = state.error(
+                        request.id,
+                        "not_started",
+                        "the browser session is not open",
+                        None,
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                };
+                let mut execution =
+                    Box::pin(active_session.execute(&host, &compiled, &run_options));
                 let mut requested_close = None;
                 let mut input_closed = false;
                 let mut cancellation_requested = false;
@@ -659,7 +677,19 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 accessibility,
                 since,
             } => {
-                let opened = session.as_mut().expect("eager session");
+                let Some(opened) = session.as_mut() else {
+                    let response = state.error(
+                        request.id,
+                        "not_started",
+                        "submit a valid flow before capturing a snapshot",
+                        None,
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                };
                 if let Some(dialog) = opened.pending_dialog() {
                     let response = state.response(
                         request.id,
@@ -735,7 +765,10 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 let diff = since.map(|from| {
                     opened
                         .snapshot_diff(from, snapshot.generation)
-                        .expect("validated baseline is adjacent to the new snapshot")
+                        // Invariant: `validate_snapshot_baseline(from)` above
+                        // confirmed `from` is adjacent to the newly captured
+                        // snapshot, so the diff cannot fail.
+                        .expect("snapshot baseline was validated as adjacent")
                 });
                 let event = JournalEvent::Snapshot {
                     snapshot_revision: snapshot.generation,
@@ -772,7 +805,19 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Act { action } => {
-                let opened = session.as_mut().expect("eager session");
+                let Some(opened) = session.as_mut() else {
+                    let response = state.error(
+                        request.id,
+                        "not_started",
+                        "submit a valid flow before acting",
+                        None,
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                };
                 if let Some(dialog) = opened.pending_dialog() {
                     let response = state.error(
                         request.id,
@@ -917,7 +962,19 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     }
                     continue;
                 }
-                let opened = session.as_mut().expect("eager session");
+                let Some(opened) = session.as_mut() else {
+                    let response = state.error(
+                        request.id,
+                        "not_started",
+                        "submit a valid flow before scrolling",
+                        None,
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                };
                 if let Some(dialog) = opened.pending_dialog() {
                     let response = state.error(
                         request.id,
@@ -932,7 +989,12 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     continue;
                 }
                 let step = json!({ "scroll": { "x": x, "y": y } });
-                let flow = compile_interactive(&step, opened).expect("validated scroll compiles");
+                let flow = compile_interactive(&step, opened)
+                    // Invariant: the scroll step is a fixed literal
+                    // `{ scroll: { x, y } }` with no environment values or
+                    // refs, so it always compiles. x/y are already validated
+                    // as not both zero above.
+                    .expect("scroll step is a validated literal flow");
                 let result = opened
                     .execute_interactive(&host, &flow, &state.artifacts)
                     .await;
@@ -965,7 +1027,19 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Dialog { action, text } => {
-                let opened = session.as_ref().expect("eager session");
+                let Some(opened) = session.as_ref() else {
+                    let response = state.error(
+                        request.id,
+                        "not_started",
+                        "submit a valid flow before handling a dialog",
+                        None,
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                };
                 let invalid_text = text.is_some() && !matches!(action, DialogAction::Accept);
                 if invalid_text {
                     let response = state.error(
@@ -1012,18 +1086,23 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     exit_code = ExitCode::Infrastructure;
                     break;
                 }
-                let response = match export_bundle(
-                    &options.artifacts,
-                    &mut state,
-                    &name,
-                    session.as_ref().expect("eager session"),
-                ) {
-                    Ok(result) => state.response(request.id, result),
-                    Err(CommandError {
-                        code,
-                        message,
-                        details,
-                    }) => state.error(request.id, code, message, details),
+                let response = match session.as_ref() {
+                    None => state.error(
+                        request.id,
+                        "not_started",
+                        "submit a valid flow before exporting a bundle",
+                        None,
+                    ),
+                    Some(opened) => {
+                        match export_bundle(&options.artifacts, &mut state, &name, opened) {
+                            Ok(result) => state.response(request.id, result),
+                            Err(CommandError {
+                                code,
+                                message,
+                                details,
+                            }) => state.error(request.id, code, message, details),
+                        }
+                    }
                 };
                 if write_response(&mut stdout, &response).await.is_err() {
                     exit_code = ExitCode::Infrastructure;
@@ -1057,18 +1136,29 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Close => {
-                let mut close_result =
-                    match session.take().expect("eager session").close(&host).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let response =
-                                state.error(request.id, "browser", error.to_string(), None);
-                            let _ = write_response(&mut stdout, &response).await;
-                            exit_code = ExitCode::Infrastructure;
-                            close_session = true;
-                            continue;
-                        }
-                    };
+                let Some(session) = session.take() else {
+                    let response = state.error(
+                        request.id,
+                        "not_started",
+                        "submit a valid flow before closing the session",
+                        None,
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                };
+                let mut close_result = match session.close(&host).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let response = state.error(request.id, "browser", error.to_string(), None);
+                        let _ = write_response(&mut stdout, &response).await;
+                        exit_code = ExitCode::Infrastructure;
+                        close_session = true;
+                        continue;
+                    }
+                };
                 if let Err(error) =
                     publish_close_artifacts(&mut state, &chromium, &mut close_result)
                 {
@@ -1132,7 +1222,12 @@ fn prepare_action(
         .ok_or_else(|| {
             validation_error("action must be an object containing exactly one operation")
         })?;
-    let (name, payload) = object.iter().next().expect("one action");
+    // Invariant: `object` has exactly one entry (checked by the
+    // `object.len() == 1` filter above), so `.next()` is always Some.
+    let (name, payload) = object
+        .iter()
+        .next()
+        .expect("action object has exactly one entry");
     if !matches!(
         name.as_str(),
         "open"
@@ -1174,7 +1269,12 @@ fn prepare_action(
             Value::Object(object)
         }
         "switch_frame" if payload.get("ref").is_some() => {
-            let mut object = payload.as_object().cloned().expect("ref requires object");
+            // Invariant: `payload.get("ref").is_some()` requires `payload` to
+            // be an object containing a `ref` key, so `as_object()` is Some.
+            let mut object = payload
+                .as_object()
+                .cloned()
+                .expect("payload holds a ref key");
             let reference = take_reference(&mut object, session, &mut backend_node_id)?;
             durable = Some(reference.clone());
             json!({ "target": reference })
@@ -1274,7 +1374,9 @@ fn compile_interactive(step: &Value, session: &BrowserSession) -> Result<Compile
         "secrets": secrets,
         "steps": [executable],
     }))
-    .expect("interactive flow serializes");
+    // Invariant: the embedded JSON value is built entirely from serializable
+    // primitives and serde_json::Value, so `to_string` cannot fail.
+    .expect("interactive flow value is serializable");
     compile_inline_yaml(
         &source,
         "interactive-action.yaml",

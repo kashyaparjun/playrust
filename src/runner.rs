@@ -717,7 +717,11 @@ impl SessionRuntime {
         let context_id = self
             .context
             .as_ref()
-            .expect("open session context")
+            // Invariant: SessionRuntime is only constructed via open_settings,
+            // which stores an open browser context; context is only taken by
+            // close(), which consumes the runtime. This method runs before
+            // close, so context is always Some.
+            .expect("open session context on a live runtime")
             .id()
             .clone();
         let placeholder = ActiveContext::new(self.active.page.clone());
@@ -865,7 +869,13 @@ impl SessionRuntime {
         accessibility: bool,
         screenshot_directory: Option<&Path>,
     ) -> anyhow::Result<SessionInspection> {
-        let context = self.context.as_ref().expect("open session context");
+        let context = self
+            .context
+            .as_ref()
+            // Invariant: SessionRuntime is only constructed with an open
+            // context, and context is only taken by close(), which consumes
+            // the runtime. inspect runs on a live session, so context is Some.
+            .expect("open session context on a live runtime");
         let target_id = self.active.page.target_id();
         let targets = host
             .browser()
@@ -953,7 +963,11 @@ impl SessionRuntime {
         let disposal = tokio::select! {
             result = tokio::time::timeout(
                 SECONDARY_TIMEOUT,
-                host.dispose_context(self.context.take().expect("open session context")),
+                host.dispose_context(self.context.take()
+                    // Invariant: this is close(); SessionRuntime is only
+                    // constructed with an open context and context is taken
+                    // only here, exactly once, on the terminal close path.
+                    .expect("close disposes an open session context")),
             ) => match result {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("dispose browser context timed out")),
@@ -1224,7 +1238,11 @@ async fn execute_flow(
     let context_id = session
         .context
         .as_ref()
-        .expect("open session context")
+        // Invariant: SessionRuntime::open (which produced `session`) stores an
+        // open browser context; context is only taken by close(), which runs
+        // after execute_flow. execute_flow runs on a live session, so context
+        // is Some.
+        .expect("open session context during execute_flow")
         .id()
         .clone();
     let placeholder = ActiveContext::new(session.active.page.clone());

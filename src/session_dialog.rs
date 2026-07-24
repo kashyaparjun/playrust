@@ -224,6 +224,10 @@ pub(crate) struct NativeDialogState {
     listener: Option<Listener>,
 }
 
+// Invariant: the Mutex<State> is only poisoned if a previous lock holder
+// panicked. We guard all lock().expect() sites because native-dialog state
+// lives behind Arc<Mutex<State>> shared across the CDP listener and the
+// runner; poisoning would make the session permanently unusable.
 impl NativeDialogState {
     pub(crate) fn new(policy: DialogPolicy) -> Self {
         Self {
