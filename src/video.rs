@@ -316,7 +316,7 @@ impl VideoRecorder {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn finalize_with_timeout(
         self,
         stop_at: Instant,

@@ -167,6 +167,7 @@ pub struct RawSettings {
     pub viewport: Option<RawViewport>,
     pub video: Option<VideoMode>,
     pub geolocation: Option<RawGeolocation>,
+    pub overlays: Option<PresentationOverlays>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -655,6 +656,18 @@ pub struct FlowSettings {
     pub viewport: Viewport,
     pub video: VideoMode,
     pub geolocation: Option<Geolocation>,
+    pub overlays: PresentationOverlays,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PresentationOverlays {
+    #[serde(default)]
+    pub step: bool,
+    #[serde(default)]
+    pub url: bool,
+    #[serde(default)]
+    pub pointer: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1257,6 +1270,7 @@ fn compile_raw_inner(
             .map_err(|error| FlowError::Invalid(error.to_string()))
         })
         .transpose()?;
+    let overlays = raw.settings.overlays.unwrap_or_default();
 
     let base_url = raw
         .base_url
@@ -1272,6 +1286,7 @@ fn compile_raw_inner(
         viewport,
         video,
         geolocation,
+        overlays,
     };
     let mut ids = BTreeSet::new();
     let mut screenshot_names = BTreeSet::new();
