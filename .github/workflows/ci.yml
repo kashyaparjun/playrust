@@ -75,6 +75,7 @@ jobs:
           --test frames_e2e
           --test http_e2e
           --test long_press_e2e
+          --test pause_e2e
           --test recording_controls_e2e
           --test scripting_e2e
           --test session_e2e
@@ -86,3 +87,11 @@ jobs:
           --test wait_until_stable_e2e
           --test wait_until_visible_e2e
           -- --ignored --test-threads=1
+      - name: Run pause cancellation test
+        env:
+          PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
+          PLAYRUST_NO_SANDBOX: "1"
+        run: >-
+          cargo test --locked --lib
+          cancelling_an_in_flight_compiled_pause_interrupts_the_flow
+          -- --ignored

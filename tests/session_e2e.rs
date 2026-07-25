@@ -406,6 +406,13 @@ fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
         session.command(json!({ "id": "scroll", "command": "scroll", "y": 500 }))["ok"],
         true
     );
+    let pause = session.command(json!({
+        "id": "pause",
+        "command": "act",
+        "action": { "pause": "25ms" }
+    }));
+    assert_eq!(pause["ok"], true, "{pause}");
+    assert!(pause["result"]["elapsed_ms"].as_u64().unwrap() >= 20);
     assert_eq!(
         session.command(json!({
             "id": "stale",
@@ -432,6 +439,7 @@ fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
     assert!(replay.contains("PLAYRUST_SESSION_TEST_SECRET"));
     assert!(replay.contains("dialog:"));
     assert!(replay.contains("dismiss"));
+    assert!(replay.contains("pause: '25ms'"));
     assert!(!replay.contains(SECRET));
     assert!(!journal.contains(SECRET));
 

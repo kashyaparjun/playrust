@@ -697,6 +697,11 @@ mod tests {
             success(ReplayOperation::WaitUntilVisible(TargetAction {
                 target: test_id("result"),
             })),
+            JournalEvent::ReplayStep {
+                step: serde_json::json!({ "pause": "1500ms" }),
+                outcome: ActionOutcome::Success,
+                durable_locator: None,
+            },
             success(ReplayOperation::Dialog(DialogAction {
                 action: DialogResponse::Accept,
                 text: None,
@@ -708,11 +713,12 @@ mod tests {
         let first = build_replay_yaml("example-run", &events).unwrap();
         let second = build_replay_yaml("example-run", &events).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.step_count, 6);
+        assert_eq!(first.step_count, 7);
         assert!(first.yaml.contains("test_id: 'submit'"));
         assert!(!first.yaml.contains("snapshot_revision"));
         assert!(!first.yaml.contains("/done"));
         assert!(first.yaml.contains("dialog:"));
+        assert!(first.yaml.contains("pause: '1500ms'"));
 
         #[derive(Deserialize)]
         struct FlowShape {
@@ -723,7 +729,7 @@ mod tests {
         let flow: FlowShape = serde_saphyr::from_str(&first.yaml).unwrap();
         assert_eq!(flow.version, 1);
         assert_eq!(flow.name, "example-run");
-        assert_eq!(flow.steps.len(), 6);
+        assert_eq!(flow.steps.len(), 7);
     }
 
     #[test]

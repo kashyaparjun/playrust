@@ -604,6 +604,22 @@ fn runtime_outputs_support_repeated_and_conditional_expansions() {
 }
 
 #[test]
+fn compiles_bounded_pause_duration_and_rejects_invalid_values() {
+    let flow = compile("version: 1\nname: pause\nsteps: [{ pause: 1500ms }]\n").unwrap();
+    assert!(matches!(
+        flow.steps[0].operation,
+        Operation::Pause { duration } if duration == Duration::from_millis(1500)
+    ));
+    for duration in ["0ms", "61s", "not-a-duration"] {
+        let source = format!("version: 1\nname: pause\nsteps: [{{ pause: {duration} }}]\n");
+        assert!(
+            error(&source).contains("pause"),
+            "accepted pause {duration}"
+        );
+    }
+}
+
+#[test]
 fn rejects_unknown_duplicate_merge_and_alias_yaml() {
     let unknown = "version: 1\nname: x\nunknown: true\nsteps: [{ open: https://x.test }]\n";
     assert!(parse_yaml(unknown).is_err());

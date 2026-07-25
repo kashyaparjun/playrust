@@ -115,10 +115,11 @@ Before dispatch, Playrust revalidates the durable locator stored with the ref fo
 {"id":31,"command":"act","action":{"switch_frame":"parent"}}
 {"id":32,"command":"act","action":{"wait_until_visible":{"ref":"e21"}}}
 {"id":33,"command":"act","action":{"wait_until_stable":{"ref":"e21"}}}
-{"id":34,"command":"act","action":{"assert":{"visible":{"ref":"e21"}}}}
+{"id":34,"command":"act","action":{"pause":"1500ms"}}
+{"id":35,"command":"act","action":{"assert":{"visible":{"ref":"e21"}}}}
 ```
 
-The supported action names are `open`, `click`, `double_click`, `fill`, `erase`, `select`, `press`, `back`, `switch_page`, `switch_frame`, `wait_until_visible`, `wait_until_stable`, and structured `assert`. Page/frame selector variants and assertion predicates follow their YAML V1 shapes, replacing an element target with `ref`. `act` deliberately excludes arbitrary evaluation, HTTP requests, storage clearing, recording controls, and scrolling.
+The supported action names are `open`, `click`, `double_click`, `fill`, `erase`, `select`, `press`, `back`, `switch_page`, `switch_frame`, `wait_until_visible`, `wait_until_stable`, `pause`, and structured `assert`. Page/frame selector variants and assertion predicates follow their YAML V1 shapes, replacing an element target with `ref`. `pause` accepts the same positive duration syntax and `60s` maximum as YAML, keeps a continuous session recording running while it waits, and is preserved by export. `act` deliberately excludes arbitrary evaluation, HTTP requests, storage clearing, recording controls, and scrolling.
 
 `fill.value` and `select.value` accept a literal string or `{"env":"NAME"}`. Playrust resolves environment-backed values internally, marks them secret, and records/exports only the environment-variable name. Use an environment value whenever one is available for credentials.
 
@@ -191,7 +192,7 @@ An exported bundle contains:
   <referenced screenshots>
 ```
 
-`session.ndjson` is an append-only, sequence-numbered, redacted audit journal covering settings, commands and outcomes, durable locators, navigations, dialogs, waits/assertions, variable/secret metadata, warnings, and artifact references. `replay.yaml` contains only successful explicit opens/actions, necessary scrolls, explicit waits, dialog responses, and assertions. Batch YAML handles those responses with `dialog: { action: accept }`, `dialog: { action: dismiss }`, or an accepted prompt with `text`. Snapshots, failed exploratory actions, duplicate observed navigations, recorder internals, and protocol bookkeeping are excluded.
+`session.ndjson` is an append-only, sequence-numbered, redacted audit journal covering settings, commands and outcomes, durable locators, navigations, dialogs, waits/assertions, pauses, variable/secret metadata, warnings, and artifact references. `replay.yaml` contains only successful explicit opens/actions, necessary scrolls, explicit waits and pauses, dialog responses, and assertions. Batch YAML handles those responses with `dialog: { action: accept }`, `dialog: { action: dismiss }`, or an accepted prompt with `text`. Snapshots, failed exploratory actions, duplicate observed navigations, recorder internals, and protocol bookkeeping are excluded.
 
 Environment-backed values become deterministic YAML secret entries. Plaintext secret values do not appear in protocol responses, the journal, reports, or replay YAML. Validate the canonical flow with `playrust check <bundle>/replay.yaml`; optionally run it in a fresh browser with the same environment variables.
 

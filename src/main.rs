@@ -13,7 +13,9 @@ use playrust::flow::{
     CompiledFlow, FlowError, VideoMode, compile_file, compile_file_with_video, discover_flow_files,
     parse_duration,
 };
-use playrust::install::{PINNED_CHROME_VERSION, install_browser, resolve_or_install_browser};
+use playrust::install::{
+    PINNED_CHROME_VERSION, install_browser, install_release, resolve_or_install_browser,
+};
 use playrust::report::{
     AggregateReport, ArtifactPaths, ChromiumInfo, ExitCode, Failure, FailureCategory, FlowReport,
     FlowStatus, RunnerInfo, SafeText, artifact_directory, write_aggregate_report,
@@ -35,6 +37,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify a release archive and install its Playrust binary.
+    Install(InstallArgs),
     /// Validate flows without launching Chromium.
     Check(CheckArgs),
     /// Run flows in Chromium.
@@ -43,6 +47,19 @@ enum Command {
     Session(SessionArgs),
     /// Manage the pinned Chrome for Testing installation.
     Browser(BrowserArgs),
+}
+
+#[derive(Debug, Args)]
+struct InstallArgs {
+    /// Local .tar.gz, .tgz, or .zip release archive.
+    #[arg(long)]
+    archive: PathBuf,
+    /// Checksum file containing the archive's SHA-256 digest.
+    #[arg(long)]
+    checksum: PathBuf,
+    /// Directory in which to install the platform binary.
+    #[arg(long)]
+    destination: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -213,6 +230,18 @@ struct FlowRun {
 #[tokio::main]
 async fn main() {
     let exit_code = match Cli::parse().command {
+        Command::Install(args) => {
+            match install_release(&args.archive, &args.checksum, &args.destination) {
+                Ok(path) => {
+                    println!("Installed verified Playrust binary to {}", path.display());
+                    ExitCode::Success
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::Infrastructure
+                }
+            }
+        }
         Command::Check(args) => check(args),
         Command::Run(args) => run(args).await,
         Command::Session(args) => session(args).await,
