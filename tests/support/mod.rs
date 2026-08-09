@@ -27,10 +27,10 @@ pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     let chrome_overridden = environment
         .iter()
         .any(|(key, _)| *key == playrust::install::CHROME_ENV);
-    if !chrome_overridden {
-        if let Some(path) = chrome_path() {
-            command.env(playrust::install::CHROME_ENV, path);
-        }
+    if !chrome_overridden
+        && let Some(path) = chrome_path()
+    {
+        command.env(playrust::install::CHROME_ENV, path);
     }
     output_with_timeout(command, Duration::from_secs(180))
 }
