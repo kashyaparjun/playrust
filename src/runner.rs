@@ -2456,14 +2456,17 @@ async fn settle_after_open(
 const OPEN_SETTLE_DEADLINE_SLACK: Duration = Duration::from_millis(50);
 
 fn prepare_open_settle(deadline: Instant) -> Result<Instant, StepError> {
+    open_phase_deadline(deadline).ok_or_else(open_settle_budget_error)
+}
+
+fn open_phase_deadline(deadline: Instant) -> Option<Instant> {
     let now = Instant::now();
     if now >= deadline {
-        return Err(open_settle_budget_error());
+        return None;
     }
     deadline
         .checked_sub(OPEN_SETTLE_DEADLINE_SLACK)
         .filter(|early| *early > now)
-        .ok_or_else(open_settle_budget_error)
 }
 
 fn open_settle_budget_error() -> StepError {

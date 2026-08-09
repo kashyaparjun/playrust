@@ -303,12 +303,15 @@ fn open_with_wait_until_still_reports_a_navigation_timeout() {
     assert_eq!(report.flows[0].status, FlowStatus::Failed);
     let failure = &report.flows[0].failures[0];
     assert_eq!(failure.category, FailureCategory::Timeout);
+    // Hung CDP navigation often loses the race to the outer step `timeout_at`,
+    // which reports `step deadline expired`. Either way must not be a settle miss.
     assert!(
         failure
             .message
             .as_str()
-            .contains("navigation deadline expired"),
-        "expected navigation timeout, got {}",
+            .contains("navigation deadline expired")
+            || failure.message.as_str().contains("step deadline expired"),
+        "expected navigation or step deadline timeout, got {}",
         failure.message
     );
     assert!(
@@ -317,6 +320,14 @@ fn open_with_wait_until_still_reports_a_navigation_timeout() {
             .as_str()
             .contains("open settle condition was not satisfied"),
         "settle must not absorb a navigation timeout: {}",
+        failure.message
+    );
+    assert!(
+        !failure
+            .message
+            .as_str()
+            .contains("without enough remaining time for the open settle"),
+        "settle budget exhaustion must not absorb a hung navigation: {}",
         failure.message
     );
 }
