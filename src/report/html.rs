@@ -187,8 +187,9 @@ fn push_artifact(
                     "<a href=\"{escaped}\"><img class=\"artifact-preview\" src=\"{escaped}\" alt=\"{}\"></a>",
                     escape_html(label)
                 )),
+                // Keep <video controls> outside <a>: interactive content must not nest in anchors.
                 ArtifactKind::Video => output.push_str(&format!(
-                    "<a href=\"{escaped}\"><video controls preload=\"metadata\" class=\"artifact-preview\"><source src=\"{escaped}\" type=\"video/mp4\"></video></a>"
+                    "<video controls preload=\"metadata\" class=\"artifact-preview\"><source src=\"{escaped}\" type=\"video/mp4\"></video> <a href=\"{escaped}\">Open</a>"
                 )),
             }
             output.push_str(" <code>");
@@ -205,17 +206,22 @@ fn push_artifact(
 }
 
 fn safe_relative_artifact(root: &Path, artifact: &Path) -> Option<String> {
-    let path = if artifact.is_absolute() {
-        artifact.strip_prefix(root).ok()?
-    } else {
-        artifact
+    // Artifact paths are often rooted at the report directory, either as an
+    // absolute path under `root` or as a cwd-relative path that still begins
+    // with `root` (the default `--artifacts playrust-artifacts` shape).
+    let path = match artifact.strip_prefix(root) {
+        Ok(stripped) => stripped,
+        Err(_) if artifact.is_absolute() => return None,
+        Err(_) => artifact,
     };
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
+    if path.as_os_str().is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
         return None;
     }
     let resolved = root.join(path);

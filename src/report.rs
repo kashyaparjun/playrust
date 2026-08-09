@@ -795,12 +795,98 @@ mod tests {
 
         assert!(html.contains("href=\"flow-a/shot.png\""));
         assert!(html.contains("src=\"flow-a/shot.png\""));
-        assert!(html.contains("href=\"flow-a/recording.mp4\""));
+        assert!(html.contains("href=\"flow-a/recording.mp4\">Open</a>"));
         assert!(html.contains("<video controls"));
         assert!(html.contains("src=\"flow-a/recording.mp4\""));
+        assert!(!html.contains("<a href=\"flow-a/recording.mp4\"><video"));
         assert!(html.contains("Missing artifact"));
         assert!(!html.contains(&format!("href=\"{}", directory.path().display())));
         assert!(!html.contains(&format!("src=\"{}", directory.path().display())));
+    }
+
+    #[test]
+    fn html_embeds_media_for_cwd_relative_artifact_roots() {
+        let root = PathBuf::from(format!(
+            "playrust-artifacts-html-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let screenshot = root.join("flow-a").join("shot.png");
+        let recording = root.join("flow-a").join("recording.mp4");
+        fs::create_dir_all(screenshot.parent().unwrap()).unwrap();
+        fs::write(&screenshot, b"png").unwrap();
+        fs::write(&recording, b"mp4").unwrap();
+        assert!(!root.is_absolute());
+
+        let mut artifact_report = flow(FlowStatus::Passed, None);
+        artifact_report.artifacts = ArtifactPaths {
+            directory: root.join("flow-a").display().to_string(),
+            screenshots: vec![screenshot.display().to_string()],
+            recording: Some(recording.display().to_string()),
+            ..ArtifactPaths::default()
+        };
+        let report = AggregateReport::new(
+            RunnerInfo {
+                name: "playrust".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            1,
+            None,
+            1,
+            vec![artifact_report],
+        );
+
+        let html = html::render(&report, &root);
+
+        assert!(html.contains("href=\"flow-a/shot.png\""));
+        assert!(html.contains("src=\"flow-a/shot.png\""));
+        assert!(html.contains("href=\"flow-a/recording.mp4\">Open</a>"));
+        assert!(html.contains("src=\"flow-a/recording.mp4\""));
+        assert!(!html.contains("Missing artifact"));
+        assert!(!html.contains(&format!("href=\"{}/flow-a", root.display())));
+        assert!(!html.contains(&format!("src=\"{}/flow-a", root.display())));
+    }
+
+    #[test]
+    fn html_rejects_parent_dir_artifact_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("secret.png");
+        fs::write(&outside, b"png").unwrap();
+        let nested = directory.path().join("flow-a");
+        fs::create_dir_all(&nested).unwrap();
+
+        let mut artifact_report = flow(FlowStatus::Passed, None);
+        artifact_report.artifacts = ArtifactPaths {
+            directory: nested.display().to_string(),
+            screenshots: vec![nested.join("..").join("secret.png").display().to_string()],
+            ..ArtifactPaths::default()
+        };
+        let report = AggregateReport::new(
+            RunnerInfo {
+                name: "playrust".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            1,
+            None,
+            1,
+            vec![artifact_report],
+        );
+
+        let html = html::render(&report, &nested);
+
+        assert!(html.contains("Missing artifact"));
+        assert!(!html.contains("src=\""));
+        assert!(!html.contains("href=\"../secret.png\""));
+        assert!(!html.contains("href=\"secret.png\""));
     }
 
     #[test]
