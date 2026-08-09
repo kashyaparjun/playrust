@@ -1388,7 +1388,7 @@ async fn execute_flow(
                             interrupted = true;
                             if let Some(finish) = finish {
                                 apply_recording_finish(
-                                    finish,
+                                    Err(finish),
                                     &mut artifacts,
                                     &mut recording_error,
                                 );
