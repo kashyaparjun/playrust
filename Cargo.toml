@@ -28,6 +28,5 @@ thiserror = "2"
 flate2 = "1"
 tar = "0.4"
 zip = "4"
-xz2 = "0.1"
 tokio = { version = "1", features = ["full"] }
 url = "2"
