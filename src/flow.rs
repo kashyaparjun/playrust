@@ -14,6 +14,11 @@ use url::Url;
 
 use crate::browser::Geolocation;
 
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
+
 pub const REDACTED: &str = "[REDACTED]";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum accepted YAML flow source size in bytes (1 MiB).
@@ -48,6 +53,15 @@ pub const MAX_GESTURE_DELTA: i32 = 10_000;
 pub const MAX_GESTURE_DURATION: Duration = Duration::from_secs(10);
 pub const DEFAULT_SWIPE_DURATION: Duration = Duration::from_millis(300);
 pub const DEFAULT_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
+/// Minimum length a declared or runtime secret must reach before it is
+/// registered with the redactor. Shorter values are rejected at compile time
+/// (declared secrets) or silently skipped (runtime outputs) to avoid
+/// over-redacting common short substrings.
+pub const MIN_SECRET_LEN: usize = 4;
+
+pub(crate) fn meets_min_secret_len(value: &str) -> bool {
+    value.chars().count() >= MIN_SECRET_LEN
+}
 
 #[derive(Debug, Error)]
 pub enum FlowError {
@@ -105,34 +119,96 @@ impl<T: fmt::Display> fmt::Display for Resolved<T> {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Redactor {
-    secrets: Vec<String>,
+    variants: Vec<String>,
 }
 
 impl Redactor {
     pub fn redact(&self, text: &str) -> String {
-        self.secrets.iter().fold(text.to_owned(), |text, secret| {
-            text.replace(secret, REDACTED)
+        self.variants.iter().fold(text.to_owned(), |text, variant| {
+            text.replace(variant, REDACTED)
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.secrets.is_empty()
+        self.variants.is_empty()
     }
 
     pub(crate) fn extend(&mut self, other: &Self) {
-        self.secrets.extend(other.secrets.iter().cloned());
-        self.secrets
-            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        self.secrets.dedup();
+        self.variants.extend(other.variants.iter().cloned());
+        self.sort_and_dedupe();
     }
 
     pub(crate) fn add_secret(&mut self, secret: String) {
-        if !secret.is_empty() {
-            self.secrets.push(secret);
-            self.secrets
-                .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-            self.secrets.dedup();
+        if meets_min_secret_len(&secret) {
+            self.register_variants(&secret);
+            self.sort_and_dedupe();
         }
+    }
+
+    /// Register a JSON-serialized runtime output for redaction.
+    /// When `bare_string` is `Some`, length is measured on that bare string so
+    /// JSON quotes do not promote a short value past `MIN_SECRET_LEN`.
+    pub(crate) fn add_serialized_secret(&mut self, serialized: String, bare_string: Option<&str>) {
+        match bare_string {
+            Some(bare) if !meets_min_secret_len(bare) => {}
+            _ => self.add_secret(serialized),
+        }
+    }
+
+    fn register_variants(&mut self, secret: &str) {
+        self.variants.push(secret.to_owned());
+        // Percent-encoding hex digits are case-insensitive in URLs, but
+        // str::replace is not — register both cases for each space form.
+        for mode in PERCENT_ENCODINGS {
+            self.variants.push(mode.encode(secret));
+        }
+        self.variants.push(STANDARD.encode(secret.as_bytes()));
+        self.variants
+            .push(STANDARD_NO_PAD.encode(secret.as_bytes()));
+        self.variants.push(URL_SAFE.encode(secret.as_bytes()));
+        self.variants
+            .push(URL_SAFE_NO_PAD.encode(secret.as_bytes()));
+    }
+
+    fn sort_and_dedupe(&mut self) {
+        self.variants
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        self.variants.dedup();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PercentEncoding {
+    ComponentUpper,
+    ComponentLower,
+    FormUpper,
+    FormLower,
+}
+
+const PERCENT_ENCODINGS: [PercentEncoding; 4] = [
+    PercentEncoding::ComponentUpper,
+    PercentEncoding::ComponentLower,
+    PercentEncoding::FormUpper,
+    PercentEncoding::FormLower,
+];
+
+impl PercentEncoding {
+    fn encode(self, value: &str) -> String {
+        let form = matches!(self, Self::FormUpper | Self::FormLower);
+        let lower_hex = matches!(self, Self::ComponentLower | Self::FormLower);
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(byte as char);
+            } else if form && byte == b' ' {
+                encoded.push('+');
+            } else if lower_hex {
+                encoded.push_str(&format!("%{byte:02x}"));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        encoded
     }
 }
 
@@ -140,7 +216,7 @@ impl fmt::Debug for Redactor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Redactor")
-            .field("secret_count", &self.secrets.len())
+            .field("variant_count", &self.variants.len())
             .finish()
     }
 }
@@ -2003,14 +2079,11 @@ pub fn artifact_key(root: impl AsRef<Path>, file: impl AsRef<Path>) -> String {
 
 impl Redactor {
     fn from_inputs(inputs: &BTreeMap<String, Resolved<String>>) -> Self {
-        let mut secrets = inputs
-            .values()
-            .filter(|value| value.secret)
-            .map(|value| value.value.clone())
-            .collect::<Vec<_>>();
-        secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        secrets.dedup();
-        Self { secrets }
+        let mut redactor = Self::default();
+        for value in inputs.values().filter(|value| value.secret) {
+            redactor.add_secret(value.value.clone());
+        }
+        redactor
     }
 }
 
@@ -2310,6 +2383,11 @@ fn resolve_inputs(
         })?;
         require_scalar_size(&format!("secrets.{name}"), &value)?;
         require_non_empty(&format!("secrets.{name}"), &value)?;
+        if !meets_min_secret_len(&value) {
+            return invalid(format!(
+                "secrets.{name} must be at least {MIN_SECRET_LEN} characters so it does not over-redact diagnostics"
+            ));
+        }
         resolved.insert(name.clone(), Resolved::new(value, true));
     }
     Ok(resolved)

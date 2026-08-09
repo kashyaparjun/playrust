@@ -2336,7 +2336,11 @@ fn store_output(
             "runtime output exceeds the runtime value size limit",
         ));
     }
-    redactor.add_secret(serialized);
+    let bare_string = match &value {
+        Value::String(value) => Some(value.as_str()),
+        _ => None,
+    };
+    redactor.add_serialized_secret(serialized, bare_string);
     register_string_secrets(redactor, &value);
     outputs.insert(name.to_owned(), Resolved::new(value, true));
     Ok(())

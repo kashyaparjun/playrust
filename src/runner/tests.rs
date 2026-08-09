@@ -157,6 +157,32 @@ fn runtime_json_is_compact_secret_and_size_bounded() {
 }
 
 #[test]
+fn short_runtime_string_outputs_are_not_registered_for_redaction() {
+    let mut stored = BTreeMap::new();
+    let mut redactor = Redactor::default();
+    store_output(
+        &mut stored,
+        &mut redactor,
+        "short",
+        Value::String("ab".to_owned()),
+    )
+    .unwrap_or_else(|error| panic!("{}", error.message));
+    assert_eq!(
+        redactor.redact("ab and \"ab\" and visible"),
+        "ab and \"ab\" and visible"
+    );
+
+    store_output(
+        &mut stored,
+        &mut redactor,
+        "long",
+        Value::String("abcd".to_owned()),
+    )
+    .unwrap_or_else(|error| panic!("{}", error.message));
+    assert_eq!(redactor.redact("abcd"), "[REDACTED]");
+}
+
+#[test]
 fn structured_expressions_resolve_runtime_json_without_exposing_values() {
     let flow = compile_yaml_with_env(
             "version: 1\nname: x\nsteps:\n  - evaluate: { script: 'return true', save_as: saved }\n  - when: { expression: { all: [{ boolean: '${saved}' }, { not_equals: { left: x, right: y } }] } }\n    open: https://x.test\n",

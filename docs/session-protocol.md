@@ -194,7 +194,7 @@ An exported bundle contains:
 
 `session.ndjson` is an append-only, sequence-numbered, redacted audit journal covering settings, commands and outcomes, durable locators, navigations, dialogs, waits/assertions, pauses, variable/secret metadata, warnings, and artifact references. `replay.yaml` contains only successful explicit opens/actions, necessary scrolls, explicit waits and pauses, dialog responses, and assertions. Batch YAML handles those responses with `dialog: { action: accept }`, `dialog: { action: dismiss }`, or an accepted prompt with `text`. Snapshots, failed exploratory actions, duplicate observed navigations, recorder internals, and protocol bookkeeping are excluded.
 
-Environment-backed values become deterministic YAML secret entries. Plaintext secret values do not appear in protocol responses, the journal, reports, or replay YAML. Validate the canonical flow with `playrust check <bundle>/replay.yaml`; optionally run it in a fresh browser with the same environment variables.
+Environment-backed values become deterministic YAML secret entries. Plaintext secret values do not appear in protocol responses, the journal, reports, or replay YAML. Diagnostic and protocol redaction follow the same rules as README **Variables and secrets** (encoding variants and the four-character minimum for declared secrets). Validate the canonical flow with `playrust check <bundle>/replay.yaml`; optionally run it in a fresh browser with the same environment variables.
 
 ## Compatibility Commands
 
