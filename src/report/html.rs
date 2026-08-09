@@ -188,7 +188,7 @@ fn push_artifact(
                     escape_html(label)
                 )),
                 ArtifactKind::Video => output.push_str(&format!(
-                    "<video controls preload=\"metadata\" class=\"artifact-preview\"><source src=\"{escaped}\" type=\"video/mp4\"></video>"
+                    "<a href=\"{escaped}\"><video controls preload=\"metadata\" class=\"artifact-preview\"><source src=\"{escaped}\" type=\"video/mp4\"></video></a>"
                 )),
             }
             output.push_str(" <code>");

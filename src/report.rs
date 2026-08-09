@@ -795,6 +795,7 @@ mod tests {
 
         assert!(html.contains("href=\"flow-a/shot.png\""));
         assert!(html.contains("src=\"flow-a/shot.png\""));
+        assert!(html.contains("href=\"flow-a/recording.mp4\""));
         assert!(html.contains("<video controls"));
         assert!(html.contains("src=\"flow-a/recording.mp4\""));
         assert!(html.contains("Missing artifact"));
