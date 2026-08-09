@@ -1,5 +1,10 @@
 use super::*;
 
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+
 #[test]
 fn presentation_overlays_parse_with_independent_options() {
     let flow = compile(
@@ -1691,4 +1696,83 @@ fn recording_secret_warning_is_present_for_secret_open_and_select_and_dialog() {
             "expected warning for {source}"
         );
     }
+}
+
+#[test]
+fn redactor_redacts_percent_encoded_secrets_in_both_space_forms() {
+    let mut redactor = Redactor::default();
+    redactor.add_secret("p@ss w0rd/x=y".to_owned());
+    let url = "https://api.test/?q=p%40ss%20w0rd%2Fx%3Dy&keep=visible";
+    let redacted = redactor.redact(url);
+    assert!(redacted.contains("[REDACTED]"), "{redacted}");
+    assert!(!redacted.contains("p%40ss%20w0rd%2Fx%3Dy"));
+    assert!(redacted.contains("visible"));
+    let form = "grant_type=password&q=p%40ss+w0rd%2Fx%3Dy&keep=visible";
+    let redacted = redactor.redact(form);
+    assert!(redacted.contains("[REDACTED]"), "{redacted}");
+    assert!(!redacted.contains("p%40ss+w0rd%2Fx%3Dy"));
+    assert!(redacted.contains("visible"));
+    assert_eq!(redactor.redact("p@ss w0rd/x=y"), REDACTED);
+}
+
+#[test]
+fn redactor_redacts_base64_encoded_secrets_in_standard_and_urlsafe_alphabets() {
+    let mut redactor = Redactor::default();
+    redactor.add_secret("PLAINTEXT+SECRET/VALUE".to_owned());
+    let standard = STANDARD.encode("PLAINTEXT+SECRET/VALUE");
+    let urlsafe = URL_SAFE_NO_PAD.encode("PLAINTEXT+SECRET/VALUE");
+    assert_ne!(standard, "PLAINTEXT+SECRET/VALUE");
+    assert_ne!(urlsafe, "PLAINTEXT+SECRET/VALUE");
+    let redacted = redactor.redact(&format!("auth={standard}&alt={urlsafe}"));
+    assert!(
+        redacted.contains("[REDACTED]"),
+        "{redacted} std={standard} url={urlsafe}"
+    );
+    assert!(!redacted.contains(&standard), "{redacted}");
+    assert!(!redacted.contains(&urlsafe), "{redacted}");
+    assert_eq!(
+        redactor.redact(&format!("bearer {standard}")),
+        "bearer [REDACTED]"
+    );
+}
+
+#[test]
+fn redactor_longest_first_ordering_wins_across_encodings_when_one_secret_is_a_prefix() {
+    let mut redactor = Redactor::default();
+    redactor.add_secret("secret-prefix".to_owned());
+    redactor.add_secret("secret-prefix-extension".to_owned());
+    let redacted = redactor.redact("secret-prefix-extension and secret-prefix");
+    assert!(!redacted.contains("secret-prefix-extension"), "{redacted}");
+}
+
+#[test]
+fn declared_secrets_shorter_than_four_characters_are_rejected_at_compile_time() {
+    for short in ["ab", "x", "one"] {
+        let environment = BTreeMap::from([("TOKEN".to_owned(), short.to_owned())]);
+        let result = compile_yaml_with_env(
+            "version: 1\nname: x\nsecrets: { token: { env: TOKEN } }\nsteps: [{ open: https://x.test }]\n",
+            "flows/example.yaml",
+            &BTreeMap::new(),
+            &environment,
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("token"), "{message} for {short:?}");
+        assert!(
+            message.contains("4") || message.contains("four"),
+            "{message} for {short:?}"
+        );
+        assert!(
+            !message.contains(short),
+            "error leaked short secret {short:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn runtime_output_secrets_shorter_than_four_characters_are_not_redacted_away() {
+    let mut redactor = Redactor::default();
+    redactor.add_secret("ab".to_owned());
+    redactor.add_secret("visible".to_owned());
+    let redacted = redactor.redact("ab and visible");
+    assert_eq!(redacted, "ab and [REDACTED]");
 }
