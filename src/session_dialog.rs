@@ -1,5 +1,7 @@
 //! Native JavaScript dialog state for a persistent browser session.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -228,6 +230,12 @@ pub(crate) struct NativeDialogState {
 // panicked. We guard all lock().expect() sites because native-dialog state
 // lives behind Arc<Mutex<State>> shared across the CDP listener and the
 // runner; poisoning would make the session permanently unusable.
+
+#[allow(clippy::expect_used)]
+fn lock_dialog_state(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    state.lock().expect("native dialog state poisoned")
+}
+
 impl NativeDialogState {
     pub(crate) fn new(policy: DialogPolicy) -> Self {
         Self {
@@ -249,11 +257,7 @@ impl NativeDialogState {
             .event_listener::<EventJavascriptDialogClosed>()
             .await
             .context("listen for native dialog closed events")?;
-        let generation = self
-            .state
-            .lock()
-            .expect("native dialog state poisoned")
-            .bind(page.clone());
+        let generation = lock_dialog_state(&self.state).bind(page.clone());
         let state = Arc::clone(&self.state);
         let pending_notify = Arc::clone(&self.pending_notify);
         let policy = self.policy;
@@ -265,10 +269,7 @@ impl NativeDialogState {
                     _ = &mut stop_rx => break,
                     event = opened.next() => {
                         let Some(event) = event else { break };
-                        let response = state
-                            .lock()
-                            .expect("native dialog state poisoned")
-                            .opened(generation, PendingDialog::from(event.as_ref()), policy);
+                        let response = lock_dialog_state(&state).opened(generation, PendingDialog::from(event.as_ref()), policy);
                         pending_notify.notify_waiters();
                         if let Some(response) = response {
                             tokio::select! {
@@ -281,17 +282,11 @@ impl NativeDialogState {
                     }
                     event = closed.next() => {
                         let Some(event) = event else { break };
-                        state
-                            .lock()
-                            .expect("native dialog state poisoned")
-                            .closed(generation, event.frame_id.as_ref());
+                        lock_dialog_state(&state).closed(generation, event.frame_id.as_ref());
                     }
                 }
             }
-            state
-                .lock()
-                .expect("native dialog state poisoned")
-                .unbind_if(generation);
+            lock_dialog_state(&state).unbind_if(generation);
         });
         self.listener = Some(Listener {
             stop: Some(stop),
@@ -301,20 +296,14 @@ impl NativeDialogState {
     }
 
     pub(crate) fn pending(&self) -> Option<PendingDialog> {
-        self.state
-            .lock()
-            .expect("native dialog state poisoned")
+        lock_dialog_state(&self.state)
             .pending
             .as_ref()
             .map(|pending| pending.metadata.clone())
     }
 
     pub(crate) fn take_error(&self) -> Option<String> {
-        self.state
-            .lock()
-            .expect("native dialog state poisoned")
-            .last_error
-            .take()
+        lock_dialog_state(&self.state).last_error.take()
     }
 
     pub(crate) async fn wait_for_pending(&self) {
@@ -340,21 +329,15 @@ impl NativeDialogState {
     }
 
     async fn respond(&self, accept: bool, prompt_text: Option<&str>) -> Result<()> {
-        let (page, response) = self
-            .state
-            .lock()
-            .expect("native dialog state poisoned")
-            .begin_response(accept, prompt_text)?;
+        let (page, response) =
+            lock_dialog_state(&self.state).begin_response(accept, prompt_text)?;
         let result = send_response_bounded(&page, &response).await;
         finish_response(&self.state, response.id, &result);
         result
     }
 
     async fn stop_listener(&mut self) {
-        self.state
-            .lock()
-            .expect("native dialog state poisoned")
-            .unbind();
+        lock_dialog_state(&self.state).unbind();
         if let Some(mut listener) = self.listener.take() {
             if let Some(stop) = listener.stop.take() {
                 let _ = stop.send(());
@@ -366,10 +349,7 @@ impl NativeDialogState {
 
 impl Drop for NativeDialogState {
     fn drop(&mut self) {
-        self.state
-            .lock()
-            .expect("native dialog state poisoned")
-            .unbind();
+        lock_dialog_state(&self.state).unbind();
         if let Some(listener) = self.listener.take() {
             listener.task.abort();
         }
@@ -390,10 +370,7 @@ async fn send_response_bounded(page: &Page, response: &Response) -> Result<()> {
 }
 
 fn finish_response(state: &Mutex<State>, id: u64, result: &Result<()>) {
-    state
-        .lock()
-        .expect("native dialog state poisoned")
-        .complete(id, result.as_ref().err().map(ToString::to_string));
+    lock_dialog_state(state).complete(id, result.as_ref().err().map(ToString::to_string));
 }
 
 fn validate_prompt_text(kind: DialogKind, accept: bool, prompt_text: Option<&str>) -> Result<()> {
@@ -404,6 +381,7 @@ fn validate_prompt_text(kind: DialogKind, accept: bool, prompt_text: Option<&str
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use chromiumoxide::cdp::browser_protocol::page::FrameId;

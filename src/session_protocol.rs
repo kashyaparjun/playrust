@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
@@ -340,6 +342,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 // holds a borrow of `session` via `opened`, and the session is
                 // opened at startup before this loop and only taken on close
                 // (which exits the function).
+                #[allow(clippy::expect_used)]
                 let _ = session
                     .take()
                     .expect("recorder warning path holds an open session")
@@ -786,14 +789,25 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         }
                     }
                 };
-                let diff = since.map(|from| {
-                    opened
-                        .snapshot_diff(from, snapshot.generation)
-                        // Invariant: `validate_snapshot_baseline(from)` above
-                        // confirmed `from` is adjacent to the newly captured
-                        // snapshot, so the diff cannot fail.
-                        .expect("snapshot baseline was validated as adjacent")
-                });
+                let diff = match since {
+                    Some(from) => match opened.snapshot_diff(from, snapshot.generation) {
+                        Ok(diff) => Some(diff),
+                        Err(error) => {
+                            let response = state.error(
+                                request.id,
+                                "snapshot_unavailable",
+                                error.to_string(),
+                                None,
+                            );
+                            if write_response(&mut stdout, &response).await.is_err() {
+                                exit_code = ExitCode::Infrastructure;
+                                break;
+                            }
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let event = JournalEvent::Snapshot {
                     snapshot_revision: snapshot.generation,
                     summary: json!({ "url": inspection.url, "elements": snapshot.elements.len() }),
@@ -1009,12 +1023,17 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     continue;
                 }
                 let step = json!({ "scroll": { "x": x, "y": y } });
-                let flow = compile_interactive(&step, opened)
-                    // Invariant: the scroll step is a fixed literal
-                    // `{ scroll: { x, y } }` with no environment values or
-                    // refs, so it always compiles. x/y are already validated
-                    // as not both zero above.
-                    .expect("scroll step is a validated literal flow");
+                let flow = match compile_interactive(&step, opened) {
+                    Ok(flow) => flow,
+                    Err(error) => {
+                        let response = state.error(request.id, "validation", error, None);
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let result = opened
                     .execute_interactive(&host, &flow, &state.artifacts)
                     .await;
@@ -1238,6 +1257,7 @@ fn prepare_action(
         })?;
     // Invariant: `object` has exactly one entry (checked by the
     // `object.len() == 1` filter above), so `.next()` is always Some.
+    #[allow(clippy::expect_used)]
     let (name, payload) = object
         .iter()
         .next()
@@ -1288,7 +1308,7 @@ fn prepare_action(
             let mut object = payload
                 .as_object()
                 .cloned()
-                .expect("payload holds a ref key");
+                .ok_or_else(|| validation_error("act.switch_frame must be an object"))?;
             let reference = take_reference(&mut object, session, &mut backend_node_id)?;
             durable = Some(reference.clone());
             json!({ "target": reference })
@@ -1390,7 +1410,7 @@ fn compile_interactive(step: &Value, session: &BrowserSession) -> Result<Compile
     }))
     // Invariant: the embedded JSON value is built entirely from serializable
     // primitives and serde_json::Value, so `to_string` cannot fail.
-    .expect("interactive flow value is serializable");
+    .map_err(|error| error.to_string())?;
     compile_inline_yaml(
         &source,
         "interactive-action.yaml",
@@ -1730,6 +1750,7 @@ fn session_id() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1891,6 +1912,25 @@ mod tests {
         assert!(!contents.contains("secret-canary"));
     }
 
+    #[test]
+    fn replace_environment_values_rejects_missing_variables() {
+        let mut value = json!({ "env": "PLAYRUST_TEST_MISSING_ENV_FOR_PROTOCOL" });
+        let mut secrets = serde_json::Map::new();
+        assert!(
+            replace_environment_values(&mut value, &mut secrets)
+                .unwrap_err()
+                .contains("PLAYRUST_TEST_MISSING_ENV_FOR_PROTOCOL")
+        );
+    }
+    #[test]
+    fn act_command_without_action_field_is_invalid() {
+        assert_eq!(
+            decode_request(br#"{"id":1,"command":"act"}"#)
+                .unwrap_err()
+                .0,
+            1
+        );
+    }
     #[test]
     fn invalid_utf8_is_an_invalid_command_with_a_null_id() {
         let error =

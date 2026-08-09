@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -290,22 +292,22 @@ impl JournalEvent {
         }
     }
 
-    fn replay_step(&self) -> Option<Value> {
+    fn replay_step(&self) -> Result<Option<Value>, ExportError> {
         match self {
-            Self::ReplayStep { step, outcome, .. } if outcome.succeeded() => Some(step.clone()),
+            Self::ReplayStep { step, outcome, .. } if outcome.succeeded() => Ok(Some(step.clone())),
             Self::DialogHandled { action, text } => {
                 let mut dialog = serde_json::Map::new();
                 dialog.insert("action".to_owned(), Value::String(action.clone()));
                 if let Some(text) = text {
                     dialog.insert("text".to_owned(), text.clone());
                 }
-                Some(serde_json::json!({ "dialog": dialog }))
+                Ok(Some(serde_json::json!({ "dialog": dialog })))
             }
             _ => self
                 .replay_operation()
                 .map(serde_json::to_value)
                 .transpose()
-                .expect("replay operations serialize to JSON"),
+                .map_err(ExportError::StepJson),
         }
     }
 }
@@ -436,6 +438,8 @@ pub enum ExportError {
     UnsafeName,
     #[error("replay has no successful explicit operations")]
     EmptyReplay,
+    #[error("failed to serialize replay step: {0}")]
+    StepJson(#[from] serde_json::Error),
     #[error("failed to serialize replay YAML: {0}")]
     Yaml(#[from] serde_saphyr::ser_error::Error),
     #[error("failed to publish replay to {path}: {source}")]
@@ -459,10 +463,12 @@ pub fn build_replay_yaml(name: &str, events: &[JournalEvent]) -> Result<ReplayEx
     if !is_safe_bundle_name(name) {
         return Err(ExportError::UnsafeName);
     }
-    let mut steps = events
-        .iter()
-        .filter_map(JournalEvent::replay_step)
-        .collect::<Vec<_>>();
+    let mut steps = Vec::new();
+    for event in events {
+        if let Some(step) = event.replay_step()? {
+            steps.push(step);
+        }
+    }
     if steps.is_empty() {
         return Err(ExportError::EmptyReplay);
     }
@@ -618,6 +624,7 @@ pub fn publish_replay_atomic(path: impl AsRef<Path>, yaml: &str) -> Result<(), E
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde::Deserialize;

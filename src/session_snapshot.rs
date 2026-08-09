@@ -1,5 +1,6 @@
 //! Pure snapshot, element-reference, and semantic-diff state for agent sessions.
 
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -257,6 +258,7 @@ struct StoredSnapshot {
 
 impl Default for SnapshotStore {
     fn default() -> Self {
+        #[allow(clippy::expect_used)]
         Self::new(NonZeroUsize::new(2).expect("two is non-zero"))
     }
 }
@@ -334,12 +336,13 @@ impl SnapshotStore {
             .collect::<BTreeSet<_>>();
         if identities.len() != capture.elements.len() {
             let mut seen = BTreeSet::new();
-            let duplicate = capture
+            if let Some(duplicate) = capture
                 .elements
                 .iter()
                 .find(|element| !seen.insert(element.identity.clone()))
-                .expect("identity count proved a duplicate");
-            return Err(SnapshotError::DuplicateIdentity(duplicate.identity.clone()));
+            {
+                return Err(SnapshotError::DuplicateIdentity(duplicate.identity.clone()));
+            }
         }
         for element in &capture.elements {
             if let Some(parent) = &element.parent
@@ -358,12 +361,11 @@ impl SnapshotStore {
             .iter()
             .enumerate()
             .map(|(index, element)| {
-                (
-                    element.identity.clone(),
-                    ElementRef(first_ref + u64::try_from(index).expect("element count fits u64")),
-                )
+                u64::try_from(index)
+                    .map_err(|_| SnapshotError::ReferenceExhausted)
+                    .map(|index| (element.identity.clone(), ElementRef(first_ref + index)))
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut latest = BTreeMap::new();
         let mut stored = BTreeMap::new();
         let elements = capture
@@ -465,6 +467,7 @@ impl SnapshotStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -639,6 +642,17 @@ mod tests {
             Err(DiffError::NotAdjacent { from: 3, to: 2 })
         );
         assert!(store.diff(2, 3).is_ok());
+    }
+
+    #[test]
+    fn publish_rejects_duplicate_element_identities() {
+        let mut store = store(2);
+        let mut snapshot = capture(&[("button", None, "One"), ("button", None, "Two")]);
+        snapshot.elements[1].identity = snapshot.elements[0].identity.clone();
+        assert!(matches!(
+            store.publish(snapshot).unwrap_err(),
+            SnapshotError::DuplicateIdentity(_)
+        ));
     }
 
     #[test]
