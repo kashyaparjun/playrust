@@ -1,0 +1,3 @@
+﻿version: 1
+name: bom-crlf
+steps: [{ open: https://x.test }]
