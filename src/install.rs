@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -10,6 +10,7 @@ use std::{
 use chrome_for_testing::Version;
 use chrome_for_testing_manager::{ChromeBinary, ChromeForTestingManager, VersionRequest};
 use directories::ProjectDirs;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -112,6 +113,32 @@ pub enum InstallError {
     ResolvedVersionMismatch {
         expected: &'static str,
         actual: String,
+    },
+    #[error("failed to read release archive {path}: {error}")]
+    ArchiveRead {
+        path: PathBuf,
+        #[source]
+        error: io::Error,
+    },
+    #[error("unsupported release archive {path}; expected .tar.gz, .tgz, or .zip")]
+    UnsupportedArchive { path: PathBuf },
+    #[error("invalid SHA-256 checksum file {path}: {reason}")]
+    InvalidChecksum { path: PathBuf, reason: String },
+    #[error("SHA-256 mismatch for {archive}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        archive: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("release archive contains an unsafe path {path:?}")]
+    UnsafeArchivePath { path: String },
+    #[error("release archive does not contain the expected {binary} binary")]
+    BinaryNotFound { binary: &'static str },
+    #[error("release installation failed for {path}: {error}")]
+    ReleaseInstall {
+        path: PathBuf,
+        #[source]
+        error: io::Error,
     },
 }
 
@@ -364,6 +391,234 @@ fn validate_version(version: &str) -> Result<(), InstallError> {
     }
 }
 
+const RELEASE_BINARY: &str = if cfg!(windows) {
+    "playrust.exe"
+} else {
+    "playrust"
+};
+
+pub fn install_release(
+    archive: &Path,
+    checksum: &Path,
+    destination: &Path,
+) -> Result<PathBuf, InstallError> {
+    verify_sha256(archive, checksum)?;
+    fs::create_dir_all(destination).map_err(|error| InstallError::ReleaseInstall {
+        path: destination.to_owned(),
+        error,
+    })?;
+    let mut staged = tempfile::NamedTempFile::new_in(destination).map_err(|error| {
+        InstallError::ReleaseInstall {
+            path: destination.to_owned(),
+            error,
+        }
+    })?;
+    let output = staged.as_file_mut();
+    let found = match archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+    {
+        name if name.ends_with(".zip") => extract_zip(archive, output)?,
+        name if name.ends_with(".tar.gz") || name.ends_with(".tgz") => {
+            extract_tar(archive, output)?
+        }
+        _ => {
+            return Err(InstallError::UnsupportedArchive {
+                path: archive.to_owned(),
+            });
+        }
+    };
+    if !found {
+        return Err(InstallError::BinaryNotFound {
+            binary: RELEASE_BINARY,
+        });
+    }
+    output
+        .flush()
+        .map_err(|error| InstallError::ReleaseInstall {
+            path: destination.to_owned(),
+            error,
+        })?;
+    let target = destination.join(RELEASE_BINARY);
+    staged
+        .persist(&target)
+        .map_err(|error| InstallError::ReleaseInstall {
+            path: target.clone(),
+            error: error.error,
+        })?;
+    set_executable(&target).map_err(|error| InstallError::ReleaseInstall {
+        path: target.clone(),
+        error,
+    })?;
+    Ok(target)
+}
+
+fn verify_sha256(archive: &Path, checksum: &Path) -> Result<(), InstallError> {
+    let mut file = File::open(archive).map_err(|error| InstallError::ArchiveRead {
+        path: archive.to_owned(),
+        error,
+    })?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher).map_err(|error| InstallError::ArchiveRead {
+        path: archive.to_owned(),
+        error,
+    })?;
+    let actual = format!("{:x}", hasher.finalize());
+    let text = fs::read_to_string(checksum).map_err(|error| InstallError::ArchiveRead {
+        path: checksum.to_owned(),
+        error,
+    })?;
+    let name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let expected = parse_checksum(&text, name).map_err(|error| match error {
+        InstallError::InvalidChecksum { reason, .. } => InstallError::InvalidChecksum {
+            path: checksum.to_owned(),
+            reason,
+        },
+        other => other,
+    })?;
+    if expected != actual {
+        return Err(InstallError::ChecksumMismatch {
+            archive: archive.to_owned(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn parse_checksum(text: &str, archive_name: &str) -> Result<String, InstallError> {
+    let invalid = || InstallError::InvalidChecksum {
+        path: PathBuf::from("checksum"),
+        reason: "expected a 64-character SHA-256 digest (GNU, BSD, or raw format)".to_owned(),
+    };
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let candidate = if let Some((prefix, digest)) = line.split_once('=') {
+            let prefix = prefix.trim();
+            let bsd_name = prefix
+                .strip_prefix("SHA256 (")
+                .and_then(|name| name.strip_suffix(')'));
+            if bsd_name.is_some_and(|name| name.ends_with(archive_name)) {
+                digest.trim()
+            } else {
+                continue;
+            }
+        } else {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next().unwrap_or_default();
+            let name = fields.next().unwrap_or_default().trim_start_matches('*');
+            if !name.is_empty() && !name.ends_with(archive_name) {
+                continue;
+            }
+            digest
+        };
+        if candidate.len() == 64 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(candidate.to_ascii_lowercase());
+        }
+        return Err(invalid());
+    }
+    Err(invalid())
+}
+
+fn safe_archive_path(path: &Path) -> Result<(), InstallError> {
+    use std::path::Component;
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(InstallError::UnsafeArchivePath {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn extract_tar(archive: &Path, output: &mut File) -> Result<bool, InstallError> {
+    let file = File::open(archive).map_err(|error| InstallError::ArchiveRead {
+        path: archive.to_owned(),
+        error,
+    })?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    for entry in tar
+        .entries()
+        .map_err(|error| InstallError::ReleaseInstall {
+            path: archive.to_owned(),
+            error,
+        })?
+    {
+        let mut entry = entry.map_err(|error| InstallError::ReleaseInstall {
+            path: archive.to_owned(),
+            error,
+        })?;
+        let path = entry
+            .path()
+            .map_err(|error| InstallError::ReleaseInstall {
+                path: archive.to_owned(),
+                error,
+            })?
+            .into_owned();
+        safe_archive_path(&path)?;
+        if entry.header().entry_type().is_file()
+            && path.file_name().and_then(|name| name.to_str()) == Some(RELEASE_BINARY)
+        {
+            io::copy(&mut entry, output).map_err(|error| InstallError::ReleaseInstall {
+                path: archive.to_owned(),
+                error,
+            })?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn extract_zip(archive: &Path, output: &mut File) -> Result<bool, InstallError> {
+    let file = File::open(archive).map_err(|error| InstallError::ArchiveRead {
+        path: archive.to_owned(),
+        error,
+    })?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|error| InstallError::ReleaseInstall {
+        path: archive.to_owned(),
+        error: io::Error::other(error),
+    })?;
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|error| InstallError::ReleaseInstall {
+                path: archive.to_owned(),
+                error: io::Error::other(error),
+            })?;
+        let path = PathBuf::from(entry.name());
+        safe_archive_path(&path)?;
+        if entry.is_file()
+            && path.file_name().and_then(|name| name.to_str()) == Some(RELEASE_BINARY)
+        {
+            io::copy(&mut entry, output).map_err(|error| InstallError::ReleaseInstall {
+                path: archive.to_owned(),
+                error,
+            })?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn set_executable(_path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(_path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(_path, permissions)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn resolve_browser_with<F>(
     explicit: Option<&Path>,
@@ -516,5 +771,47 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn accepts_gnu_bsd_and_raw_checksum_formats() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_checksum(&format!("{digest}  release.tar.gz"), "release.tar.gz").unwrap(),
+            digest
+        );
+        assert_eq!(
+            parse_checksum(
+                &format!("SHA256 (release.tar.gz) = {digest}"),
+                "release.tar.gz"
+            )
+            .unwrap(),
+            digest
+        );
+        assert_eq!(parse_checksum(&digest, "release.tar.gz").unwrap(), digest);
+    }
+
+    #[test]
+    fn rejects_checksum_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("release.tar.gz");
+        let checksum = directory.path().join("release.sha256");
+        fs::write(&archive, b"release").unwrap();
+        fs::write(&checksum, format!("{}  release.tar.gz", "0".repeat(64))).unwrap();
+        assert!(matches!(
+            verify_sha256(&archive, &checksum),
+            Err(InstallError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_archive_traversal_and_absolute_paths() {
+        for path in [Path::new("../playrust"), Path::new("/tmp/playrust")] {
+            assert!(matches!(
+                safe_archive_path(path),
+                Err(InstallError::UnsafeArchivePath { .. })
+            ));
+        }
+        assert!(safe_archive_path(Path::new("release/playrust")).is_ok());
     }
 }

@@ -47,8 +47,9 @@ use crate::browser::{BrowserContext, BrowserHost, BrowserStatus, Geolocation, Vi
 use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
     Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey,
-    NativeDialogResponse, Operation, PageSwitch, RecordingControl, Redactor, RelationKind,
-    RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation, When,
+    NativeDialogResponse, Operation, PageSwitch, PresentationOverlays, RecordingControl, Redactor,
+    RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
+    When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -377,6 +378,19 @@ pub struct RunOptions {
     pub artifact_directory: PathBuf,
     pub ffmpeg_path: Option<PathBuf>,
     pub cancellation: Option<CancellationToken>,
+    #[cfg(test)]
+    step_started_observer: Option<StepStartedObserver>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StepStartedObserver(Arc<dyn Fn(&'static str) + Send + Sync>);
+
+#[cfg(test)]
+impl fmt::Debug for StepStartedObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StepStartedObserver")
+    }
 }
 
 impl RunOptions {
@@ -385,6 +399,8 @@ impl RunOptions {
             artifact_directory: artifact_directory.into(),
             ffmpeg_path: None,
             cancellation: None,
+            #[cfg(test)]
+            step_started_observer: None,
         }
     }
 
@@ -717,6 +733,8 @@ impl SessionRuntime {
             stopped_loops: BTreeSet::new(),
             expects_dialog: false,
             dialog_listener: None,
+            presentation_overlays: PresentationOverlays::default(),
+            presentation_overlay_recording: false,
         };
         let deadline = Instant::now()
             .checked_add(step.timeout)
@@ -1231,6 +1249,8 @@ async fn execute_flow(
             .iter()
             .any(|step| matches!(step.operation, Operation::Dialog { .. })),
         dialog_listener: None,
+        presentation_overlays: flow.settings.overlays,
+        presentation_overlay_recording: false,
     };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut browser_status = host.subscribe_status();
@@ -1242,6 +1262,7 @@ async fn execute_flow(
             match start_video(&page, flow, options, deadline).await {
                 Ok(VideoStartup::Ready(session)) => {
                     video = session;
+                    runtime.presentation_overlay_recording = video.is_some();
                     interrupted = is_cancelled(options.cancellation.as_ref());
                 }
                 Ok(VideoStartup::Cancelled(finish)) => {
@@ -1331,7 +1352,10 @@ async fn execute_flow(
             match control {
                 RecordingControl::Start => {
                     match start_video(&active.page, flow, options, deadline).await {
-                        Ok(VideoStartup::Ready(session)) => video = session,
+                        Ok(VideoStartup::Ready(session)) => {
+                            video = session;
+                            runtime.presentation_overlay_recording = video.is_some();
+                        }
                         Ok(VideoStartup::Cancelled(finish)) => {
                             interrupted = true;
                             if let Some(finish) = finish {
@@ -1361,6 +1385,7 @@ async fn execute_flow(
                             .await;
                         apply_video_finish(finish, &mut artifacts, &mut recording_error);
                     }
+                    deactivate_presentation_overlay(&active, &mut runtime).await;
                 }
             }
             interrupted |= is_cancelled(options.cancellation.as_ref());
@@ -1380,6 +1405,19 @@ async fn execute_flow(
         }
         let mut error = None;
         for attempt in 0..=step.retries {
+            if runtime.presentation_overlays_active() {
+                if step_captures_screenshot(step) {
+                    let _ = remove_presentation_overlay(&active).await;
+                } else {
+                    let _ = update_presentation_overlay(
+                        &active,
+                        step,
+                        &runtime.presentation_overlays,
+                        &runtime.redactor,
+                    )
+                    .await;
+                }
+            }
             let Some(deadline) = Instant::now().checked_add(step.timeout) else {
                 error = Some(StepError::new(
                     FailureCategory::Protocol,
@@ -1398,8 +1436,11 @@ async fn execute_flow(
                     error = Some(protocol(browser_error));
                     break;
                 }
-                result = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
+                result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    #[cfg(test)]
+                    if let Some(observer) = &options.step_started_observer {
+                        (observer.0)(operation_name(&step.operation));
+                    }
                     execute_step(
                         host,
                         &context_id,
@@ -1408,11 +1449,21 @@ async fn execute_flow(
                         deadline,
                         &options.artifact_directory,
                         &mut runtime,
-                    ),
-                ) => result,
+                    ).await
+                }) => result,
             };
             match result {
                 Ok(Ok(screenshot)) => {
+                    if runtime.presentation_overlays_active() {
+                        let _ = update_presentation_overlay(
+                            &active,
+                            step,
+                            &runtime.presentation_overlays,
+                            &runtime.redactor,
+                        )
+                        .await;
+                        settle_video(&active.page).await;
+                    }
                     if let Some(path) = screenshot {
                         artifacts.screenshots.push(path_text(&path));
                     }
@@ -1451,6 +1502,9 @@ async fn execute_flow(
                 ),
             }
         }
+        if runtime.presentation_overlays_active() {
+            let _ = remove_presentation_overlay(&active).await;
+        }
         artifacts.failure_screenshot =
             capture_failure_screenshot(&active, &options.artifact_directory)
                 .await
@@ -1475,6 +1529,7 @@ async fn execute_flow(
             .await;
         apply_video_finish(finish, &mut artifacts, &mut recording_error);
     }
+    deactivate_presentation_overlay(&active, &mut runtime).await;
 
     let mut failures = primary.into_iter().collect::<Vec<_>>();
     failures.append(&mut additional_failures);
@@ -1521,6 +1576,16 @@ async fn settle_video(page: &Page) {
     tokio::time::sleep(FINAL_FRAME_DELAY).await;
 }
 
+async fn pause_until(duration: Duration, deadline: Instant) -> Result<(), StepError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if duration > remaining {
+        tokio::time::sleep(remaining).await;
+        return Err(StepError::new(FailureCategory::Timeout, "step deadline expired").deadline());
+    }
+    tokio::time::sleep(duration).await;
+    Ok(())
+}
+
 async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
     match cancellation {
         Some(cancellation) => cancellation.cancelled().await,
@@ -1553,6 +1618,157 @@ struct RuntimeState {
     stopped_loops: BTreeSet<usize>,
     expects_dialog: bool,
     dialog_listener: Option<EventStream<EventJavascriptDialogOpening>>,
+    presentation_overlays: PresentationOverlays,
+    presentation_overlay_recording: bool,
+}
+
+impl RuntimeState {
+    fn presentation_overlays_active(&self) -> bool {
+        self.presentation_overlay_recording
+            && self.presentation_overlays != PresentationOverlays::default()
+    }
+}
+
+async fn deactivate_presentation_overlay(active: &ActiveContext, runtime: &mut RuntimeState) {
+    runtime.presentation_overlay_recording = false;
+    let _ = remove_presentation_overlay(active).await;
+}
+
+fn step_captures_screenshot(step: &CompiledStep) -> bool {
+    matches!(
+        step.operation,
+        Operation::Screenshot { .. } | Operation::Assert(Assertion::Screenshot(_))
+    )
+}
+
+async fn update_presentation_overlay(
+    active: &ActiveContext,
+    step: &CompiledStep,
+    overlays: &PresentationOverlays,
+    redactor: &Redactor,
+) -> Result<(), StepError> {
+    let url = if overlays.url {
+        redactor.redact(&active.url().await.map_err(protocol)?.unwrap_or_default())
+    } else {
+        String::new()
+    };
+    let step_text = if overlays.step {
+        redactor.redact(&format!(
+            "Step {}{}",
+            step.index,
+            step.id
+                .as_deref()
+                .map_or(String::new(), |id| format!(" · {id}"))
+        ))
+    } else {
+        String::new()
+    };
+    // ponytail: values are JSON-serialized before injection; any new dynamic
+    // value must go through serde_json::to_string to stay injection-safe.
+    let script = format!(
+        r#"(() => {{
+            const tag = 'playrust-presentation-overlay';
+            let host = document.querySelector(`${{tag}}[data-playrust-presentation-overlay]`);
+            if (!host) {{
+                if (typeof document.__playrustPresentationOverlayCleanup === 'function') {{
+                    document.__playrustPresentationOverlayCleanup();
+                }}
+                host = document.createElement(tag);
+                host.dataset.playrustPresentationOverlay = '';
+                host.setAttribute('aria-hidden', 'true');
+                host.style.cssText = 'all:initial;display:contents;pointer-events:none';
+                const shadow = host.attachShadow({{ mode: 'open' }});
+                const style = document.createElement('style');
+                style.textContent = `
+                    :host, * {{ box-sizing:border-box;pointer-events:none }}
+                    #context {{ position:fixed;left:0;right:0;top:0;display:flex;gap:16px;padding:10px 14px;background:rgba(0,0,0,.72);font:600 14px sans-serif;color:white;text-shadow:0 1px 2px #000;white-space:nowrap;overflow:hidden }}
+                    #pointer {{ position:fixed;width:18px;height:18px;border:3px solid #ff3b30;border-radius:50%;transform:translate(-50%,-50%);left:50%;top:50% }}
+                    [data-marker="click"] {{ position:fixed;width:34px;height:34px;border:4px solid #34c759;border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 5px rgba(52,199,89,.28) }}
+                    [data-marker="scroll"] {{ position:fixed;min-width:44px;padding:8px 12px;border-radius:22px;transform:translate(-50%,-50%);background:#ffd60a;font:700 22px sans-serif;color:#111;text-align:center }}
+                `;
+                const context = document.createElement('div');
+                context.id = 'context';
+                const pointer = document.createElement('div');
+                pointer.id = 'pointer';
+                const markers = document.createElement('div');
+                markers.id = 'markers';
+                shadow.append(style, context, pointer, markers);
+
+                const showMarker = (kind, x, y, text) => {{
+                    markers.querySelector(`[data-marker="${{kind}}"]`)?.remove();
+                    const marker = document.createElement('div');
+                    marker.dataset.marker = kind;
+                    if (Number.isFinite(x)) marker.style.left = `${{x}}px`;
+                    if (Number.isFinite(y)) marker.style.top = `${{y}}px`;
+                    marker.textContent = text;
+                    markers.appendChild(marker);
+                }};
+                const onMove = event => {{
+                    pointer.style.left = `${{event.clientX}}px`;
+                    pointer.style.top = `${{event.clientY}}px`;
+                }};
+                const onPointerDown = event => showMarker('click', event.clientX, event.clientY, '');
+                const onWheel = event => showMarker(
+                    'scroll',
+                    innerWidth / 2,
+                    innerHeight / 2,
+                    Math.abs(event.deltaY) >= Math.abs(event.deltaX)
+                        ? (event.deltaY >= 0 ? '↓' : '↑')
+                        : (event.deltaX >= 0 ? '→' : '←')
+                );
+                if ({pointer}) {{
+                    document.addEventListener('pointermove', onMove, true);
+                    document.addEventListener('pointerdown', onPointerDown, true);
+                    document.addEventListener('wheel', onWheel, true);
+                    document.__playrustPresentationOverlayCleanup = () => {{
+                        document.removeEventListener('pointermove', onMove, true);
+                        document.removeEventListener('pointerdown', onPointerDown, true);
+                        document.removeEventListener('wheel', onWheel, true);
+                    }};
+                }}
+                document.documentElement.appendChild(host);
+            }}
+            const shadow = host.shadowRoot;
+            const context = shadow.getElementById('context');
+            context.replaceChildren();
+            const add = value => {{
+                if (!value) return;
+                const item = document.createElement('span');
+                item.textContent = value;
+                context.appendChild(item);
+            }};
+            add({step});
+            add({url});
+            shadow.getElementById('pointer').hidden = !{pointer};
+        }})()"#,
+        step = serde_json::to_string(&step_text).expect("overlay step serializes"),
+        url = serde_json::to_string(&url).expect("overlay URL serializes"),
+        pointer = overlays.pointer,
+    );
+    tokio::time::timeout(SECONDARY_TIMEOUT, active.page.evaluate(script))
+        .await
+        .map_err(|_| protocol("presentation overlay update timed out"))?
+        .map_err(protocol)?;
+    Ok(())
+}
+
+async fn remove_presentation_overlay(active: &ActiveContext) -> Result<(), StepError> {
+    tokio::time::timeout(
+        SECONDARY_TIMEOUT,
+        active.page.evaluate(
+            r#"(() => {
+                if (typeof document.__playrustPresentationOverlayCleanup === 'function') {
+                    document.__playrustPresentationOverlayCleanup();
+                    delete document.__playrustPresentationOverlayCleanup;
+                }
+                document.querySelector('playrust-presentation-overlay[data-playrust-presentation-overlay]')?.remove();
+            })()"#,
+        ),
+    )
+    .await
+    .map_err(|_| protocol("presentation overlay removal timed out"))?
+        .map_err(protocol)?;
+    Ok(())
 }
 
 async fn execute_step(
@@ -1575,22 +1791,16 @@ async fn execute_step(
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
             let (x, y) = page_point(active, element.center.x, element.center.y).await?;
-            dispatch_click(
-                &active.page,
-                x,
-                y,
-                1,
-                dialog_listener(&active.page, runtime).await?,
-            )
-            .await
-            .map(|_| None)
+            dispatch_flow_click(&active.page, x, y, 1, runtime)
+                .await
+                .map(|_| None)
         }
-        Operation::ClickPoint { point } => dispatch_click(
+        Operation::ClickPoint { point } => dispatch_flow_click(
             &active.page,
             f64::from(point.x),
             f64::from(point.y),
             1,
-            dialog_listener(&active.page, runtime).await?,
+            runtime,
         )
         .await
         .map_err(|mut error| {
@@ -1605,15 +1815,9 @@ async fn execute_step(
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
             let (x, y) = page_point(active, element.center.x, element.center.y).await?;
-            dispatch_click(
-                &active.page,
-                x,
-                y,
-                2,
-                dialog_listener(&active.page, runtime).await?,
-            )
-            .await
-            .map(|_| None)
+            dispatch_flow_click(&active.page, x, y, 2, runtime)
+                .await
+                .map(|_| None)
         }
         Operation::Fill { target, value } => {
             let value = resolve_runtime(value, &runtime.outputs)?;
@@ -1677,6 +1881,7 @@ async fn execute_step(
                 .await
                 .map(|_| None)
         }
+        Operation::Pause { duration } => pause_until(*duration, deadline).await.map(|_| None),
         Operation::Back if active.frame().is_some() => Err(StepError::new(
             FailureCategory::Navigation,
             "back navigation is unsupported inside a frame; switch_frame to main first",
@@ -2926,11 +3131,25 @@ async fn dialog_listener<'a>(
     Ok(runtime.dialog_listener.as_mut())
 }
 
+async fn dispatch_flow_click(
+    page: &Page,
+    x: f64,
+    y: f64,
+    clicks: i64,
+    runtime: &mut RuntimeState,
+) -> Result<(), StepError> {
+    let settle_after_mouse_press =
+        runtime.presentation_overlays_active() && runtime.presentation_overlays.pointer;
+    let dialogs = dialog_listener(page, runtime).await?;
+    dispatch_click(page, x, y, clicks, settle_after_mouse_press, dialogs).await
+}
+
 async fn dispatch_click(
     page: &Page,
     x: f64,
     y: f64,
     clicks: i64,
+    settle_after_mouse_press: bool,
     mut dialogs: Option<&mut EventStream<EventJavascriptDialogOpening>>,
 ) -> Result<(), StepError> {
     page.move_mouse(chromiumoxide::layout::Point::new(x, y))
@@ -2955,6 +3174,9 @@ async fn dispatch_click(
         .await?
         {
             return Ok(());
+        }
+        if settle_after_mouse_press {
+            settle_video(page).await;
         }
         if dispatch_mouse_event(
             page,
@@ -3966,6 +4188,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::LongPress { .. } => "long_press",
         Operation::WaitUntilVisible { .. } => "wait_until_visible",
         Operation::WaitUntilStable { .. } => "wait_until_stable",
+        Operation::Pause { .. } => "pause",
         Operation::Back => "back",
         Operation::SwitchPage(PageSwitch::Popup) => "switch_page.popup",
         Operation::SwitchPage(PageSwitch::Opener) => "switch_page.opener",
@@ -4024,6 +4247,7 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::SwitchPage(_)
         | Operation::SwitchFrame(FrameSwitch::Main | FrameSwitch::Parent)
         | Operation::Screenshot { .. }
+        | Operation::Pause { .. }
         | Operation::Recording(_)
         | Operation::Dialog { .. }
         | Operation::Clear(_)
