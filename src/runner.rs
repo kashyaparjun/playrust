@@ -48,8 +48,8 @@ use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
     Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey,
     NativeDialogResponse, Operation, PageSwitch, PresentationOverlays, RecordingControl, Redactor,
-    RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
-    When,
+    RelationKind, RelativePoint, Resolved, SettleCondition, TextMatch, UrlExpectation, VideoMode,
+    VisualExpectation, When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -1802,9 +1802,14 @@ async fn execute_step(
         return Ok(None);
     }
     match &step.operation {
-        Operation::Open { url } => navigate(active, url.expose().as_str(), deadline)
-            .await
-            .map(|_| None),
+        Operation::Open { url, settle } => {
+            navigate(active, url.expose().as_str(), deadline).await?;
+            if let Some(settle) = settle {
+                let settle_by = prepare_open_settle(deadline)?;
+                settle_after_open(active, settle, settle_by).await?;
+            }
+            Ok(None)
+        }
         Operation::Click { target, position } => {
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
@@ -2424,6 +2429,72 @@ async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Resul
             );
         }
         sleep_until_poll(deadline).await;
+    }
+}
+
+async fn settle_after_open(
+    active: &ActiveContext,
+    settle: &SettleCondition,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    let (target, requirements) = match settle {
+        SettleCondition::Visible(target) => (target, Actionability::VISIBLE),
+        SettleCondition::Stable(target) => (target, Actionability::STABLE),
+    };
+    active
+        .locator()
+        .wait_unique(target, requirements, None, deadline)
+        .await
+        .map_err(settle_locator_error)?;
+    Ok(())
+}
+
+/// Leave headroom so settle timeouts complete inside `timeout_at` instead of
+/// being cancelled as a generic `step deadline expired`. When that headroom
+/// does not fit in the remaining budget, treat it as settle-budget exhaustion
+/// rather than an immediate settle miss.
+const OPEN_SETTLE_DEADLINE_SLACK: Duration = Duration::from_millis(50);
+
+fn prepare_open_settle(deadline: Instant) -> Result<Instant, StepError> {
+    open_phase_deadline(deadline).ok_or_else(open_settle_budget_error)
+}
+
+fn open_phase_deadline(deadline: Instant) -> Option<Instant> {
+    let now = Instant::now();
+    if now >= deadline {
+        return None;
+    }
+    deadline
+        .checked_sub(OPEN_SETTLE_DEADLINE_SLACK)
+        .filter(|early| *early > now)
+}
+
+fn open_settle_budget_error() -> StepError {
+    StepError::new(
+        FailureCategory::Timeout,
+        "navigation completed without enough remaining time for the open settle condition",
+    )
+    .deadline()
+}
+
+fn settle_locator_error(error: LocatorError) -> StepError {
+    match error {
+        LocatorError::Timeout { last } => {
+            let category = match last {
+                Observation::NoMatch | Observation::Multiple { .. } => FailureCategory::Locator,
+                Observation::Unavailable { .. } => FailureCategory::Protocol,
+                _ => FailureCategory::Actionability,
+            };
+            StepError::new(
+                category,
+                "open settle condition was not satisfied before the step deadline",
+            )
+            .deadline()
+            .observed(last.to_string())
+        }
+        LocatorError::Protocol(message) | LocatorError::InvalidResponse(message) => {
+            StepError::new(FailureCategory::Protocol, message)
+        }
     }
 }
 
@@ -4258,6 +4329,10 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::SwitchFrame(FrameSwitch::Target(target))
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
+        Operation::Open {
+            settle: Some(SettleCondition::Visible(target) | SettleCondition::Stable(target)),
+            ..
+        } => Some(target),
         Operation::Open { .. }
         | Operation::ClickPoint { .. }
         | Operation::Scroll { .. }

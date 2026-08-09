@@ -507,6 +507,74 @@ fn interaction_step_contexts_include_only_targeted_locators() {
 }
 
 #[test]
+fn open_settle_step_context_includes_the_settle_locator() {
+    let flow = compile_yaml_with_env(
+        "version: 1\nname: x\nbase_url: https://example.test/\nsteps:\n  - open: { url: /a, wait_until: { visible: { css: '#heading' } } }\n  - open: { url: /b, wait_until: { stable: { test_id: hero } } }\n  - open: /c\n",
+        "x.yaml",
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let visible = step_context(&flow, &flow.steps[0]);
+    assert_eq!(visible.operation, "open");
+    assert_eq!(
+        visible.locator.as_ref().map(SafeText::as_str),
+        Some("css=\"#heading\"")
+    );
+    let stable = step_context(&flow, &flow.steps[1]);
+    assert_eq!(stable.operation, "open");
+    assert_eq!(
+        stable.locator.as_ref().map(SafeText::as_str),
+        Some("test_id=\"hero\"")
+    );
+    let plain = step_context(&flow, &flow.steps[2]);
+    assert_eq!(plain.operation, "open");
+    assert!(plain.locator.is_none());
+}
+
+#[test]
+fn open_settle_budget_is_exhausted_at_or_past_the_deadline() {
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("deadline in the past");
+    let error = prepare_open_settle(past).expect_err("budget exhausted");
+    assert_eq!(error.category, FailureCategory::Timeout);
+    assert!(error.deadline_based);
+    assert!(
+        error.message.contains(
+            "navigation completed without enough remaining time for the open settle condition"
+        ),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn open_settle_deadline_keeps_slack_before_the_step_deadline() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let settle_by = prepare_open_settle(deadline).unwrap_or_else(|error| {
+        panic!("budget available: {}", error.message);
+    });
+    assert!(settle_by < deadline);
+    assert!(deadline.duration_since(settle_by) >= OPEN_SETTLE_DEADLINE_SLACK);
+}
+
+#[test]
+fn open_settle_budget_is_exhausted_when_slack_does_not_fit() {
+    let deadline = Instant::now() + OPEN_SETTLE_DEADLINE_SLACK / 2;
+    let error = prepare_open_settle(deadline).expect_err("slack must not fit");
+    assert_eq!(error.category, FailureCategory::Timeout);
+    assert!(error.deadline_based);
+    assert!(
+        error.message.contains(
+            "navigation completed without enough remaining time for the open settle condition"
+        ),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn included_step_context_preserves_child_source_and_local_number() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root.yaml");
