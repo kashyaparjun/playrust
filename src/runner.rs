@@ -1805,14 +1805,8 @@ async fn execute_step(
         Operation::Open { url, settle } => {
             navigate(active, url.expose().as_str(), deadline).await?;
             if let Some(settle) = settle {
-                if Instant::now() >= deadline {
-                    return Err(StepError::new(
-                        FailureCategory::Timeout,
-                        "navigation completed without enough remaining time for the open settle condition",
-                    )
-                    .deadline());
-                }
-                settle_after_open(active, settle, deadline).await?;
+                let settle_by = prepare_open_settle(deadline)?;
+                settle_after_open(active, settle, settle_by).await?;
             }
             Ok(None)
         }
@@ -2453,6 +2447,29 @@ async fn settle_after_open(
         .await
         .map_err(settle_locator_error)?;
     Ok(())
+}
+
+/// Leave headroom so settle timeouts complete inside `timeout_at` instead of
+/// being cancelled as a generic `step deadline expired`.
+const OPEN_SETTLE_DEADLINE_SLACK: Duration = Duration::from_millis(50);
+
+fn prepare_open_settle(deadline: Instant) -> Result<Instant, StepError> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(open_settle_budget_error());
+    }
+    Ok(deadline
+        .checked_sub(OPEN_SETTLE_DEADLINE_SLACK)
+        .filter(|early| *early > now)
+        .unwrap_or(now))
+}
+
+fn open_settle_budget_error() -> StepError {
+    StepError::new(
+        FailureCategory::Timeout,
+        "navigation completed without enough remaining time for the open settle condition",
+    )
+    .deadline()
 }
 
 fn settle_locator_error(error: LocatorError) -> StepError {

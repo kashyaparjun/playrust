@@ -1,6 +1,14 @@
 mod support;
 
 use std::fs;
+use std::io::Read;
+use std::net::TcpListener;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::Duration;
 
 use playrust::report::{FailureCategory, FlowStatus};
 use support::{FixtureServer, assert_success, playrust, read_report};
@@ -39,6 +47,36 @@ fn write_flow(
     )
     .expect("write flow");
     flow
+}
+
+/// Accepts TCP connections and never sends an HTTP response, so navigation hangs.
+fn start_hanging_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind hanging server");
+    let address = listener.local_addr().expect("hanging server address");
+    listener
+        .set_nonblocking(true)
+        .expect("make hanging server stoppable");
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        let mut held = Vec::new();
+        while !server_stop.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                    let mut buffer = [0; 1024];
+                    let _ = stream.read(&mut buffer);
+                    held.push(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{address}"), stop, thread)
 }
 
 #[test]
@@ -230,4 +268,55 @@ fn open_without_wait_until_is_backward_compatible() {
     server.shutdown();
     assert_success("run", &run);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+fn open_with_wait_until_still_reports_a_navigation_timeout() {
+    let (url, stop, thread) = start_hanging_server();
+    let directory = tempfile::tempdir().expect("create E2E directory");
+    let artifacts = directory.path().join("artifacts");
+    let flow = write_flow(
+        directory.path(),
+        "open-settle-nav-timeout",
+        &url,
+        "  - timeout: 1s\n    open: { url: /, wait_until: { visible: { css: '#never' } } }\n",
+    );
+
+    let run = playrust(
+        &[
+            "run",
+            flow.to_str().unwrap(),
+            "--artifacts",
+            artifacts.to_str().unwrap(),
+        ],
+        &[],
+    );
+    stop.store(true, Ordering::Release);
+    let _ = thread.join();
+    assert!(
+        !run.status.success(),
+        "navigation should time out\nstderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report = read_report(&artifacts);
+    assert_eq!(report.flows[0].status, FlowStatus::Failed);
+    let failure = &report.flows[0].failures[0];
+    assert_eq!(failure.category, FailureCategory::Timeout);
+    assert!(
+        failure
+            .message
+            .as_str()
+            .contains("navigation deadline expired"),
+        "expected navigation timeout, got {}",
+        failure.message
+    );
+    assert!(
+        !failure
+            .message
+            .as_str()
+            .contains("open settle condition was not satisfied"),
+        "settle must not absorb a navigation timeout: {}",
+        failure.message
+    );
 }
