@@ -4,6 +4,7 @@ pub mod flow;
 pub mod install;
 pub mod locator;
 mod oopif;
+pub mod recording;
 pub mod report;
 pub mod runner;
 pub mod session_dialog;

@@ -24,7 +24,7 @@ The client writes one UTF-8 JSON object per stdin line. Playrust writes and flus
 
 One command envelope may contain at most 1,048,576 bytes before its `LF`. The limit includes a `CR` in `CRLF`. An oversized line is drained through its next `LF` and receives recoverable `envelope_too_large` with `id: null`. Invalid UTF-8, malformed JSON, and invalid command shapes receive recoverable `invalid_command`. If the transport remains open, the next line is processed normally. A stdin read failure or stdout write failure is fatal and may prevent a response.
 
-EOF closes an idle session without a response. EOF during an active compatibility submission cancels and drains it, writes its `cancelled` response while stdout remains available, and terminates with exit 130 unless an infrastructure failure occurs.
+EOF closes an idle session without a response.
 
 ## Observe-Act Loop
 
@@ -158,7 +158,7 @@ Pending native `alert`, `confirm`, `prompt`, and `beforeunload` dialogs are prot
 
 `text` is valid only when accepting a prompt. Invalid combinations are rejected without changing the dialog. Success reports the handled dialog and response. An action that opens a dialog succeeds and includes it as `pending_dialog` in that action's result.
 
-Under the default explicit policy, `act`, `scroll`, and `submit` return recoverable `dialog_pending` until the dialog is handled. `snapshot`, `dialog`, `export`, and `close` remain available. Close attempts to dismiss a pending dialog before browser and recording shutdown.
+Under the default explicit policy, `act` and `scroll` return recoverable `dialog_pending` until the dialog is handled. `snapshot`, `dialog`, `export`, and `close` remain available. Close attempts to dismiss a pending dialog before browser and recording shutdown.
 
 ## Export And Close
 
@@ -196,22 +196,13 @@ An exported bundle contains:
 
 Environment-backed values become deterministic YAML secret entries. Plaintext secret values do not appear in protocol responses, the journal, reports, or replay YAML. Diagnostic and protocol redaction follow the same rules as README **Variables and secrets** (encoding variants and the four-character minimum for declared secrets). Validate the canonical flow with `playrust check <bundle>/replay.yaml`; optionally run it in a fresh browser with the same environment variables.
 
-## Compatibility Commands
+## Migration From Deprecated Commands (v0.3.0)
 
-Protocol v1 retains the original commands:
+Removed commands: `submit`, `inspect`, `output`, `cancel`. Sending one returns recoverable `unknown_command`. Use `act`/`snapshot` interactively; run headless YAML with `playrust run`.
 
-```json
-{"id":"s1","command":"submit","flow":"version: 1\nname: example\nsteps: [{ open: https://example.com }]\n","variables":{"region":"west"}}
-{"id":"i1","command":"inspect","accessibility":true,"screenshot":true}
-{"id":"o1","command":"output","name":"saved_value"}
-{"id":"x1","command":"cancel"}
-```
+## Page Switching And Video
 
-`submit` accepts one complete inline YAML V1 flow. Its viewport and geolocation must match the established session settings. Browser state, active page/frame, JavaScript state, and runtime outputs persist, but a submission does not start or stop the session's continuous recorder. Filesystem subflows and filesystem screenshot baselines remain unsupported in inline submissions.
-
-`inspect` is deprecated in favor of `snapshot`, but retains its existing request and response shape through protocol v1: `{url,title,pages,active_frame?,accessibility?,screenshot?}`. Its screenshot is an artifact path. Raw accessibility remains bounded to depth 8, 500 nodes, and 256 KiB.
-
-`output.name` returns `{name,value}` for a persisted runtime output. `cancel` is valid only while a compatibility submission is active. While a submission runs, other ordering and cancellation rules remain compatible: `cancel` and `close` are accepted and other commands return `busy`.
+Flows with `switch_page` require `settings.video: off` and no recording controls. Session recording binds one screencast source; page switches risk dropped frames until page-aware recording is designed.
 
 ## Responses And Errors
 
@@ -231,19 +222,13 @@ Stable protocol errors include:
 | `invalid_command` | Invalid UTF-8, JSON, field, or command shape. | Yes |
 | `envelope_too_large` | Command exceeds 1 MiB. | Yes |
 | `validation` | Inline flow, variable, action, or value is invalid. | Yes |
-| `settings_conflict` | Submission viewport/geolocation conflicts with session settings. | Yes |
-| `busy` | Command is not allowed during an active submission. | Yes |
-| `not_active` | `cancel` arrived while no submission was active. | Yes |
 | `not_started` | Browser session handle is unavailable. | Yes |
-| `output_not_found` | Named runtime output is unavailable. | Yes |
 | `dialog_pending` | A native dialog must be handled before mutation. | Yes |
 | `unknown_reference` | Ref was never issued by this session. | Yes |
 | `stale_reference` | Ref no longer belongs to the current observation. | Yes |
 | `snapshot_unavailable` | Requested `since` baseline is unavailable or non-adjacent. | Yes |
 | `export_invalid` | Journal cannot be compiled into canonical replay YAML. | Yes |
 | `action_failed` | Recoverable interactive action, wait, assertion, or navigation failure. | Yes |
-| `submission_failed` | Recoverable compatibility submission failure. | Yes |
-| `cancelled` | Submission drained after cancellation. | No |
 | `browser` | Browser launch, crash, connection, protocol, or disposal failed. | No |
 | `artifacts` | Journal or artifact persistence failed. | No |
 
@@ -251,13 +236,11 @@ Ordinary action, wait, assertion, navigation, stale-ref, and export validation f
 
 ## Ordering And Termination
 
-Commands receive one response each in request order. A malformed or oversized line receives its own error and does not cancel active work.
+Commands receive one response each in request order.
 
-`cancel` is acknowledged immediately with `{cancelling:true}`. That commits the active compatibility submission to terminal cancellation even if it concurrently finishes. The submission then receives `cancelled`; the process terminates with exit 130 unless an infrastructure failure wins.
+An idle close dismisses pending dialogs, finalizes recording and artifacts, and returns one close response.
 
-An idle close dismisses any pending dialog, finalizes the recorder and artifacts, disposes the router/browser context, and returns its one close response. During a compatibility submission, close requests cancellation, drains the submission, writes its `cancelled` response, performs shutdown, then writes the close response. No command is accepted after close is pending.
-
-Exit codes remain `0` for a successful close, `2` for invalid startup input, `3` for automation/assertion failure where applicable, `4` for fatal infrastructure/artifact failure, and `130` for interruption or committed cancellation.
+Exit codes: `0` success, `2` invalid startup, `3` automation failure, `4` infrastructure failure, `130` interruption.
 
 ## Versioning
 

@@ -9,10 +9,12 @@ use serde_json::Value;
 
 use crate::browser::BrowserHost;
 use crate::flow::{CompiledFlow, FrameSwitch, Operation, Redactor, VideoMode};
+use crate::recording::{
+    FinalizeOptions, RecordingController, SessionRecordingFinish, missing_recording_finish,
+};
 use crate::report::FlowReport;
 use crate::runner::{
-    InteractiveStepError, InteractiveStepResult, RunOptions, SessionRecorder,
-    SessionRecordingFinish, SessionRuntime, SessionSettings,
+    InteractiveStepError, InteractiveStepResult, RunOptions, SessionRuntime, SessionSettings,
 };
 use crate::session_dialog::{DialogPolicy, NativeDialogState, PendingDialog};
 use crate::session_snapshot::{
@@ -42,7 +44,7 @@ pub struct BrowserSession {
     settings: SessionSettings,
     dialogs: NativeDialogState,
     snapshots: SnapshotStore,
-    recorder: Option<SessionRecorder>,
+    recorder: Option<RecordingController>,
     recording_enabled: bool,
     recording_warnings: Vec<String>,
 }
@@ -64,7 +66,7 @@ impl BrowserSession {
                 viewport_width: viewport.width,
                 viewport_height: viewport.height,
             };
-            match SessionRecorder::start(config, runtime.page()).await {
+            match RecordingController::start(config, runtime.page()).await {
                 Ok(recorder) => Some(recorder),
                 Err(error) => {
                     recording_warnings.push(error);
@@ -304,7 +306,14 @@ impl BrowserSession {
                 .push(format!("automatic dialog response failed: {error}"));
         }
         let recording = match self.recorder.take() {
-            Some(recorder) => recorder.finalize().await,
+            Some(recorder) => {
+                recorder
+                    .finalize(FinalizeOptions {
+                        retain_on_failure: false,
+                        capture_final_frame: true,
+                    })
+                    .await
+            }
             None => {
                 missing_recording_finish(self.recording_enabled, self.recording_warnings.clone())
             }
@@ -314,18 +323,6 @@ impl BrowserSession {
             warnings: self.recording_warnings,
             recording,
         })
-    }
-}
-
-fn missing_recording_finish(
-    recording_enabled: bool,
-    warnings: Vec<String>,
-) -> SessionRecordingFinish {
-    SessionRecordingFinish {
-        status: if recording_enabled { "failed" } else { "off" },
-        path: None,
-        partial_path: None,
-        warnings,
     }
 }
 
@@ -362,18 +359,5 @@ fn redact_json(value: &mut Value, runtime: &SessionRuntime) {
             }
         }
         _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn video_off_stays_off_when_unrelated_warnings_exist() {
-        let finish = missing_recording_finish(false, vec!["dialog warning".to_owned()]);
-        assert_eq!(finish.status, "off");
-        assert_eq!(finish.warnings, ["dialog warning"]);
-        assert_eq!(missing_recording_finish(true, Vec::new()).status, "failed");
     }
 }

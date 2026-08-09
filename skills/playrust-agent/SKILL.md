@@ -38,7 +38,7 @@ The browser context and continuous recorder start immediately. Playrust records 
 8. Send `export` before `close`; close finalizes the recording into the bundle.
 9. Run `playrust check <bundle>/replay.yaml`. Replay fresh when reproducibility matters.
 
-Large pages return a bounded snapshot with `truncation.truncated: true`. Use the refs that were returned, then scroll or act and snapshot again; do not treat truncation as a failure or fall back to raw `inspect`.
+Large pages return a bounded snapshot with `truncation.truncated: true`. Use the refs that were returned, then scroll or act and snapshot again; do not treat truncation as a failure; take another snapshot instead.
 
 For credentials and other available environment values, send `{"env":"NAME"}` as a `fill` or `select` value. Do not put secret literals in commands when an environment variable is available.
 
@@ -58,4 +58,3 @@ The canonical video is the bundle's `recording.mp4`, encoded as H.264 at the con
 
 Playrust's `export` command is the only source of canonical replay YAML. Never synthesize YAML from memory or reconstruct it from snapshots. Export excludes failed exploration and snapshots, lifts environment-backed values into YAML secrets, and writes `replay.yaml`, `session.ndjson`, `report.json`, the recording or documented partial result, and referenced screenshots.
 
-`submit` and raw `inspect` remain compatibility commands. Prefer `act`/`snapshot` for interactive work; use `submit` only for an existing inline YAML flow and `inspect` only for a client that requires its deprecated raw response.
