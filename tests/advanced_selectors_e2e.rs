@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{Read, Write};
@@ -62,8 +64,12 @@ const HTML: &str = r#"<!doctype html>
 </html>"#;
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn advanced_relations_states_and_relative_click_point_work_live() {
+    let Some(chrome) =
+        support::require_browser("advanced_relations_states_and_relative_click_point_work_live")
+    else {
+        return;
+    };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
     let address = listener.local_addr().expect("read fixture address");
     let server = thread::spawn(move || {
@@ -112,10 +118,6 @@ steps:
         &BTreeMap::new(),
     )
     .expect("compile advanced selector flow");
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
     let artifacts = tempfile::tempdir().expect("create artifact directory");
     let host = BrowserHost::launch(&chrome, false)
         .await

@@ -43,9 +43,12 @@ const ROUTES: &[(&str, &str, &str)] = &[
 ];
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn extended_clear_targets_preserve_other_state_and_contexts() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("extended_clear_targets_preserve_other_state_and_contexts")
+    else {
+        return;
+    };
     let server = FixtureServer::start(ROUTES);
     let source = format!(
         "version: 1\nname: storage-clearing\nbase_url: {}\nsettings: {{ video: off }}\nsteps:\n  - open: /\n  - assert: {{ text: {{ target: {{ css: '#status' }}, equals: ready }} }}\n  - clear: indexeddb\n  - clear: cache-storage\n  - clear: service-workers\n  - click: {{ target: {{ css: '#inspect' }} }}\n  - assert: {{ text: {{ target: {{ css: '#state' }}, equals: 'cookie=flow=present;local=present;session=present;db=0;cache=0;workers=0' }} }}\n",

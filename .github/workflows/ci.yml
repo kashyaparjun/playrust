@@ -66,6 +66,7 @@ jobs:
           PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
           PLAYRUST_FFMPEG: /usr/bin/ffmpeg
           PLAYRUST_NO_SANDBOX: "1"
+          PLAYRUST_REQUIRE_BROWSER: "1"
         run: >-
           cargo test --locked
           --test browser_smoke
@@ -88,12 +89,12 @@ jobs:
           --test wait_until_visible_e2e
           --test open_settle_e2e
           --test secret_recording_warning_e2e
-          -- --ignored --test-threads=1
+          -- --test-threads=4
       - name: Run pause cancellation test
         env:
           PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
           PLAYRUST_NO_SANDBOX: "1"
+          PLAYRUST_REQUIRE_BROWSER: "1"
         run: >-
           cargo test --locked --lib
           cancelling_an_in_flight_compiled_pause_interrupts_the_flow
-          -- --ignored

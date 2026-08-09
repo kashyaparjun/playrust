@@ -8,8 +8,12 @@ use support::{FixtureServer, assert_success, playrust, read_report};
 const HTML: &str = r#"<!doctype html><body><p id="late" hidden>ready</p><script>setTimeout(() => document.querySelector('#late').hidden = false, 300)</script></body>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn uses_the_explicit_step_timeout_for_visibility() {
+    let Some(chrome) = support::require_browser("uses_the_explicit_step_timeout_for_visibility")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("wait-until-visible.yaml");
@@ -30,7 +34,7 @@ fn uses_the_explicit_step_timeout_for_visibility() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);

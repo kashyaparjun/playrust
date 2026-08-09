@@ -28,9 +28,17 @@ const ROUTES: &[(&str, &str, &str)] = &[
 ];
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
 async fn presentation_overlays_redact_text_and_mark_clicks_and_scrolls() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("presentation_overlays_redact_text_and_mark_clicks_and_scrolls")
+    else {
+        return;
+    };
+    let Some(ffmpeg) =
+        support::require_ffmpeg("presentation_overlays_redact_text_and_mark_clicks_and_scrolls")
+    else {
+        return;
+    };
     let server = FixtureServer::start(ROUTES);
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -91,9 +99,17 @@ steps:
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
 async fn presentation_overlays_are_recording_only_and_do_not_change_screenshots() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) = support::require_browser(
+        "presentation_overlays_are_recording_only_and_do_not_change_screenshots",
+    ) else {
+        return;
+    };
+    let Some(ffmpeg) = support::require_ffmpeg(
+        "presentation_overlays_are_recording_only_and_do_not_change_screenshots",
+    ) else {
+        return;
+    };
     let server = FixtureServer::start(ROUTES);
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let directory = tempfile::tempdir().unwrap();

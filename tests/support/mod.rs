@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc,
@@ -13,7 +13,113 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use playrust::install::{self, PINNED_CHROME_VERSION, Platform};
 use playrust::report::AggregateReport;
+
+/// Resolve Chrome: `PLAYRUST_CHROME` env var, then the Playrust cache. Never downloads.
+pub fn chrome_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os(install::CHROME_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let root = install::cache_root().ok()?;
+    let platform = Platform::current().ok()?;
+    let path = install::cached_browser_path(&root, PINNED_CHROME_VERSION, platform).ok()?;
+    path.is_file().then_some(path)
+}
+
+fn require_env_flag(name: &str) -> bool {
+    env::var_os(name).is_some_and(|value| {
+        !matches!(
+            value.to_str(),
+            Some("0") | Some("false") | Some("no") | Some("")
+        )
+    })
+}
+
+fn skip_or_fail(test_name: &str, message: &str) {
+    if require_env_flag("PLAYRUST_REQUIRE_BROWSER") {
+        panic!("{test_name}: {message}");
+    }
+    eprintln!("SKIP {test_name}: {message}");
+}
+
+/// Returns Chrome when available; otherwise prints a skip notice or fails when
+/// `PLAYRUST_REQUIRE_BROWSER=1`.
+pub fn require_browser(test_name: &str) -> Option<PathBuf> {
+    match chrome_path() {
+        Some(path) => Some(path),
+        None => {
+            skip_or_fail(
+                test_name,
+                "no Chrome available (set PLAYRUST_CHROME or run `playrust browser install`)",
+            );
+            None
+        }
+    }
+}
+
+fn command_exists(program: &str) -> bool {
+    Command::new(program)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Returns ffmpeg when available; otherwise prints a skip notice or fails when
+/// `PLAYRUST_REQUIRE_BROWSER=1`.
+pub fn require_ffmpeg(test_name: &str) -> Option<String> {
+    let path = ffmpeg_path();
+    if command_exists(&path) {
+        return Some(path);
+    }
+    skip_or_fail(
+        test_name,
+        "ffmpeg not available (set PLAYRUST_FFMPEG or install ffmpeg)",
+    );
+    None
+}
+
+/// Returns ffprobe when available; otherwise prints a skip notice or fails when
+/// `PLAYRUST_REQUIRE_BROWSER=1`.
+pub fn require_ffprobe(test_name: &str) -> Option<String> {
+    let path = env::var_os("PLAYRUST_FFPROBE")
+        .unwrap_or_else(|| "ffprobe".into())
+        .to_string_lossy()
+        .into_owned();
+    if command_exists(&path) {
+        return Some(path);
+    }
+    skip_or_fail(
+        test_name,
+        "ffprobe not available (set PLAYRUST_FFPROBE or install ffmpeg)",
+    );
+    None
+}
+
+/// Gate for live-network tests (Wikipedia). Set `PLAYRUST_LIVE_E2E=1` to run.
+pub fn require_live_e2e(test_name: &str) -> Option<()> {
+    if require_env_flag("PLAYRUST_LIVE_E2E") {
+        return Some(());
+    }
+    skip_or_fail(
+        test_name,
+        "set PLAYRUST_LIVE_E2E=1 to run live network tests",
+    );
+    None
+}
+
+pub fn chrome_env(chrome: &Path) -> (String, String) {
+    (
+        install::CHROME_ENV.to_owned(),
+        chrome.to_string_lossy().into_owned(),
+    )
+}
 
 pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_playrust"));

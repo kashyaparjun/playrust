@@ -11,8 +11,13 @@ const FIXTURE: &str = r#"<!doctype html>
 </body></html>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn secret_screenshot_warning_is_reported_without_secret_text() {
+    let Some(chrome) =
+        support::require_browser("secret_screenshot_warning_is_reported_without_secret_text")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", FIXTURE)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("secret.yaml");
@@ -34,7 +39,7 @@ fn secret_screenshot_warning_is_reported_without_secret_text() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[("TOKEN", secret)],
+        &[("TOKEN", secret), (&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
 
@@ -65,8 +70,12 @@ fn secret_screenshot_warning_is_reported_without_secret_text() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn secret_fill_without_visual_capture_does_not_warn() {
+    let Some(chrome) = support::require_browser("secret_fill_without_visual_capture_does_not_warn")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", FIXTURE)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("secret-off.yaml");
@@ -88,7 +97,7 @@ fn secret_fill_without_visual_capture_does_not_warn() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[("TOKEN", secret)],
+        &[("TOKEN", secret), (&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
 

@@ -54,8 +54,28 @@ steps:
 "##;
 
 #[test]
-#[ignore = "requires Wikipedia network access, pinned Chromium, FFmpeg, and ffprobe"]
 fn search_flow_exercises_interactions_assertions_and_default_video() {
+    let Some(()) = support::require_live_e2e(
+        "search_flow_exercises_interactions_assertions_and_default_video",
+    ) else {
+        return;
+    };
+    let Some(chrome) =
+        support::require_browser("search_flow_exercises_interactions_assertions_and_default_video")
+    else {
+        return;
+    };
+    let Some(_ffmpeg) =
+        support::require_ffmpeg("search_flow_exercises_interactions_assertions_and_default_video")
+    else {
+        return;
+    };
+    let Some(_ffprobe) =
+        support::require_ffprobe("search_flow_exercises_interactions_assertions_and_default_video")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("search.yaml");
     let artifacts = directory.path().join("artifacts");
@@ -85,7 +105,7 @@ fn search_flow_exercises_interactions_assertions_and_default_video() {
             artifacts.to_str().unwrap(),
             "--junit",
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     assert_success("run", &run);
 

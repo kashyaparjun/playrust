@@ -25,9 +25,12 @@ const GRANDCHILD: &str = r#"<!doctype html><html><body>
 </body></html>"#;
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn nested_same_origin_frames_switch_to_parent_and_main() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("nested_same_origin_frames_switch_to_parent_and_main")
+    else {
+        return;
+    };
     let server = FixtureServer::start(&[
         ("/", "text/html", ROOT),
         ("/child", "text/html", CHILD),
@@ -72,9 +75,12 @@ steps:
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn cross_origin_oopif_locates_fills_clicks_and_asserts() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("cross_origin_oopif_locates_fills_clicks_and_asserts")
+    else {
+        return;
+    };
     let foreign = FixtureServer::start(&[(
         "/foreign",
         "text/html",
@@ -103,9 +109,12 @@ async fn cross_origin_oopif_locates_fills_clicks_and_asserts() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn active_frame_navigates_across_origins_and_process_replacements() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("active_frame_navigates_across_origins_and_process_replacements")
+    else {
+        return;
+    };
     let foreign = FixtureServer::start(&[(
         "/foreign",
         "text/html",
@@ -144,9 +153,12 @@ async fn active_frame_navigates_across_origins_and_process_replacements() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn active_oopif_clears_dom_storage_scrolls_and_swipes() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("active_oopif_clears_dom_storage_scrolls_and_swipes")
+    else {
+        return;
+    };
     let foreign = FixtureServer::start(&[(
         "/foreign",
         "text/html",
@@ -179,9 +191,11 @@ async fn active_oopif_clears_dom_storage_scrolls_and_swipes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn nested_oopif_preserves_parent_and_main_switching() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) = support::require_browser("nested_oopif_preserves_parent_and_main_switching")
+    else {
+        return;
+    };
     let foreign_page = r#"<p id='foreign'>foreign</p>
         <iframe id='nested' style='margin:20px;width:220px;height:120px'></iframe>
         <script>
@@ -221,9 +235,10 @@ async fn nested_oopif_preserves_parent_and_main_switching() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn back_inside_frame_is_explicitly_rejected() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) = support::require_browser("back_inside_frame_is_explicitly_rejected") else {
+        return;
+    };
     let server = FixtureServer::start(&[("/", "text/html", ROOT), ("/child", "text/html", CHILD)]);
     let source = format!(
         "version: 1\nname: frame-back\nbase_url: http://{}\nsettings: {{ video: off }}\nsteps:\n  - open: /\n  - switch_frame: {{ target: {{ css: '#child' }} }}\n  - back: {{}}\n",

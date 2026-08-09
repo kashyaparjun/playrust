@@ -80,8 +80,13 @@ fn start_hanging_server() -> (String, Arc<AtomicBool>, thread::JoinHandle<()>) {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_settles_until_a_late_element_becomes_visible() {
+    let Some(chrome) =
+        support::require_browser("open_settles_until_a_late_element_becomes_visible")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", LATE_HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let artifacts = directory.path().join("artifacts");
@@ -99,7 +104,7 @@ fn open_settles_until_a_late_element_becomes_visible() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);
@@ -107,8 +112,13 @@ fn open_settles_until_a_late_element_becomes_visible() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_settle_timeout_is_reported_when_the_element_never_appears() {
+    let Some(chrome) =
+        support::require_browser("open_settle_timeout_is_reported_when_the_element_never_appears")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", STATIC_HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let artifacts = directory.path().join("artifacts");
@@ -126,7 +136,7 @@ fn open_settle_timeout_is_reported_when_the_element_never_appears() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert!(
@@ -160,8 +170,13 @@ fn open_settle_timeout_is_reported_when_the_element_never_appears() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_settle_waits_for_content_injected_after_load() {
+    let Some(chrome) =
+        support::require_browser("open_settle_waits_for_content_injected_after_load")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", DYNAMIC_HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let artifacts = directory.path().join("artifacts");
@@ -179,7 +194,7 @@ fn open_settle_waits_for_content_injected_after_load() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);
@@ -187,8 +202,12 @@ fn open_settle_waits_for_content_injected_after_load() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_settle_follows_a_client_side_redirect() {
+    let Some(chrome) = support::require_browser("open_settle_follows_a_client_side_redirect")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[
         ("/", "text/html", REDIRECT_HTML),
         ("/done", "text/html", DONE_HTML),
@@ -209,7 +228,7 @@ fn open_settle_follows_a_client_side_redirect() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);
@@ -217,8 +236,13 @@ fn open_settle_follows_a_client_side_redirect() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_settles_until_a_moving_element_becomes_stable() {
+    let Some(chrome) =
+        support::require_browser("open_settles_until_a_moving_element_becomes_stable")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", MOVING_HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let artifacts = directory.path().join("artifacts");
@@ -236,7 +260,7 @@ fn open_settles_until_a_moving_element_becomes_stable() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);
@@ -244,8 +268,12 @@ fn open_settles_until_a_moving_element_becomes_stable() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_without_wait_until_is_backward_compatible() {
+    let Some(chrome) = support::require_browser("open_without_wait_until_is_backward_compatible")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", STATIC_HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let artifacts = directory.path().join("artifacts");
@@ -263,7 +291,7 @@ fn open_without_wait_until_is_backward_compatible() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);
@@ -271,8 +299,13 @@ fn open_without_wait_until_is_backward_compatible() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn open_with_wait_until_still_reports_a_navigation_timeout() {
+    let Some(chrome) =
+        support::require_browser("open_with_wait_until_still_reports_a_navigation_timeout")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let (url, stop, thread) = start_hanging_server();
     let directory = tempfile::tempdir().expect("create E2E directory");
     let artifacts = directory.path().join("artifacts");
@@ -290,7 +323,7 @@ fn open_with_wait_until_still_reports_a_navigation_timeout() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     stop.store(true, Ordering::Release);
     let _ = thread.join();

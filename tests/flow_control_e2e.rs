@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{Read, Write};
@@ -23,8 +25,12 @@ const HTML: &str = r#"<!doctype html><html><body>
 </body></html>"#;
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn predicates_repeats_retries_and_mapped_subflows_run_in_chrome() {
+    let Some(chrome) =
+        support::require_browser("predicates_repeats_retries_and_mapped_subflows_run_in_chrome")
+    else {
+        return;
+    };
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -106,7 +112,6 @@ steps:
     .unwrap();
 
     let flow = compile_file(&root, &BTreeMap::new()).unwrap();
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let report = run_flow(
         &host,

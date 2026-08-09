@@ -10,8 +10,13 @@ const HTML: &str = r#"<!doctype html><html><head><title>Fixture</title></head><b
 </body></html>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn page_script_receives_separate_arguments_and_saves_a_flow_local_value() {
+    let Some(chrome) = support::require_browser(
+        "page_script_receives_separate_arguments_and_saves_a_flow_local_value",
+    ) else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start_with(|_| (200, "text/html; charset=utf-8", HTML));
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("scripting.yaml");
@@ -60,15 +65,20 @@ steps:
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     assert_success("run scripting fixture", &output);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn runtime_script_failures_are_redacted_and_keep_subflow_provenance() {
+    let Some(chrome) = support::require_browser(
+        "runtime_script_failures_are_redacted_and_keep_subflow_provenance",
+    ) else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start_with(|_| (200, "text/html; charset=utf-8", HTML));
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("failure.yaml");
@@ -95,7 +105,7 @@ fn runtime_script_failures_are_redacted_and_keep_subflow_provenance() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     assert_eq!(output.status.code(), Some(3));
     let report = read_report(&artifacts);

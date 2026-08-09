@@ -16,10 +16,18 @@ const HTML: &str = r#"<!doctype html><html><body><button id="change" onclick="do
 const ROUTES: &[(&str, &str, &str)] = &[("/", "text/html", HTML)];
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
 async fn manual_recording_finalizes_on_stop_failure_and_cancellation() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
-    let ffmpeg = PathBuf::from(ffmpeg_path());
+    let Some(chrome) =
+        support::require_browser("manual_recording_finalizes_on_stop_failure_and_cancellation")
+    else {
+        return;
+    };
+    let Some(ffmpeg) =
+        support::require_ffmpeg("manual_recording_finalizes_on_stop_failure_and_cancellation")
+    else {
+        return;
+    };
+    let ffmpeg = PathBuf::from(ffmpeg);
     let server = FixtureServer::start(ROUTES);
     let host = BrowserHost::launch(chrome, false).await.unwrap();
 

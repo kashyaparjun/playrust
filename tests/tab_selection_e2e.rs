@@ -20,9 +20,12 @@ const NAMED: &str = r#"<!doctype html><body><p id="page">named</p></body>"#;
 const BY_URL: &str = r#"<!doctype html><body><p id="page">url</p></body>"#;
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn selects_named_and_exact_url_pages_inside_the_flow_context() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        support::require_browser("selects_named_and_exact_url_pages_inside_the_flow_context")
+    else {
+        return;
+    };
     let server = FixtureServer::start(&[
         ("/", "text/html", ROOT),
         ("/named", "text/html", NAMED),
