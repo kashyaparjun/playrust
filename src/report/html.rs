@@ -1,6 +1,8 @@
+use std::path::{Component, Path, PathBuf};
+
 use super::{AggregateReport, AggregateStatus, FlowStatus};
 
-pub(super) fn render(report: &AggregateReport) -> String {
+pub(super) fn render(report: &AggregateReport, report_root: &Path) -> String {
     let (status, status_class) = match report.status {
         AggregateStatus::Passed => ("Passed", "passed"),
         AggregateStatus::Failed => ("Failed", "failed"),
@@ -18,7 +20,7 @@ pub(super) fn render(report: &AggregateReport) -> String {
         .count();
     let interrupted = report.flows.len() - passed - failed;
     let mut html = String::from(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Playrust report</title><style>\n:root{color-scheme:light dark;font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.5}body{max-width:70rem;margin:0 auto;padding:2rem;background:#f5f5f4;color:#1c1917}header,.flow{background:#fff;border:1px solid #d6d3d1;border-radius:.6rem;padding:1.25rem;margin-bottom:1rem}.summary{display:flex;gap:1rem;flex-wrap:wrap}.badge{display:inline-block;border-radius:999px;padding:.2rem .65rem;font-weight:700}.passed{background:#dcfce7;color:#166534}.failed{background:#fee2e2;color:#991b1b}.interrupted{background:#fef3c7;color:#92400e}h1,h2,h3{line-height:1.2}h2{overflow-wrap:anywhere}.meta{color:#57534e}.failure{border-left:.3rem solid #dc2626;padding-left:1rem;margin:1rem 0}dl{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem}dt{font-weight:700}dd{margin:0;overflow-wrap:anywhere}code{font-family:ui-monospace,monospace;overflow-wrap:anywhere}@media(prefers-color-scheme:dark){body{background:#0c0a09;color:#fafaf9}header,.flow{background:#1c1917;border-color:#44403c}.meta{color:#d6d3d1}}\n</style></head><body><header><h1>Playrust report</h1><p><span class=\"badge ",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; media-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Playrust report</title><style>\n:root{color-scheme:light dark;font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.5}body{max-width:70rem;margin:0 auto;padding:2rem;background:#f5f5f4;color:#1c1917}header,.flow{background:#fff;border:1px solid #d6d3d1;border-radius:.6rem;padding:1.25rem;margin-bottom:1rem}.summary{display:flex;gap:1rem;flex-wrap:wrap}.badge{display:inline-block;border-radius:999px;padding:.2rem .65rem;font-weight:700}.passed{background:#dcfce7;color:#166534}.failed{background:#fee2e2;color:#991b1b}.interrupted{background:#fef3c7;color:#92400e}h1,h2,h3{line-height:1.2}h2{overflow-wrap:anywhere}.meta{color:#57534e}.failure{border-left:.3rem solid #dc2626;padding-left:1rem;margin:1rem 0}dl{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem}dt{font-weight:700}dd{margin:0;overflow-wrap:anywhere}code{font-family:ui-monospace,monospace;overflow-wrap:anywhere}.artifact-preview{max-width:20rem;max-height:12rem;object-fit:contain;border:1px solid #d6d3d1;border-radius:.3rem}@media(prefers-color-scheme:dark){body{background:#0c0a09;color:#fafaf9}header,.flow{background:#1c1917;border-color:#44403c}.meta{color:#d6d3d1}}\n</style></head><body><header><h1>Playrust report</h1><p><span class=\"badge ",
     );
     html.push_str(status_class);
     html.push_str("\">");
@@ -102,22 +104,58 @@ pub(super) fn render(report: &AggregateReport) -> String {
         push_html(&mut html, &flow.artifacts.directory);
         html.push_str("</code></dd>");
         for path in &flow.artifacts.screenshots {
-            push_html_path(&mut html, "Screenshot", path);
+            push_artifact(
+                &mut html,
+                "Screenshot",
+                path,
+                report_root,
+                ArtifactKind::Image,
+            );
         }
         if let Some(path) = &flow.artifacts.failure_screenshot {
-            push_html_path(&mut html, "Failure screenshot", path);
+            push_artifact(
+                &mut html,
+                "Failure screenshot",
+                path,
+                report_root,
+                ArtifactKind::Image,
+            );
         }
         if let Some(path) = &flow.artifacts.visual_actual {
-            push_html_path(&mut html, "Visual actual", path);
+            push_artifact(
+                &mut html,
+                "Visual actual",
+                path,
+                report_root,
+                ArtifactKind::Image,
+            );
         }
         if let Some(path) = &flow.artifacts.visual_diff {
-            push_html_path(&mut html, "Visual diff", path);
+            push_artifact(
+                &mut html,
+                "Visual diff",
+                path,
+                report_root,
+                ArtifactKind::Image,
+            );
         }
         if let Some(path) = &flow.artifacts.recording {
-            push_html_path(&mut html, "Recording", path);
+            push_artifact(
+                &mut html,
+                "Recording",
+                path,
+                report_root,
+                ArtifactKind::Video,
+            );
         }
         if let Some(path) = &flow.artifacts.partial_recording {
-            push_html_path(&mut html, "Partial recording", path);
+            push_artifact(
+                &mut html,
+                "Partial recording",
+                path,
+                report_root,
+                ArtifactKind::Video,
+            );
         }
         html.push_str("</dl></section>");
     }
@@ -125,12 +163,88 @@ pub(super) fn render(report: &AggregateReport) -> String {
     html
 }
 
-fn push_html_path(output: &mut String, label: &str, path: &str) {
+#[derive(Clone, Copy)]
+enum ArtifactKind {
+    Image,
+    Video,
+}
+
+fn push_artifact(
+    output: &mut String,
+    label: &str,
+    path: &str,
+    report_root: &Path,
+    kind: ArtifactKind,
+) {
     output.push_str("<dt>");
     output.push_str(label);
-    output.push_str("</dt><dd><code>");
-    push_html(output, path);
-    output.push_str("</code></dd>");
+    output.push_str("</dt><dd>");
+    match safe_relative_artifact(report_root, Path::new(path)) {
+        Some(relative) => {
+            let escaped = escape_html(&relative);
+            match kind {
+                ArtifactKind::Image => output.push_str(&format!(
+                    "<a href=\"{escaped}\"><img class=\"artifact-preview\" src=\"{escaped}\" alt=\"{}\"></a>",
+                    escape_html(label)
+                )),
+                // Keep <video controls> outside <a>: interactive content must not nest in anchors.
+                ArtifactKind::Video => output.push_str(&format!(
+                    "<video controls preload=\"metadata\" class=\"artifact-preview\"><source src=\"{escaped}\" type=\"video/mp4\"></video> <a href=\"{escaped}\">Open</a>"
+                )),
+            }
+            output.push_str(" <code>");
+            push_html(output, &relative);
+            output.push_str("</code>");
+        }
+        None => {
+            output.push_str("<span class=\"missing-artifact\">Missing artifact</span> <code>");
+            push_html(output, path);
+            output.push_str("</code>");
+        }
+    }
+    output.push_str("</dd>");
+}
+
+fn safe_relative_artifact(root: &Path, artifact: &Path) -> Option<String> {
+    // Normalize relative/absolute mixtures (e.g. default `--artifacts playrust-artifacts`
+    // with an absolute artifact path) before computing the report-relative link.
+    let abs_root = absolute_path(root)?;
+    let abs_artifact = absolute_path(artifact)?;
+    let relative = abs_artifact.strip_prefix(&abs_root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+
+    // Follow symlinks and require the resolved target to stay under the report root.
+    let canon_root = abs_root.canonicalize().ok()?;
+    let canon_artifact = abs_artifact.canonicalize().ok()?;
+    if !canon_artifact.is_file() {
+        return None;
+    }
+    canon_artifact.strip_prefix(&canon_root).ok()?;
+
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn absolute_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_owned())
+    } else {
+        Some(std::env::current_dir().ok()?.join(path))
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    let mut output = String::new();
+    push_html(&mut output, value);
+    output
 }
 
 fn push_html(output: &mut String, value: &str) {

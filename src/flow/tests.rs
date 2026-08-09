@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn presentation_overlays_parse_with_independent_options() {
+    let flow = compile(
+        "version: 1\nname: overlays\nsettings:\n  video: on\n  overlays: { step: true, url: true, pointer: true }\nsteps:\n  - open: https://example.com/\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        flow.settings.overlays,
+        PresentationOverlays {
+            step: true,
+            url: true,
+            pointer: true,
+        }
+    );
+}
+
+#[test]
+fn presentation_overlays_default_to_disabled() {
+    let flow = compile("version: 1\nname: plain\nsettings: { video: off }\nsteps:\n  - open: https://example.com/\n").unwrap();
+    assert_eq!(flow.settings.overlays, PresentationOverlays::default());
+}
+
 fn compile(source: &str) -> Result<CompiledFlow, FlowError> {
     compile_yaml_with_env(
         source,

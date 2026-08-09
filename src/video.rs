@@ -22,6 +22,7 @@ pub use crate::flow::VideoMode;
 
 const FRAME_RATE: u32 = 15;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
+const FINALIZATION_ATTEMPTS: u32 = 2;
 const MAX_STDERR_BYTES: u64 = 64 * 1024;
 
 impl VideoMode {
@@ -122,8 +123,16 @@ pub enum VideoError {
     FirstFrameTimeout(Duration),
     #[error("video frame writer failed: {0}")]
     FrameWriter(String),
-    #[error("FFmpeg finalization timed out after {0:?}; partial recording retained at {1}")]
-    FinalizationTimeout(Duration, PathBuf),
+    #[error(
+        "FFmpeg finalization timed out while {phase} after {attempts} attempts of {timeout:?} each: {stderr}; partial recording retained at {partial_path}"
+    )]
+    FinalizationTimeout {
+        phase: FinalizationPhase,
+        timeout: Duration,
+        attempts: u32,
+        stderr: String,
+        partial_path: PathBuf,
+    },
     #[error(
         "FFmpeg exited unsuccessfully ({status}): {stderr}; partial recording retained at {partial_path}"
     )]
@@ -138,6 +147,21 @@ pub enum VideoError {
         #[source]
         source: std::io::Error,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinalizationPhase {
+    FrameDrain,
+    ProcessExit,
+}
+
+impl fmt::Display for FinalizationPhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FrameDrain => "draining video frames",
+            Self::ProcessExit => "waiting for FFmpeg to exit",
+        })
+    }
 }
 
 /// Checks that the configured executable starts and exposes the H.264 encoder used by Playrust.
@@ -284,39 +308,83 @@ impl VideoRecorder {
 
     /// Flushes the last frame through `stop_at`, then publishes or removes the completed MP4.
     pub async fn finalize(
-        mut self,
+        self,
         stop_at: Instant,
         flow_failed: bool,
     ) -> Result<Option<PathBuf>, VideoError> {
+        self.finalize_with_policy(stop_at, flow_failed, PROCESS_TIMEOUT, FINALIZATION_ATTEMPTS)
+            .await
+    }
+
+    #[cfg(all(test, unix))]
+    async fn finalize_with_timeout(
+        self,
+        stop_at: Instant,
+        flow_failed: bool,
+        process_timeout: Duration,
+    ) -> Result<Option<PathBuf>, VideoError> {
+        self.finalize_with_policy(stop_at, flow_failed, process_timeout, FINALIZATION_ATTEMPTS)
+            .await
+    }
+
+    async fn finalize_with_policy(
+        mut self,
+        stop_at: Instant,
+        flow_failed: bool,
+        process_timeout: Duration,
+        attempts: u32,
+    ) -> Result<Option<PathBuf>, VideoError> {
+        debug_assert!(attempts > 0);
         self.begin_finalization(stop_at);
 
-        let deadline = time::Instant::now() + PROCESS_TIMEOUT;
-        let writer_result = match time::timeout_at(deadline, &mut self.writer).await {
-            Ok(result) => result
-                .map_err(|error| VideoError::FrameWriter(error.to_string()))?
-                .map_err(|error| VideoError::FrameWriter(error.to_string())),
-            Err(_) => {
-                terminate(&mut self.child).await;
-                self.writer.abort();
-                let _ = (&mut self.writer).await;
-                return Err(VideoError::FinalizationTimeout(
-                    PROCESS_TIMEOUT,
-                    self.partial_path.clone(),
-                ));
+        let mut writer_attempt = 0;
+        let writer_result = loop {
+            writer_attempt += 1;
+            match time::timeout(process_timeout, &mut self.writer).await {
+                Ok(result) => {
+                    break result
+                        .map_err(|error| VideoError::FrameWriter(error.to_string()))?
+                        .map_err(|error| VideoError::FrameWriter(error.to_string()));
+                }
+                Err(_) if writer_attempt < attempts => {}
+                Err(_) => {
+                    terminate(&mut self.child).await;
+                    self.writer.abort();
+                    let _ = (&mut self.writer).await;
+                    let stderr = (&mut self.stderr).await.unwrap_or_default();
+                    return Err(VideoError::FinalizationTimeout {
+                        phase: FinalizationPhase::FrameDrain,
+                        timeout: process_timeout,
+                        attempts,
+                        stderr,
+                        partial_path: self.partial_path.clone(),
+                    });
+                }
             }
         };
 
-        let status = match time::timeout_at(deadline, self.child.wait()).await {
-            Ok(result) => result.map_err(|source| VideoError::Artifact {
-                path: self.partial_path.clone(),
-                source,
-            })?,
-            Err(_) => {
-                terminate(&mut self.child).await;
-                return Err(VideoError::FinalizationTimeout(
-                    PROCESS_TIMEOUT,
-                    self.partial_path.clone(),
-                ));
+        let mut exit_attempt = 0;
+        let status = loop {
+            exit_attempt += 1;
+            match time::timeout(process_timeout, self.child.wait()).await {
+                Ok(result) => {
+                    break result.map_err(|source| VideoError::Artifact {
+                        path: self.partial_path.clone(),
+                        source,
+                    })?;
+                }
+                Err(_) if exit_attempt < attempts => {}
+                Err(_) => {
+                    terminate(&mut self.child).await;
+                    let stderr = (&mut self.stderr).await.unwrap_or_default();
+                    return Err(VideoError::FinalizationTimeout {
+                        phase: FinalizationPhase::ProcessExit,
+                        timeout: process_timeout,
+                        attempts,
+                        stderr,
+                        partial_path: self.partial_path.clone(),
+                    });
+                }
             }
         };
         let stderr = (&mut self.stderr).await.unwrap_or_default();
@@ -602,6 +670,33 @@ fn output_text(stdout: &[u8], stderr: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    async fn executable_script(directory: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join(name);
+        tokio::fs::write(&path, format!("#!/bin/sh\n{body}"))
+            .await
+            .unwrap();
+        let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&path, permissions)
+            .await
+            .unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &Path) {
+        time::timeout(Duration::from_secs(5), async {
+            while !path.exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture process did not become ready");
+    }
+
     fn config() -> VideoConfig {
         VideoConfig {
             mode: VideoMode::On,
@@ -720,6 +815,181 @@ mod tests {
 
         assert!(publish(&partial, &output).await.is_err());
         assert_eq!(tokio::fs::read(&partial).await.unwrap(), b"partial");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalization_gives_frame_drain_and_process_exit_separate_timeouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let encoder = executable_script(
+            directory.path(),
+            "slow-encoder.sh",
+            concat!(
+                "sleep 0.6\n",
+                "cat >/dev/null\n",
+                "sleep 0.6\n",
+                "for argument in \"$@\"; do output=\"$argument\"; done\n",
+                "printf video > \"$output\"\n",
+            ),
+        )
+        .await;
+
+        let output = directory.path().join("recording.mp4");
+        let recorder = VideoRecorder::start(&VideoConfig {
+            mode: VideoMode::On,
+            ffmpeg_path: encoder,
+            output_path: output.clone(),
+            viewport_width: 1280,
+            viewport_height: 720,
+        })
+        .await
+        .unwrap();
+        recorder.push_frame(vec![0; 1024 * 1024]);
+
+        let result = recorder
+            .finalize_with_timeout(Instant::now(), false, Duration::from_secs(1))
+            .await;
+
+        assert_eq!(result.unwrap(), Some(output));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finalization_retries_each_backpressured_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("encoder-ready");
+        let encoder = executable_script(
+            directory.path(),
+            "retrying-encoder.sh",
+            &format!(
+                concat!(
+                    "printf ready > '{}'\n",
+                    "sleep 0.25\n",
+                    "cat >/dev/null\n",
+                    "sleep 0.25\n",
+                    "for argument in \"$@\"; do output=\"$argument\"; done\n",
+                    "printf video > \"$output\"\n",
+                ),
+                ready.display()
+            ),
+        )
+        .await;
+        let output = directory.path().join("recording.mp4");
+        let recorder = VideoRecorder::start(&VideoConfig {
+            mode: VideoMode::On,
+            ffmpeg_path: encoder,
+            output_path: output.clone(),
+            viewport_width: 1280,
+            viewport_height: 720,
+        })
+        .await
+        .unwrap();
+        wait_for_path(&ready).await;
+        recorder.push_frame(vec![0; 1024 * 1024]);
+
+        let result = recorder
+            .finalize_with_timeout(Instant::now(), false, Duration::from_millis(200))
+            .await;
+
+        assert_eq!(result.unwrap(), Some(output));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frame_drain_timeout_reports_its_phase_and_ffmpeg_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("encoder-ready");
+        let encoder = executable_script(
+            directory.path(),
+            "blocked-encoder.sh",
+            &format!(
+                "printf 'encoder input blocked\\n' >&2\nprintf ready > '{}'\nwhile :; do :; done\n",
+                ready.display()
+            ),
+        )
+        .await;
+        let output = directory.path().join("recording.mp4");
+        let recorder = VideoRecorder::start(&VideoConfig {
+            mode: VideoMode::On,
+            ffmpeg_path: encoder,
+            output_path: output,
+            viewport_width: 1280,
+            viewport_height: 720,
+        })
+        .await
+        .unwrap();
+        wait_for_path(&ready).await;
+        recorder.push_frame(vec![0; 1024 * 1024]);
+
+        let error = recorder
+            .finalize_with_timeout(Instant::now(), false, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        match error {
+            VideoError::FinalizationTimeout {
+                phase,
+                timeout,
+                attempts,
+                stderr,
+                ..
+            } => {
+                assert_eq!(phase, FinalizationPhase::FrameDrain);
+                assert_eq!(timeout, Duration::from_millis(100));
+                assert_eq!(attempts, 2);
+                assert_eq!(stderr, "encoder input blocked");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_timeout_reports_its_phase_and_ffmpeg_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("encoder-ready");
+        let encoder = executable_script(
+            directory.path(),
+            "stuck-encoder.sh",
+            &format!(
+                "printf 'encoder flush blocked\\n' >&2\nprintf ready > '{}'\ncat >/dev/null\nwhile :; do :; done\n",
+                ready.display()
+            ),
+        )
+        .await;
+        let output = directory.path().join("recording.mp4");
+        let recorder = VideoRecorder::start(&VideoConfig {
+            mode: VideoMode::On,
+            ffmpeg_path: encoder,
+            output_path: output,
+            viewport_width: 1280,
+            viewport_height: 720,
+        })
+        .await
+        .unwrap();
+        wait_for_path(&ready).await;
+        recorder.push_frame(vec![0; 1024]);
+
+        let error = recorder
+            .finalize_with_timeout(Instant::now(), false, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        match error {
+            VideoError::FinalizationTimeout {
+                phase,
+                timeout,
+                attempts,
+                stderr,
+                ..
+            } => {
+                assert_eq!(phase, FinalizationPhase::ProcessExit);
+                assert_eq!(timeout, Duration::from_millis(100));
+                assert_eq!(attempts, 2);
+                assert_eq!(stderr, "encoder flush blocked");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]

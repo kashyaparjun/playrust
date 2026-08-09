@@ -793,6 +793,8 @@ steps:
         stopped_loops: BTreeSet::new(),
         expects_dialog: false,
         dialog_listener: None,
+        presentation_overlays: PresentationOverlays::default(),
+        presentation_overlay_recording: false,
     };
     for step in &flow.steps {
         execute_step(
