@@ -1,5 +1,11 @@
 use super::*;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::browser::Geolocation;
+
+use super::raw::ViewportPoint;
+
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
