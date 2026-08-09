@@ -4,12 +4,12 @@ use std::{
     fs::{self, File},
     io,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
 use reqwest::Url;
 use tokio::io::AsyncWriteExt;
-use xz2::read::XzDecoder;
 
 use super::{
     INSTALL_LOCK, InstallError, Platform, acquire_install_lock, safe_archive_path, set_executable,
@@ -261,43 +261,74 @@ fn extract_ffmpeg_from_zip(archive: &Path, destination: &Path) -> Result<(), Ins
 }
 
 fn extract_ffmpeg_from_tar_xz(archive: &Path, destination: &Path) -> Result<(), InstallError> {
-    let file = File::open(archive).map_err(|error| InstallError::ArchiveRead {
-        path: archive.to_owned(),
+    let extract_dir = archive.parent().ok_or_else(|| {
+        ffmpeg_install_error("missing FFmpeg archive parent directory".to_owned())
+    })?;
+    let temp_extract = extract_dir.join(".extract-tmp");
+    if temp_extract.exists() {
+        fs::remove_dir_all(&temp_extract).map_err(|error| InstallError::ReleaseInstall {
+            path: temp_extract.clone(),
+            error,
+        })?;
+    }
+    fs::create_dir_all(&temp_extract).map_err(|error| InstallError::ReleaseInstall {
+        path: temp_extract.clone(),
         error,
     })?;
-    let decoder = XzDecoder::new(file);
-    let mut tar = tar::Archive::new(decoder);
-    for entry in tar
-        .entries()
+
+    let status = Command::new("tar")
+        .args(["-xJf"])
+        .arg(archive)
+        .arg("-C")
+        .arg(&temp_extract)
+        .status()
         .map_err(|error| InstallError::ReleaseInstall {
             path: archive.to_owned(),
             error,
-        })?
-    {
-        let mut entry = entry.map_err(|error| InstallError::ReleaseInstall {
+        })?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&temp_extract);
+        return Err(InstallError::ReleaseInstall {
             path: archive.to_owned(),
+            error: io::Error::other(format!("tar -xJf exited with status {status}")),
+        });
+    }
+
+    let found = find_file_named(&temp_extract).inspect_err(|_error| {
+        let _ = fs::remove_dir_all(&temp_extract);
+    })?;
+    let result = write_extracted_binary(destination, |output| {
+        let mut input = File::open(&found).map_err(|error| InstallError::ReleaseInstall {
+            path: found.clone(),
             error,
         })?;
-        let path = entry
-            .path()
+        io::copy(&mut input, output)
+            .map(|_| ())
             .map_err(|error| InstallError::ReleaseInstall {
-                path: archive.to_owned(),
+                path: destination.to_owned(),
                 error,
-            })?
-            .into_owned();
-        safe_archive_path(&path)?;
-        if entry.header().entry_type().is_file()
-            && path.file_name().and_then(|name| name.to_str()) == Some(FFMPEG_BINARY)
-        {
-            write_extracted_binary(destination, |output| {
-                io::copy(&mut entry, output).map(|_| ()).map_err(|error| {
-                    InstallError::ReleaseInstall {
-                        path: archive.to_owned(),
-                        error,
-                    }
-                })
-            })?;
-            return Ok(());
+            })
+    });
+    let _ = fs::remove_dir_all(&temp_extract);
+    result
+}
+
+fn find_file_named(root: &Path) -> Result<PathBuf, InstallError> {
+    for entry in fs::read_dir(root).map_err(|error| InstallError::ReleaseInstall {
+        path: root.to_owned(),
+        error,
+    })? {
+        let entry = entry.map_err(|error| InstallError::ReleaseInstall {
+            path: root.to_owned(),
+            error,
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Ok(found) = find_file_named(&path) {
+                return Ok(found);
+            }
+        } else if path.file_name().and_then(|n| n.to_str()) == Some(FFMPEG_BINARY) {
+            return Ok(path);
         }
     }
     Err(InstallError::BinaryNotFound {
@@ -334,7 +365,7 @@ fn archive_file_name(url: &str) -> String {
         .and_then(|parsed| {
             parsed
                 .path_segments()
-                .and_then(|segments| segments.last().map(str::to_owned))
+                .and_then(|mut segments| segments.next_back().map(str::to_owned))
         })
         .unwrap_or_else(|| "ffmpeg-archive".to_owned())
 }
@@ -441,7 +472,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_version_components() {
-        for version in ["", "stable", "7.1/other"] {
+        for version in ["", "7.1/other", "bad\\name"] {
             assert!(matches!(
                 cached_ffmpeg_path(Path::new("cache"), version, Platform::Linux64),
                 Err(InstallError::InvalidPinnedComponent { .. })
