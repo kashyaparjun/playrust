@@ -59,6 +59,10 @@ pub const DEFAULT_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
 /// over-redacting common short substrings.
 pub const MIN_SECRET_LEN: usize = 4;
 
+pub(crate) fn meets_min_secret_len(value: &str) -> bool {
+    value.chars().count() >= MIN_SECRET_LEN
+}
+
 #[derive(Debug, Error)]
 pub enum FlowError {
     #[error("failed to read {path}: {source}")]
@@ -135,9 +139,19 @@ impl Redactor {
     }
 
     pub(crate) fn add_secret(&mut self, secret: String) {
-        if secret.chars().count() >= MIN_SECRET_LEN {
+        if meets_min_secret_len(&secret) {
             self.register_variants(&secret);
             self.sort_and_dedupe();
+        }
+    }
+
+    /// Register a JSON-serialized runtime output for redaction.
+    /// When `bare_string` is `Some`, length is measured on that bare string so
+    /// JSON quotes do not promote a short value past `MIN_SECRET_LEN`.
+    pub(crate) fn add_serialized_secret(&mut self, serialized: String, bare_string: Option<&str>) {
+        match bare_string {
+            Some(bare) if !meets_min_secret_len(bare) => {}
+            _ => self.add_secret(serialized),
         }
     }
 
@@ -145,10 +159,9 @@ impl Redactor {
         self.variants.push(secret.to_owned());
         // Percent-encoding hex digits are case-insensitive in URLs, but
         // str::replace is not — register both cases for each space form.
-        self.variants.push(percent_encode(secret, false, false));
-        self.variants.push(percent_encode(secret, false, true));
-        self.variants.push(percent_encode(secret, true, false));
-        self.variants.push(percent_encode(secret, true, true));
+        for mode in PERCENT_ENCODINGS {
+            self.variants.push(mode.encode(secret));
+        }
         self.variants.push(STANDARD.encode(secret.as_bytes()));
         self.variants
             .push(STANDARD_NO_PAD.encode(secret.as_bytes()));
@@ -164,27 +177,46 @@ impl Redactor {
     }
 }
 
-fn percent_encode(value: &str, form: bool, lower_hex: bool) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else if form && byte == b' ' {
-            encoded.push('+');
-        } else if lower_hex {
-            encoded.push_str(&format!("%{byte:02x}"));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+#[derive(Clone, Copy)]
+enum PercentEncoding {
+    ComponentUpper,
+    ComponentLower,
+    FormUpper,
+    FormLower,
+}
+
+const PERCENT_ENCODINGS: [PercentEncoding; 4] = [
+    PercentEncoding::ComponentUpper,
+    PercentEncoding::ComponentLower,
+    PercentEncoding::FormUpper,
+    PercentEncoding::FormLower,
+];
+
+impl PercentEncoding {
+    fn encode(self, value: &str) -> String {
+        let form = matches!(self, Self::FormUpper | Self::FormLower);
+        let lower_hex = matches!(self, Self::ComponentLower | Self::FormLower);
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(byte as char);
+            } else if form && byte == b' ' {
+                encoded.push('+');
+            } else if lower_hex {
+                encoded.push_str(&format!("%{byte:02x}"));
+            } else {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
         }
+        encoded
     }
-    encoded
 }
 
 impl fmt::Debug for Redactor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Redactor")
-            .field("secret_count", &self.variants.len())
+            .field("variant_count", &self.variants.len())
             .finish()
     }
 }
@@ -2351,7 +2383,7 @@ fn resolve_inputs(
         })?;
         require_scalar_size(&format!("secrets.{name}"), &value)?;
         require_non_empty(&format!("secrets.{name}"), &value)?;
-        if value.chars().count() < MIN_SECRET_LEN {
+        if !meets_min_secret_len(&value) {
             return invalid(format!(
                 "secrets.{name} must be at least {MIN_SECRET_LEN} characters so it does not over-redact diagnostics"
             ));

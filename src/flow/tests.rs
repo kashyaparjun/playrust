@@ -2,7 +2,7 @@ use super::*;
 
 use base64::{
     Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 
 #[test]
@@ -1698,54 +1698,60 @@ fn recording_secret_warning_is_present_for_secret_open_and_select_and_dialog() {
     }
 }
 
-#[test]
-fn redactor_redacts_percent_encoded_secrets_in_both_space_forms() {
+fn assert_percent_encoded_secret_redacted(upper_hex: bool) {
     let mut redactor = Redactor::default();
     redactor.add_secret("p@ss w0rd/x=y".to_owned());
-    let url = "https://api.test/?q=p%40ss%20w0rd%2Fx%3Dy&keep=visible";
-    let redacted = redactor.redact(url);
+    let (slash_encoded, equals_encoded) = if upper_hex {
+        ("%2F", "%3D")
+    } else {
+        ("%2f", "%3d")
+    };
+    let encoded = format!("p%40ss%20w0rd{slash_encoded}x{equals_encoded}y");
+    let form_encoded = format!("p%40ss+w0rd{slash_encoded}x{equals_encoded}y");
+    let url = format!("https://api.test/?q={encoded}&keep=visible");
+    let redacted = redactor.redact(&url);
     assert!(redacted.contains("[REDACTED]"), "{redacted}");
-    assert!(!redacted.contains("p%40ss%20w0rd%2Fx%3Dy"));
+    assert!(!redacted.contains(&encoded), "{redacted}");
     assert!(redacted.contains("visible"));
-    let form = "grant_type=password&q=p%40ss+w0rd%2Fx%3Dy&keep=visible";
-    let redacted = redactor.redact(form);
+    let form = format!("grant_type=password&q={form_encoded}&keep=visible");
+    let redacted = redactor.redact(&form);
     assert!(redacted.contains("[REDACTED]"), "{redacted}");
-    assert!(!redacted.contains("p%40ss+w0rd%2Fx%3Dy"));
+    assert!(!redacted.contains(&form_encoded), "{redacted}");
     assert!(redacted.contains("visible"));
+}
+
+#[test]
+fn redactor_redacts_percent_encoded_secrets_in_both_space_forms() {
+    assert_percent_encoded_secret_redacted(true);
+    let mut redactor = Redactor::default();
+    redactor.add_secret("p@ss w0rd/x=y".to_owned());
     assert_eq!(redactor.redact("p@ss w0rd/x=y"), REDACTED);
 }
 
 #[test]
 fn redactor_redacts_lowercase_percent_encoded_secrets() {
-    let mut redactor = Redactor::default();
-    redactor.add_secret("p@ss w0rd/x=y".to_owned());
-    let url = "https://api.test/?q=p%40ss%20w0rd%2fx%3dy&keep=visible";
-    let redacted = redactor.redact(url);
-    assert!(redacted.contains("[REDACTED]"), "{redacted}");
-    assert!(!redacted.contains("p%40ss%20w0rd%2fx%3dy"), "{redacted}");
-    assert!(redacted.contains("visible"));
-    let form = "grant_type=password&q=p%40ss+w0rd%2fx%3dy&keep=visible";
-    let redacted = redactor.redact(form);
-    assert!(redacted.contains("[REDACTED]"), "{redacted}");
-    assert!(!redacted.contains("p%40ss+w0rd%2fx%3dy"), "{redacted}");
-    assert!(redacted.contains("visible"));
+    assert_percent_encoded_secret_redacted(false);
 }
 
 #[test]
-fn redactor_redacts_base64_encoded_secrets_in_standard_and_urlsafe_alphabets() {
+fn redactor_redacts_base64_encoded_secrets_in_all_padding_and_alphabet_variants() {
     let mut redactor = Redactor::default();
-    redactor.add_secret("PLAINTEXT+SECRET/VALUE".to_owned());
-    let standard = STANDARD.encode("PLAINTEXT+SECRET/VALUE");
-    let urlsafe = URL_SAFE_NO_PAD.encode("PLAINTEXT+SECRET/VALUE");
-    assert_ne!(standard, "PLAINTEXT+SECRET/VALUE");
-    assert_ne!(urlsafe, "PLAINTEXT+SECRET/VALUE");
-    let redacted = redactor.redact(&format!("auth={standard}&alt={urlsafe}"));
-    assert!(
-        redacted.contains("[REDACTED]"),
-        "{redacted} std={standard} url={urlsafe}"
-    );
-    assert!(!redacted.contains(&standard), "{redacted}");
-    assert!(!redacted.contains(&urlsafe), "{redacted}");
+    let secret = "PLAINTEXT+SECRET/VALUE";
+    redactor.add_secret(secret.to_owned());
+    let standard = STANDARD.encode(secret.as_bytes());
+    let standard_no_pad = STANDARD_NO_PAD.encode(secret.as_bytes());
+    let urlsafe = URL_SAFE.encode(secret.as_bytes());
+    let urlsafe_no_pad = URL_SAFE_NO_PAD.encode(secret.as_bytes());
+    for encoding in [&standard, &standard_no_pad, &urlsafe, &urlsafe_no_pad] {
+        assert_ne!(encoding, secret);
+    }
+    let redacted = redactor.redact(&format!(
+        "auth={standard}&std_nopad={standard_no_pad}&url={urlsafe}&url_nopad={urlsafe_no_pad}"
+    ));
+    assert!(redacted.contains("[REDACTED]"), "{redacted}");
+    for encoding in [&standard, &standard_no_pad, &urlsafe, &urlsafe_no_pad] {
+        assert!(!redacted.contains(encoding), "{redacted}");
+    }
     assert_eq!(
         redactor.redact(&format!("bearer {standard}")),
         "bearer [REDACTED]"
@@ -1757,8 +1763,19 @@ fn redactor_longest_first_ordering_wins_across_encodings_when_one_secret_is_a_pr
     let mut redactor = Redactor::default();
     redactor.add_secret("secret-prefix".to_owned());
     redactor.add_secret("secret-prefix-extension".to_owned());
-    let redacted = redactor.redact("secret-prefix-extension and secret-prefix");
-    assert!(!redacted.contains("secret-prefix-extension"), "{redacted}");
+    assert_eq!(
+        redactor.redact("secret-prefix-extension and secret-prefix"),
+        "[REDACTED] and [REDACTED]"
+    );
+
+    let mut redactor = Redactor::default();
+    redactor.add_secret("p@ss w0rd".to_owned());
+    redactor.add_secret("p@ss w0rd/long".to_owned());
+    let encoded_long = "p%40ss%20w0rd%2Flong";
+    assert_eq!(
+        redactor.redact(&format!("{encoded_long} and p@ss w0rd")),
+        "[REDACTED] and [REDACTED]"
+    );
 }
 
 #[test]
