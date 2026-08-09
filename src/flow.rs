@@ -675,6 +675,51 @@ pub struct CompiledFlow {
     pub redactor: Redactor,
 }
 
+/// Static warning when visual capture is enabled for a flow that exposes a
+/// secret-derived or runtime-output-derived value to the page. Never contains a
+/// secret value.
+pub const RECORDING_SECRET_WARNING: &str = "video or screenshots may capture secret-derived or runtime-output-derived values; rendered page content may contain sensitive data";
+
+impl CompiledFlow {
+    /// Returns a recording/screenshot warning when the flow both (1) captures
+    /// visual artifacts (video not `off`, a `screenshot` step, or a visual
+    /// screenshot assertion) and (2) exposes a secret-tainted value to the page
+    /// via `open` URL, `fill`, `select`, `dialog` text, `evaluate` args, or a
+    /// secret `switch_page` name/URL. Request-only secret usage is excluded.
+    /// `--video` overrides are baked into `settings.video` at compile time.
+    pub fn recording_secret_warning(&self) -> Option<&'static str> {
+        if !self.captures_visual_artifacts() {
+            return None;
+        }
+        self.steps
+            .iter()
+            .any(|step| operation_exposes_secret_tainted_value(&step.operation))
+            .then_some(RECORDING_SECRET_WARNING)
+    }
+
+    fn captures_visual_artifacts(&self) -> bool {
+        self.settings.video.enabled()
+            || self.steps.iter().any(|step| {
+                matches!(
+                    step.operation,
+                    Operation::Screenshot { .. } | Operation::Assert(Assertion::Screenshot(_))
+                )
+            })
+    }
+}
+
+fn operation_exposes_secret_tainted_value(operation: &Operation) -> bool {
+    match operation {
+        Operation::Open { url, .. } => url.is_secret(),
+        Operation::Fill { value, .. } | Operation::Select { value, .. } => value.is_secret(),
+        Operation::Dialog { text, .. } => text.as_ref().is_some_and(RuntimeValue::is_secret),
+        Operation::Evaluate { args, .. } => args.iter().any(RuntimeValue::is_secret),
+        Operation::SwitchPage(PageSwitch::Name(name)) => name.is_secret(),
+        Operation::SwitchPage(PageSwitch::Url(url)) => url.is_secret(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FlowSettings {
     pub timeout: Duration,

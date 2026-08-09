@@ -59,6 +59,12 @@ pub(super) fn render(report: &AggregateReport, report_root: &Path) -> String {
         html.push_str(&flow.duration_ms.to_string());
         html.push_str(" ms</dd></dl>");
 
+        for warning in &flow.warnings {
+            html.push_str("<p class=\"meta\"><strong>warning:</strong> ");
+            push_html(&mut html, warning.as_str());
+            html.push_str("</p>");
+        }
+
         for failure in &flow.failures {
             html.push_str("<div class=\"failure\"><h3>");
             push_html(&mut html, failure.category.as_str());

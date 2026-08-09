@@ -267,6 +267,8 @@ pub struct FlowReport {
     pub status: FlowStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<Failure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SafeText>,
     pub artifacts: ArtifactPaths,
 }
 
@@ -551,6 +553,7 @@ mod tests {
                 .map(|category| Failure::new(category, SafeText::public("failed")))
                 .into_iter()
                 .collect(),
+            warnings: Vec::new(),
             artifacts: ArtifactPaths::default(),
         }
     }
@@ -639,6 +642,42 @@ mod tests {
         );
         assert!(!json.contains("canary-secret"));
         assert!(json.ends_with('\n'));
+    }
+
+    #[test]
+    fn flow_report_serializes_recording_warnings_without_exposing_secrets() {
+        let mut warned = flow(FlowStatus::Passed, None);
+        warned.warnings = vec![SafeText::public(
+            "video or screenshots may capture secret-derived or runtime-output-derived values; rendered page content may contain sensitive data",
+        )];
+        let report = AggregateReport::new(
+            RunnerInfo {
+                name: "playrust".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            1,
+            None,
+            12,
+            vec![flow(FlowStatus::Passed, None), warned],
+        );
+        let directory = tempfile::tempdir().unwrap();
+
+        let path = write_aggregate_report(directory.path(), &report).unwrap();
+        let json = fs::read_to_string(path).unwrap();
+        let decoded: AggregateReport = serde_json::from_str(&json).unwrap();
+
+        assert!(decoded.flows[0].warnings.is_empty());
+        assert_eq!(decoded.flows[1].warnings.len(), 1);
+        assert!(
+            decoded.flows[1].warnings[0]
+                .as_str()
+                .contains("secret-derived"),
+            "{:?}",
+            decoded.flows[1].warnings
+        );
+        assert!(json.contains("\"warnings\""));
+        assert!(json.contains("secret-derived"));
+        assert!(!json.contains("canary-secret"));
     }
 
     #[test]

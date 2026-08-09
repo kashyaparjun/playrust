@@ -4426,8 +4426,16 @@ fn report(
             FlowStatus::Failed
         },
         failures,
+        warnings: recording_secret_warnings(flow),
         artifacts,
     }
+}
+
+fn recording_secret_warnings(flow: &CompiledFlow) -> Vec<crate::report::SafeText> {
+    flow.recording_secret_warning()
+        .into_iter()
+        .map(crate::report::SafeText::public)
+        .collect()
 }
 
 fn failure(
