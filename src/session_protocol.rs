@@ -1567,7 +1567,7 @@ mod tests {
     fn invalid_utf8_is_an_invalid_command_with_a_null_id() {
         let error =
             decode_request(b"{\"id\":\"lost\",\"command\":\"cancel\",\"x\":\xff}").unwrap_err();
-        assert!(matches!(error, DecodeError::UnknownCommand(Value::Null, _)));
+        assert!(matches!(error, DecodeError::Invalid(Value::Null, _)));
     }
 
     #[test]

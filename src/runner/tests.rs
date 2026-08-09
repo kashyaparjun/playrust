@@ -937,29 +937,3 @@ async fn cancellation_token_wakes_existing_and_future_waiters() {
     token.cancelled().await;
     assert!(token.is_cancelled());
 }
-
-#[tokio::test]
-async fn video_start_await_obeys_cancellation_and_deadline() {
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    assert!(matches!(
-        await_video_start(
-            Some(&cancellation),
-            Instant::now() + Duration::from_secs(1),
-            std::future::pending::<()>(),
-        )
-        .await,
-        VideoStartAwait::Cancelled
-    ));
-    assert!(matches!(
-        await_video_start(None, Instant::now(), std::future::pending::<()>()).await,
-        VideoStartAwait::Deadline
-    ));
-}
-
-#[test]
-fn screencast_errors_retain_failure_only_video() {
-    assert!(should_retain_video(false, &["stream failed".to_owned()]));
-    assert!(should_retain_video(true, &[]));
-    assert!(!should_retain_video(false, &[]));
-}

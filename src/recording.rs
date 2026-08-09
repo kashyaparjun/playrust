@@ -638,6 +638,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn screencast_errors_retain_failure_only_video() {
+        assert!(should_retain_video(false, &["stream failed".to_owned()]));
+        assert!(should_retain_video(true, &[]));
+        assert!(!should_retain_video(false, &[]));
+    }
+
+    #[test]
     fn video_off_stays_off_when_unrelated_warnings_exist() {
         let finish = missing_recording_finish(false, vec!["dialog warning".to_owned()]);
         assert_eq!(finish.status, "off");
