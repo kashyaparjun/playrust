@@ -2450,7 +2450,9 @@ async fn settle_after_open(
 }
 
 /// Leave headroom so settle timeouts complete inside `timeout_at` instead of
-/// being cancelled as a generic `step deadline expired`.
+/// being cancelled as a generic `step deadline expired`. When that headroom
+/// does not fit in the remaining budget, treat it as settle-budget exhaustion
+/// rather than an immediate settle miss.
 const OPEN_SETTLE_DEADLINE_SLACK: Duration = Duration::from_millis(50);
 
 fn prepare_open_settle(deadline: Instant) -> Result<Instant, StepError> {
@@ -2458,10 +2460,10 @@ fn prepare_open_settle(deadline: Instant) -> Result<Instant, StepError> {
     if now >= deadline {
         return Err(open_settle_budget_error());
     }
-    Ok(deadline
+    deadline
         .checked_sub(OPEN_SETTLE_DEADLINE_SLACK)
         .filter(|early| *early > now)
-        .unwrap_or(now))
+        .ok_or_else(open_settle_budget_error)
 }
 
 fn open_settle_budget_error() -> StepError {
