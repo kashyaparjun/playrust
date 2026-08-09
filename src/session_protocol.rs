@@ -26,6 +26,8 @@ use crate::session_snapshot::{ElementRef, ReferenceError};
 /// Maximum bytes before the newline in one NDJSON command envelope.
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
 
+const SESSION_NOT_OPEN_MESSAGE: &str = "the browser session is not open";
+
 #[derive(Debug)]
 pub struct SessionOptions {
     pub browser: PathBuf,
@@ -178,6 +180,11 @@ impl ProtocolState {
         }
     }
 
+    /// Recoverable error when the browser session is unavailable.
+    fn not_started(&mut self, id: Value) -> Response {
+        self.error(id, "not_started", SESSION_NOT_OPEN_MESSAGE, None)
+    }
+
     fn write_report(&self, chromium: &ChromiumInfo) -> anyhow::Result<()> {
         if let Some(error) = &self.artifact_error {
             anyhow::bail!("initialize session artifacts: {error}");
@@ -200,6 +207,30 @@ impl ProtocolState {
         self.journal.append(&event)?;
         self.events.push(event);
         Ok(())
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_session_mut<'a, T>(
+    session: &'a mut Option<T>,
+    state: &mut ProtocolState,
+    id: Value,
+) -> Result<&'a mut T, Response> {
+    match session.as_mut() {
+        Some(opened) => Ok(opened),
+        None => Err(state.not_started(id)),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_session_ref<'a, T>(
+    session: &'a Option<T>,
+    state: &mut ProtocolState,
+    id: Value,
+) -> Result<&'a T, Response> {
+    match session.as_ref() {
+        Some(opened) => Ok(opened),
+        None => Err(state.not_started(id)),
     }
 }
 
@@ -305,7 +336,15 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         for warning in opened.recording_warnings() {
             if let Err(error) = state.append(JournalEvent::RecorderWarning { warning }) {
                 eprintln!("error: write recorder warning: {error}");
-                let _ = session.take().expect("eager session").close(&host).await;
+                // Invariant: `session.take()` is Some because this block
+                // holds a borrow of `session` via `opened`, and the session is
+                // opened at startup before this loop and only taken on close
+                // (which exits the function).
+                let _ = session
+                    .take()
+                    .expect("recorder warning path holds an open session")
+                    .close(&host)
+                    .await;
                 let _ = host.shutdown().await;
                 return ExitCode::Infrastructure;
             }
@@ -404,6 +443,17 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     }
                     continue;
                 }
+                let active_session =
+                    match require_session_mut(&mut session, &mut state, request.id.clone()) {
+                        Ok(opened) => opened,
+                        Err(response) => {
+                            if write_response(&mut stdout, &response).await.is_err() {
+                                exit_code = ExitCode::Infrastructure;
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                 compiled.settings.video = VideoMode::Off;
                 register_flow_secrets(&mut state.journal, &compiled);
 
@@ -422,11 +472,8 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                             .unwrap_or_else(|| PathBuf::from("ffmpeg")),
                     );
                 }
-                let mut execution = Box::pin(session.as_mut().expect("session opened").execute(
-                    &host,
-                    &compiled,
-                    &run_options,
-                ));
+                let mut execution =
+                    Box::pin(active_session.execute(&host, &compiled, &run_options));
                 let mut requested_close = None;
                 let mut input_closed = false;
                 let mut cancellation_requested = false;
@@ -616,18 +663,15 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 accessibility,
                 screenshot,
             } => {
-                let Some(opened) = &session else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before inspecting the session",
-                        None,
-                    );
-                    if write_response(&mut stdout, &response).await.is_err() {
-                        exit_code = ExitCode::Infrastructure;
-                        break;
+                let opened = match require_session_ref(&session, &mut state, request.id.clone()) {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 };
                 state.inspections += 1;
                 let directory = screenshot.then(|| {
@@ -659,7 +703,17 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 accessibility,
                 since,
             } => {
-                let opened = session.as_mut().expect("eager session");
+                let opened = match require_session_mut(&mut session, &mut state, request.id.clone())
+                {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if let Some(dialog) = opened.pending_dialog() {
                     let response = state.response(
                         request.id,
@@ -735,7 +789,10 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 let diff = since.map(|from| {
                     opened
                         .snapshot_diff(from, snapshot.generation)
-                        .expect("validated baseline is adjacent to the new snapshot")
+                        // Invariant: `validate_snapshot_baseline(from)` above
+                        // confirmed `from` is adjacent to the newly captured
+                        // snapshot, so the diff cannot fail.
+                        .expect("snapshot baseline was validated as adjacent")
                 });
                 let event = JournalEvent::Snapshot {
                     snapshot_revision: snapshot.generation,
@@ -772,7 +829,17 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Act { action } => {
-                let opened = session.as_mut().expect("eager session");
+                let opened = match require_session_mut(&mut session, &mut state, request.id.clone())
+                {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if let Some(dialog) = opened.pending_dialog() {
                     let response = state.error(
                         request.id,
@@ -917,7 +984,17 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     }
                     continue;
                 }
-                let opened = session.as_mut().expect("eager session");
+                let opened = match require_session_mut(&mut session, &mut state, request.id.clone())
+                {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if let Some(dialog) = opened.pending_dialog() {
                     let response = state.error(
                         request.id,
@@ -932,7 +1009,12 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     continue;
                 }
                 let step = json!({ "scroll": { "x": x, "y": y } });
-                let flow = compile_interactive(&step, opened).expect("validated scroll compiles");
+                let flow = compile_interactive(&step, opened)
+                    // Invariant: the scroll step is a fixed literal
+                    // `{ scroll: { x, y } }` with no environment values or
+                    // refs, so it always compiles. x/y are already validated
+                    // as not both zero above.
+                    .expect("scroll step is a validated literal flow");
                 let result = opened
                     .execute_interactive(&host, &flow, &state.artifacts)
                     .await;
@@ -965,7 +1047,16 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Dialog { action, text } => {
-                let opened = session.as_ref().expect("eager session");
+                let opened = match require_session_ref(&session, &mut state, request.id.clone()) {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let invalid_text = text.is_some() && !matches!(action, DialogAction::Accept);
                 if invalid_text {
                     let response = state.error(
@@ -1006,18 +1097,23 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Export { name } => {
+                let opened = match require_session_ref(&session, &mut state, request.id.clone()) {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if let Err(error) = state.write_report(&chromium) {
                     let response = state.error(request.id, "artifacts", error.to_string(), None);
                     let _ = write_response(&mut stdout, &response).await;
                     exit_code = ExitCode::Infrastructure;
                     break;
                 }
-                let response = match export_bundle(
-                    &options.artifacts,
-                    &mut state,
-                    &name,
-                    session.as_ref().expect("eager session"),
-                ) {
+                let response = match export_bundle(&options.artifacts, &mut state, &name, opened) {
                     Ok(result) => state.response(request.id, result),
                     Err(CommandError {
                         code,
@@ -1057,18 +1153,26 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 }
             }
             SessionCommand::Close => {
-                let mut close_result =
-                    match session.take().expect("eager session").close(&host).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let response =
-                                state.error(request.id, "browser", error.to_string(), None);
-                            let _ = write_response(&mut stdout, &response).await;
-                            exit_code = ExitCode::Infrastructure;
-                            close_session = true;
-                            continue;
-                        }
-                    };
+                let Some(session) = session.take() else {
+                    let response = state.not_started(request.id);
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    // Nothing left to close; stop accepting further commands.
+                    close_session = true;
+                    continue;
+                };
+                let mut close_result = match session.close(&host).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let response = state.error(request.id, "browser", error.to_string(), None);
+                        let _ = write_response(&mut stdout, &response).await;
+                        exit_code = ExitCode::Infrastructure;
+                        close_session = true;
+                        continue;
+                    }
+                };
                 if let Err(error) =
                     publish_close_artifacts(&mut state, &chromium, &mut close_result)
                 {
@@ -1132,7 +1236,12 @@ fn prepare_action(
         .ok_or_else(|| {
             validation_error("action must be an object containing exactly one operation")
         })?;
-    let (name, payload) = object.iter().next().expect("one action");
+    // Invariant: `object` has exactly one entry (checked by the
+    // `object.len() == 1` filter above), so `.next()` is always Some.
+    let (name, payload) = object
+        .iter()
+        .next()
+        .expect("action object has exactly one entry");
     if !matches!(
         name.as_str(),
         "open"
@@ -1174,7 +1283,12 @@ fn prepare_action(
             Value::Object(object)
         }
         "switch_frame" if payload.get("ref").is_some() => {
-            let mut object = payload.as_object().cloned().expect("ref requires object");
+            // Invariant: `payload.get("ref").is_some()` requires `payload` to
+            // be an object containing a `ref` key, so `as_object()` is Some.
+            let mut object = payload
+                .as_object()
+                .cloned()
+                .expect("payload holds a ref key");
             let reference = take_reference(&mut object, session, &mut backend_node_id)?;
             durable = Some(reference.clone());
             json!({ "target": reference })
@@ -1274,7 +1388,9 @@ fn compile_interactive(step: &Value, session: &BrowserSession) -> Result<Compile
         "secrets": secrets,
         "steps": [executable],
     }))
-    .expect("interactive flow serializes");
+    // Invariant: the embedded JSON value is built entirely from serializable
+    // primitives and serde_json::Value, so `to_string` cannot fail.
+    .expect("interactive flow value is serializable");
     compile_inline_yaml(
         &source,
         "interactive-action.yaml",
@@ -1803,5 +1919,105 @@ mod tests {
         };
         assert_eq!(state.response(json!(1), json!({})).revision, 1);
         assert_eq!(state.error(json!(2), "test", "failed", None).revision, 2);
+    }
+
+    #[test]
+    fn not_started_matches_protocol_contract_when_session_option_is_none() {
+        let mut ctx = test_protocol();
+        let mut session: Option<()> = None;
+        let response = require_session_mut(&mut session, &mut ctx.state, json!(7))
+            .expect_err("missing session");
+
+        assert!(!response.ok);
+        assert_eq!(response.id, json!(7));
+        assert_eq!(response.session_id, "session");
+        assert_eq!(response.revision, 1);
+        assert!(response.result.is_none());
+        let error = response.error.expect("error payload");
+        assert_eq!(error.code, "not_started");
+        assert_eq!(error.message, SESSION_NOT_OPEN_MESSAGE);
+        assert!(error.details.is_none());
+
+        let again = require_session_ref(&session, &mut ctx.state, json!("close"))
+            .expect_err("missing session");
+        assert_eq!(again.revision, 2);
+        assert_eq!(again.error.expect("error").code, "not_started");
+    }
+
+    #[test]
+    fn submit_not_started_skips_submission_side_effects() {
+        let mut ctx = test_protocol();
+        let mut session: Option<()> = None;
+        let submissions_before = ctx.state.submissions;
+        let events_before = ctx.state.events.len();
+
+        let rejected = match require_session_mut(&mut session, &mut ctx.state, json!(1)) {
+            Ok(_) => {
+                ctx.state.submissions += 1;
+                ctx.state
+                    .append(JournalEvent::RecorderWarning {
+                        warning: "should not register".to_owned(),
+                    })
+                    .unwrap();
+                panic!("expected not_started before submission side effects");
+            }
+            Err(response) => response,
+        };
+
+        assert_eq!(rejected.error.expect("error").code, "not_started");
+        assert_eq!(ctx.state.submissions, submissions_before);
+        assert_eq!(ctx.state.events.len(), events_before);
+        assert!(
+            std::fs::read_to_string(&ctx.state.journal_path)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn export_not_started_skips_report_persistence() {
+        let mut ctx = test_protocol();
+        let session: Option<()> = None;
+        let report_path = ctx.state.artifacts.join("report.json");
+
+        let rejected = match require_session_ref(&session, &mut ctx.state, json!("export")) {
+            Ok(_) => {
+                std::fs::write(&report_path, "{}").unwrap();
+                panic!("expected not_started before write_report");
+            }
+            Err(response) => response,
+        };
+
+        assert_eq!(rejected.error.expect("error").code, "not_started");
+        assert!(!report_path.exists());
+    }
+
+    struct TestProtocol {
+        _directory: tempfile::TempDir,
+        state: ProtocolState,
+    }
+
+    fn test_protocol() -> TestProtocol {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("session.ndjson");
+        let state = ProtocolState {
+            id: "session".to_owned(),
+            revision: 0,
+            submissions: 0,
+            inspections: 0,
+            started: Instant::now(),
+            reports: Vec::new(),
+            artifacts: directory.path().to_owned(),
+            snapshot_count: 0,
+            journal: JournalWriter::open(&journal_path).unwrap(),
+            journal_path,
+            events: Vec::new(),
+            bundle: None,
+            artifact_error: None,
+        };
+        TestProtocol {
+            _directory: directory,
+            state,
+        }
     }
 }

@@ -234,6 +234,7 @@ Stable protocol errors include:
 | `settings_conflict` | Submission viewport/geolocation conflicts with session settings. | Yes |
 | `busy` | Command is not allowed during an active submission. | Yes |
 | `not_active` | `cancel` arrived while no submission was active. | Yes |
+| `not_started` | Browser session handle is unavailable. | Yes |
 | `output_not_found` | Named runtime output is unavailable. | Yes |
 | `dialog_pending` | A native dialog must be handled before mutation. | Yes |
 | `unknown_reference` | Ref was never issued by this session. | Yes |
@@ -246,7 +247,7 @@ Stable protocol errors include:
 | `browser` | Browser launch, crash, connection, protocol, or disposal failed. | No |
 | `artifacts` | Journal or artifact persistence failed. | No |
 
-Ordinary action, wait, assertion, navigation, stale-ref, and export validation failures are recoverable command errors. Browser crash/CDP connection loss, transport failure, and journal/artifact failure are fatal. Recorder degradation is reported in recording status and warnings rather than making later browser commands fatal.
+Ordinary action, wait, assertion, navigation, stale-ref, and export validation failures are recoverable command errors. Browser crash/CDP connection loss, transport failure, and journal/artifact failure are fatal. Recorder degradation is reported in recording status and warnings rather than making later browser commands fatal. `not_started` is defense-in-depth when a command needs an open browser session but the handle is gone; the process usually keeps accepting commands. A `close` that finds no session still ends the process after the error response.
 
 ## Ordering And Termination
 
