@@ -15,6 +15,14 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+#[path = "install/ffmpeg.rs"]
+mod ffmpeg;
+
+pub use ffmpeg::{
+    FFMPEG_ENV, PINNED_FFMPEG_VERSION, cached_ffmpeg_path, ffmpeg_cache_root, install_ffmpeg,
+    resolve_or_install_ffmpeg,
+};
+
 pub const CHROME_ENV: &str = "PLAYRUST_CHROME";
 pub const PINNED_CHROME_VERSION: &str = "151.0.7922.34";
 
@@ -104,6 +112,8 @@ pub enum InstallError {
         expected: String,
         actual: String,
     },
+    #[error("failed to lock cache {path}: {error}")]
+    CacheLock { path: PathBuf, error: String },
     #[error("failed to install Chrome for Testing {version}: {error}")]
     BrowserInstall {
         version: &'static str,
@@ -140,11 +150,52 @@ pub enum InstallError {
         #[source]
         error: io::Error,
     },
+    #[error(
+        "invalid pinned {kind} {version:?}; expected a non-empty component without path separators"
+    )]
+    InvalidPinnedComponent { kind: &'static str, version: String },
+    #[error("FFmpeg path from {origin} does not name a file: {path}")]
+    InvalidFfmpegPath { origin: &'static str, path: PathBuf },
+    #[error("failed to inspect FFmpeg path from {origin} ({path}): {error}")]
+    FfmpegMetadata {
+        origin: &'static str,
+        path: PathBuf,
+        #[source]
+        error: io::Error,
+    },
+    #[error("failed to run FFmpeg from {origin} ({path}): {error}")]
+    FfmpegVersionCommand {
+        origin: &'static str,
+        path: PathBuf,
+        #[source]
+        error: io::Error,
+    },
+    #[error("FFmpeg from {origin} ({path}) failed preflight: {message}")]
+    FfmpegPreflight {
+        origin: &'static str,
+        path: PathBuf,
+        message: String,
+    },
+    #[error("FFmpeg from {origin} ({path}) does not provide the required libx264 encoder")]
+    FfmpegH264Unavailable { origin: &'static str, path: PathBuf },
+    #[error("failed to install FFmpeg {version}: {error}")]
+    FfmpegInstall {
+        version: &'static str,
+        error: String,
+    },
+    #[error(
+        "no usable FFmpeg found; run `playrust ffmpeg install`, pass --ffmpeg-path PATH, set {FFMPEG_ENV}, or install ffmpeg on PATH with libx264 support"
+    )]
+    FfmpegUnavailable,
+}
+
+pub(crate) fn cache_parent() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "playrust").map(|dirs| dirs.cache_dir().to_owned())
 }
 
 pub fn cache_root() -> Result<PathBuf, InstallError> {
-    ProjectDirs::from("", "", "playrust")
-        .map(|dirs| dirs.cache_dir().join("chrome-for-testing"))
+    cache_parent()
+        .map(|root| root.join("chrome-for-testing"))
         .ok_or(InstallError::CacheDirectoryUnavailable)
 }
 
@@ -247,11 +298,9 @@ fn install_lock_path(root: &Path) -> PathBuf {
 }
 
 fn acquire_install_lock(root: &Path) -> Result<File, InstallError> {
-    fs::create_dir_all(root).map_err(|error| {
-        install_error(format!(
-            "failed to create cache root {}: {error}",
-            root.display()
-        ))
+    fs::create_dir_all(root).map_err(|error| InstallError::CacheLock {
+        path: root.to_owned(),
+        error: format!("failed to create cache root: {error}"),
     })?;
     let path = install_lock_path(root);
     let file = OpenOptions::new()
@@ -260,14 +309,13 @@ fn acquire_install_lock(root: &Path) -> Result<File, InstallError> {
         .read(true)
         .write(true)
         .open(&path)
-        .map_err(|error| {
-            install_error(format!(
-                "failed to open cache lock {}: {error}",
-                path.display()
-            ))
+        .map_err(|error| InstallError::CacheLock {
+            path: path.clone(),
+            error: format!("failed to open cache lock: {error}"),
         })?;
-    file.lock().map_err(|error| {
-        install_error(format!("failed to lock cache {}: {error}", path.display()))
+    file.lock().map_err(|error| InstallError::CacheLock {
+        path,
+        error: format!("failed to lock cache: {error}"),
     })?;
     Ok(file)
 }
@@ -389,6 +437,37 @@ fn validate_version(version: &str) -> Result<(), InstallError> {
             version: version.to_owned(),
         })
     }
+}
+
+pub(crate) fn validate_component(kind: &'static str, version: &str) -> Result<(), InstallError> {
+    let valid = !version.is_empty()
+        && !version.contains('/')
+        && !version.contains('\\')
+        && version
+            .chars()
+            .all(|character| !character.is_whitespace() && character != '\0');
+    if valid {
+        Ok(())
+    } else {
+        Err(InstallError::InvalidPinnedComponent {
+            kind,
+            version: version.to_owned(),
+        })
+    }
+}
+
+pub(crate) fn verify_sha256_bytes(bytes: &[u8], expected: &str) -> Result<(), InstallError> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected.to_ascii_lowercase() {
+        return Err(InstallError::ChecksumMismatch {
+            archive: PathBuf::from("download"),
+            expected: expected.to_ascii_lowercase(),
+            actual,
+        });
+    }
+    Ok(())
 }
 
 const RELEASE_BINARY: &str = if cfg!(windows) {
@@ -523,7 +602,7 @@ fn parse_checksum(text: &str, archive_name: &str) -> Result<String, InstallError
     Err(invalid())
 }
 
-fn safe_archive_path(path: &Path) -> Result<(), InstallError> {
+pub(crate) fn safe_archive_path(path: &Path) -> Result<(), InstallError> {
     use std::path::Component;
     if path.components().any(|component| {
         matches!(
@@ -608,7 +687,7 @@ fn extract_zip(archive: &Path, output: &mut File) -> Result<bool, InstallError> 
     Ok(false)
 }
 
-fn set_executable(_path: &Path) -> io::Result<()> {
+pub(crate) fn set_executable(_path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

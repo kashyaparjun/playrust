@@ -71,6 +71,14 @@ Run `playrust browser install` to preinstall the browser. `playrust run` also
 installs pinned Chrome for Testing `151.0.7922.34` automatically if needed. You
 can instead provide that exact build with `--browser PATH` or `PLAYRUST_CHROME`.
 
+Video recording uses a pinned FFmpeg `7.1.5` static build (GPL-licensed; invoked
+as a separate process, not linked). Linux and Windows builds come from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds); macOS builds come
+from [evermeet.cx](https://evermeet.cx/ffmpeg/). `playrust run` and
+`playrust session` auto-install FFmpeg into `~/.cache/playrust/ffmpeg/` when
+video is enabled. Preinstall with `playrust ffmpeg install`, or override with
+`--ffmpeg-path PATH` or `PLAYRUST_FFMPEG`.
+
 ## Agent sessions
 
 `playrust session --protocol ndjson` is the interactive agent interface. It eagerly opens one isolated Chromium context, reads one JSON command per stdin line, and writes one JSON response per stdout line; diagnostics go only to stderr. Every response contains the command `id`, `ok`, stable `session_id`, monotonically increasing `revision`, and either `result` or a structured `error`.
@@ -123,6 +131,8 @@ playrust check <path> [--var NAME=VALUE]
 playrust run <path> [--headed] [--jobs N] [--browser PATH]
                     [--var NAME=VALUE] [--video MODE]
                     [--ffmpeg-path PATH] [--artifacts DIR] [--junit] [--html]
+playrust browser install
+playrust ffmpeg install
 playrust session --protocol ndjson [--headed] [--browser PATH]
                     [--viewport WIDTHxHEIGHT] [--timeout DURATION]
                     [--video on|off]
@@ -373,7 +383,11 @@ Video modes are `off`, `on`, and `retain-on-failure`. Recording defaults to `on`
 
 With no recording steps, video still covers the whole flow. To record one deliberate segment, add exactly one ordered `recording: start` / `recording: stop` pair; `check` rejects unmatched, reversed, or repeated controls after subflows are expanded. `--video off` makes a valid pair a no-op. A failure or interruption before `stop` still finalizes and reports the active recording. A completed manual recording remains reportable if a later step fails, and `retain-on-failure` removes it only after the entire flow passes.
 
-Recording requires an `ffmpeg` executable on `PATH`, or `--ffmpeg-path PATH`, with the `libx264` encoder. Playrust records the fixed page viewport as silent 15 FPS MP4/H.264 for broad player compatibility; enabled video requires even viewport dimensions. Browser chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
+Recording uses the pinned FFmpeg build above (or `--ffmpeg-path PATH`,
+`PLAYRUST_FFMPEG`, or an `ffmpeg` on `PATH` with the `libx264` encoder).
+Playrust records the fixed page viewport as silent 15 FPS MP4/H.264 for broad
+player compatibility; enabled video requires even viewport dimensions. Browser
+chrome, audio, OS dialogs, and a guaranteed pointer image are not recorded.
 
 Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically write `<artifacts>/junit.xml`; automation failures are JUnit failures, while invalid specifications, infrastructure failures, and interruptions are JUnit errors. Pass `--html` to atomically write `<artifacts>/report.html`, a self-contained static summary with inline CSS, no scripts or external resources, and plain-text artifact paths. Optional reports are removed when their flags are omitted, so stale output cannot be mistaken for the current run. Successful named screenshot paths are listed under each flow's `artifacts.screenshots`. A failed screenshot assertion retains `__visual-<step>-actual.png` and a `__visual-<step>-diff.png` whose changed pixels are red, reported as `visual_actual` and `visual_diff`; diagnostics do not expose the baseline path. Per-flow directories may also contain `failure.png`, `recording.mp4`, or `recording.partial.mp4` when finalization fails. Change the root with `--artifacts DIR`.
 
