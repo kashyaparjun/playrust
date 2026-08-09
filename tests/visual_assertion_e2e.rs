@@ -1,5 +1,6 @@
+mod support;
+
 use std::collections::BTreeMap;
-use std::env;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -11,10 +12,12 @@ use std::thread;
 use std::time::Duration;
 
 use image::{ImageEncoder, Rgba, RgbaImage, codecs::png::PngEncoder};
+use libtest_mimic::Failed;
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_file;
 use playrust::report::FlowStatus;
 use playrust::runner::{RunOptions, run_flow};
+use support::harness;
 
 const HTML: &str = r#"<!doctype html><html><head><style>*{margin:0}html{background:#102030}</style></head><body></body></html>"#;
 
@@ -94,10 +97,16 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, color: Rgba<u8>) {
     std::fs::write(path, bytes).unwrap();
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+fn main() {
+    harness::run(vec![harness::async_browser_trial(
+        "deterministic_visual_assertion_passes_and_retains_failure_artifacts",
+        deterministic_visual_assertion_passes_and_retains_failure_artifacts,
+    )]);
+}
+
+async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let fixture = Fixture::start();
     let directory = tempfile::tempdir().unwrap();
     write_png(
@@ -179,4 +188,5 @@ async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
     assert_eq!(retried.artifacts.visual_diff, None);
     assert!(!retry_artifacts.join("__visual-3-actual.png").exists());
     assert!(!retry_artifacts.join("__visual-3-diff.png").exists());
+    Ok(())
 }

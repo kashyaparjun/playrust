@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 pub const CHROME_ENV: &str = "PLAYRUST_CHROME";
+pub const REQUIRE_E2E_ENV: &str = "PLAYRUST_REQUIRE_E2E";
 pub const PINNED_CHROME_VERSION: &str = "151.0.7922.34";
 
 static INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
@@ -158,6 +159,31 @@ pub fn cached_browser_path(
         .join(version)
         .join(platform.chrome_for_testing_name())
         .join(platform.executable_relative_path()))
+}
+
+/// Returns a Chrome for Testing path from `PLAYRUST_CHROME` or the Playrust cache
+/// when the file already exists. Does not download or validate the binary version.
+pub fn resolve_cached_browser() -> Option<PathBuf> {
+    if let Some(path) = env::var_os(CHROME_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let root = cache_root().ok()?;
+    let platform = Platform::current().ok()?;
+    let path = cached_browser_path(&root, PINNED_CHROME_VERSION, platform).ok()?;
+    path.is_file().then_some(path)
+}
+
+/// Test-harness gate: panic when `PLAYRUST_REQUIRE_E2E=1` and a prerequisite is missing.
+///
+/// Intended for browser e2e / libtest-mimic helpers only. Returns normally when the
+/// env var is unset so callers can report the trial as ignored.
+pub fn escalate_missing_prerequisite(reason: &str) {
+    if env::var(REQUIRE_E2E_ENV).as_deref() == Ok("1") {
+        panic!("{REQUIRE_E2E_ENV}=1 but prerequisite missing. {reason}.");
+    }
 }
 
 /// Resolve an explicit path, then `PLAYRUST_CHROME`, then the Playrust cache,

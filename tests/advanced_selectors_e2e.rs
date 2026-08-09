@@ -1,9 +1,13 @@
+mod support;
+
 use std::collections::BTreeMap;
-use std::env;
+use std::path::PathBuf;
+
+use libtest_mimic::Failed;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::thread;
+use support::harness;
 
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_yaml;
@@ -61,9 +65,16 @@ const HTML: &str = r#"<!doctype html>
   </body>
 </html>"#;
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn advanced_relations_states_and_relative_click_point_work_live() {
+fn main() {
+    harness::run(vec![harness::async_browser_trial(
+        "advanced_relations_states_and_relative_click_point_work_live",
+        advanced_relations_states_and_relative_click_point_work_live,
+    )]);
+}
+
+async fn advanced_relations_states_and_relative_click_point_work_live(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
     let address = listener.local_addr().expect("read fixture address");
     let server = thread::spawn(move || {
@@ -112,10 +123,6 @@ steps:
         &BTreeMap::new(),
     )
     .expect("compile advanced selector flow");
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
     let artifacts = tempfile::tempdir().expect("create artifact directory");
     let host = BrowserHost::launch(&chrome, false)
         .await
@@ -126,4 +133,5 @@ steps:
     server.join().expect("fixture server thread");
 
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+    Ok(())
 }

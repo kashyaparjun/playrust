@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Read, Write};
@@ -11,11 +13,13 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use libtest_mimic::Failed;
 use playrust::browser::BrowserHost;
 use playrust::flow::{compile_file, compile_yaml};
 use playrust::report::FlowStatus;
 use playrust::runner::{RunOptions, run_flow};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
+use support::harness;
 
 const HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -189,13 +193,22 @@ impl Drop for FixtureServer {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn browser_flow_smoke() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
+fn main() {
+    harness::run(vec![
+        harness::async_browser_trial("browser_flow_smoke", browser_flow_smoke),
+        harness::async_browser_trial(
+            "clear_state_is_scoped_to_the_active_flow",
+            clear_state_is_scoped_to_the_active_flow,
+        ),
+        harness::async_browser_trial(
+            "geolocation_is_applied_only_to_the_flow_context",
+            geolocation_is_applied_only_to_the_flow_context,
+        ),
+        harness::async_browser_video_trial("browser_video_flow_smoke", browser_video_flow_smoke),
+    ]);
+}
+
+async fn browser_flow_smoke(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(HTML);
 
     let flow_files = tempfile::tempdir().expect("create subflow directory");
@@ -298,15 +311,10 @@ steps:
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 100);
     assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 80);
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn clear_state_is_scoped_to_the_active_flow() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
+async fn clear_state_is_scoped_to_the_active_flow(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(STATE_HTML);
     let url = format!("http://{}", server.address);
     let flow = compile_yaml(
@@ -359,15 +367,10 @@ steps:
     shutdown.expect("shut down Chrome cleanly");
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
     assert_eq!(other_cookie, "flow=present");
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn geolocation_is_applied_only_to_the_flow_context() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
+async fn geolocation_is_applied_only_to_the_flow_context(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(GEOLOCATION_HTML);
     let url = format!("http://{}", server.address);
     let flow = compile_yaml(
@@ -417,18 +420,10 @@ steps:
     shutdown.expect("shut down Chrome cleanly");
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
     assert_ne!(permission, "granted");
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
-async fn browser_video_flow_smoke() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
-    let ffmpeg = env::var_os("PLAYRUST_FFMPEG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+async fn browser_video_flow_smoke(chrome: PathBuf, ffmpeg: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(VIDEO_HTML);
     let flow = compile_yaml(
         &format!(
@@ -506,4 +501,5 @@ steps:
     assert!(metadata.contains("codec_name=h264"), "{metadata}");
     assert!(metadata.contains("width=800"), "{metadata}");
     assert!(metadata.contains("height=600"), "{metadata}");
+    Ok(())
 }

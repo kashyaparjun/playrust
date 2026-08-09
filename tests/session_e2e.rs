@@ -1,17 +1,64 @@
 mod support;
 
-use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use libtest_mimic::Failed;
 use serde_json::{Value, json};
-use support::{FixtureServer, read_report};
+use support::{FixtureServer, harness, read_report};
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn state_storage_tab_frame_inspection_and_artifacts_persist() {
+fn main() {
+    harness::run(vec![
+        harness::browser_trial(
+            "state_storage_tab_frame_inspection_and_artifacts_persist",
+            state_storage_tab_frame_inspection_and_artifacts_persist,
+        ),
+        harness::browser_trial(
+            "malformed_validation_automation_and_settings_errors_recover",
+            malformed_validation_automation_and_settings_errors_recover,
+        ),
+        harness::browser_trial(
+            "busy_then_cancel_is_terminal_and_exits_130",
+            busy_then_cancel_is_terminal_and_exits_130,
+        ),
+        harness::browser_trial(
+            "close_during_submit_orders_submit_before_the_only_close_response",
+            close_during_submit_orders_submit_before_the_only_close_response,
+        ),
+        harness::browser_trial(
+            "cancellation_ack_wins_a_racing_success",
+            cancellation_ack_wins_a_racing_success,
+        ),
+        harness::browser_trial(
+            "eof_during_submission_cancels_and_exits_130",
+            eof_during_submission_cancels_and_exits_130,
+        ),
+        harness::browser_trial(
+            "artifact_failure_wins_cancellation",
+            artifact_failure_wins_cancellation,
+        ),
+        harness::plain_trial(
+            "fatal_browser_startup_exits_4",
+            fatal_browser_startup_exits_4,
+        ),
+        harness::browser_trial(
+            "interactive_snapshot_refs_actions_scroll_and_dialog_recover",
+            interactive_snapshot_refs_actions_scroll_and_dialog_recover,
+        ),
+        harness::browser_video_cli_trial(
+            "interactive_session_records_one_continuous_video",
+            interactive_session_records_one_continuous_video,
+        ),
+        harness::browser_trial(
+            "large_page_snapshot_is_bounded",
+            large_page_snapshot_is_bounded,
+        ),
+    ]);
+}
+
+fn state_storage_tab_frame_inspection_and_artifacts_persist(chrome: PathBuf) -> Result<(), Failed> {
     let foreign = FixtureServer::start(&[(
         "/foreign",
         "text/html; charset=utf-8",
@@ -31,7 +78,7 @@ fn state_storage_tab_frame_inspection_and_artifacts_persist() {
     ]);
     let directory = tempfile::tempdir().unwrap();
     let artifacts = directory.path().join("artifacts");
-    let mut session = Session::start(&artifacts);
+    let mut session = Session::start(&chrome, &artifacts);
 
     let first = session.command(json!({
         "id": "submit-1",
@@ -106,18 +153,19 @@ fn state_storage_tab_frame_inspection_and_artifacts_persist() {
         inspection_path.parent(),
         Some(session_directory.join("submission-000001").as_path())
     );
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn malformed_validation_automation_and_settings_errors_recover() {
+fn malformed_validation_automation_and_settings_errors_recover(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(&[(
         "/",
         "text/html; charset=utf-8",
         "<!doctype html><title>Recovery</title><p>ready</p>",
     )]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
 
     assert_eq!(
         session.command(json!({ "id": "inspect-early", "command": "inspect" }))["result"]["url"],
@@ -194,18 +242,17 @@ fn malformed_validation_automation_and_settings_errors_recover() {
         true
     );
     assert_exit(session.finish(), 0);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn busy_then_cancel_is_terminal_and_exits_130() {
+fn busy_then_cancel_is_terminal_and_exits_130(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(&[(
         "/",
         "text/html; charset=utf-8",
         "<!doctype html><p>wait</p>",
     )]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
     session.send(json!({
         "id": "submit",
         "command": "submit",
@@ -219,18 +266,19 @@ fn busy_then_cancel_is_terminal_and_exits_130() {
     assert_eq!(cancelled["id"], "submit");
     assert_eq!(cancelled["error"]["code"], "cancelled");
     assert_exit(session.finish(), 130);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn close_during_submit_orders_submit_before_the_only_close_response() {
+fn close_during_submit_orders_submit_before_the_only_close_response(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(&[(
         "/",
         "text/html; charset=utf-8",
         "<!doctype html><p>wait</p>",
     )]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
     session.send(json!({
         "id": "submit",
         "command": "submit",
@@ -252,14 +300,13 @@ fn close_during_submit_orders_submit_before_the_only_close_response() {
         "received a second close response"
     );
     assert_exit(session.finish(), 130);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn cancellation_ack_wins_a_racing_success() {
+fn cancellation_ack_wins_a_racing_success(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", "<!doctype html>")]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
     session.send(json!({
         "id": "submit",
         "command": "submit",
@@ -272,14 +319,13 @@ fn cancellation_ack_wins_a_racing_success() {
     assert_eq!(submit["error"]["code"], "cancelled");
     assert_eq!(submit["error"]["details"]["status"], "interrupted");
     assert_exit(session.finish(), 130);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn eof_during_submission_cancels_and_exits_130() {
+fn eof_during_submission_cancels_and_exits_130(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", "<!doctype html>")]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
     session.send(json!({
         "id": "submit",
         "command": "submit",
@@ -288,16 +334,15 @@ fn eof_during_submission_cancels_and_exits_130() {
     session.close_input();
     assert_eq!(session.read()["error"]["code"], "cancelled");
     assert_exit(session.finish(), 130);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn artifact_failure_wins_cancellation() {
+fn artifact_failure_wins_cancellation(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", "<!doctype html>")]);
     let directory = tempfile::tempdir().unwrap();
     let artifacts = directory.path().join("not-a-directory");
     std::fs::write(&artifacts, "blocked").unwrap();
-    let mut session = Session::start(&artifacts);
+    let mut session = Session::start(&chrome, &artifacts);
     session.send(json!({
         "id": "submit",
         "command": "submit",
@@ -307,10 +352,10 @@ fn artifact_failure_wins_cancellation() {
     assert_eq!(session.read()["result"]["cancelling"], true);
     assert_eq!(session.read()["error"]["code"], "artifacts");
     assert_exit(session.finish(), 4);
+    Ok(())
 }
 
-#[test]
-fn fatal_browser_startup_exits_4() {
+fn fatal_browser_startup_exits_4() -> Result<(), Failed> {
     let directory = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_playrust"))
         .args([
@@ -323,11 +368,12 @@ fn fatal_browser_startup_exits_4() {
         .output()
         .unwrap();
     assert_exit(output, 4);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
+fn interactive_snapshot_refs_actions_scroll_and_dialog_recover(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     const SECRET: &str = "session-secret-canary";
     unsafe { std::env::set_var("PLAYRUST_SESSION_TEST_SECRET", SECRET) };
     let server = FixtureServer::start(&[(
@@ -336,7 +382,7 @@ fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
         "<!doctype html><title>Interactive</title><button data-testid='confirm' onclick=\"confirm('Continue?')\">Continue</button><button id='replaceable' data-testid='replaceable'>Replaceable</button><input aria-label='Name' oninput='document.title=this.value'><div style='height:2000px'></div><script>setTimeout(() => { const old = document.querySelector('#replaceable'); const replacement = old.cloneNode(true); old.replaceWith(replacement); }, 2000)</script>",
     )]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
 
     assert_eq!(
         session.command(json!({
@@ -448,7 +494,7 @@ fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
             "run",
             bundle.join("replay.yaml").to_str().unwrap(),
             "--browser",
-            env::var_os("PLAYRUST_CHROME").unwrap().to_str().unwrap(),
+            chrome.to_str().unwrap(),
             "--video",
             "off",
             "--artifacts",
@@ -458,11 +504,13 @@ fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
         .unwrap();
     assert_exit(replay_run, 0);
     unsafe { std::env::remove_var("PLAYRUST_SESSION_TEST_SECRET") };
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
-fn interactive_session_records_one_continuous_video() {
+fn interactive_session_records_one_continuous_video(
+    chrome: PathBuf,
+    ffmpeg: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(&[(
         "/",
         "text/html; charset=utf-8",
@@ -470,7 +518,7 @@ fn interactive_session_records_one_continuous_video() {
     )]);
     let directory = tempfile::tempdir().unwrap();
     let artifacts = directory.path().join("artifacts");
-    let mut session = Session::start_recorded(&artifacts);
+    let mut session = Session::start_recorded(&chrome, &artifacts);
 
     assert_eq!(
         session.command(json!({
@@ -512,7 +560,7 @@ fn interactive_session_records_one_continuous_video() {
     assert!(recording.metadata().unwrap().len() > 1_000);
     let frames = directory.path().join("frames");
     std::fs::create_dir(&frames).unwrap();
-    let extracted = Command::new("ffmpeg")
+    let extracted = Command::new(&ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(&recording)
         .arg(frames.join("%03d.png"))
@@ -543,11 +591,10 @@ fn interactive_session_records_one_continuous_video() {
         full_viewport_frame,
         "recording never showed all four viewport corners"
     );
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn large_page_snapshot_is_bounded() {
+fn large_page_snapshot_is_bounded(chrome: PathBuf) -> Result<(), Failed> {
     let body = format!(
         "<!doctype html><title>Large snapshot</title><main>{}</main>",
         (0..400)
@@ -556,7 +603,7 @@ fn large_page_snapshot_is_bounded() {
     );
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", &body)]);
     let directory = tempfile::tempdir().unwrap();
-    let mut session = Session::start(&directory.path().join("artifacts"));
+    let mut session = Session::start(&chrome, &directory.path().join("artifacts"));
 
     assert_eq!(
         session.command(json!({
@@ -597,6 +644,7 @@ fn large_page_snapshot_is_bounded() {
         true
     );
     assert_exit(session.finish(), 0);
+    Ok(())
 }
 
 struct Session {
@@ -606,16 +654,15 @@ struct Session {
 }
 
 impl Session {
-    fn start(artifacts: &Path) -> Self {
-        Self::start_with_video(artifacts, "off")
+    fn start(chrome: &Path, artifacts: &Path) -> Self {
+        Self::start_with_video(chrome, artifacts, "off")
     }
 
-    fn start_recorded(artifacts: &Path) -> Self {
-        Self::start_with_video(artifacts, "on")
+    fn start_recorded(chrome: &Path, artifacts: &Path) -> Self {
+        Self::start_with_video(chrome, artifacts, "on")
     }
 
-    fn start_with_video(artifacts: &Path, video: &str) -> Self {
-        let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+    fn start_with_video(chrome: &Path, artifacts: &Path, video: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_playrust"))
             .args([
                 "session",

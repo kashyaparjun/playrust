@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc,
@@ -22,6 +22,16 @@ pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
         .envs(environment.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Pin the harness-resolved browser so the child uses resolution-only and
+    // never enters resolve_or_install_browser's download path.
+    let chrome_overridden = environment
+        .iter()
+        .any(|(key, _)| *key == playrust::install::CHROME_ENV);
+    if !chrome_overridden {
+        if let Some(path) = chrome_path() {
+            command.env(playrust::install::CHROME_ENV, path);
+        }
+    }
     output_with_timeout(command, Duration::from_secs(180))
 }
 
@@ -101,6 +111,35 @@ pub fn ffmpeg_path() -> String {
         .unwrap_or_else(|| "ffmpeg".into())
         .to_string_lossy()
         .into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Self-skipping helpers (issue #18)
+// ---------------------------------------------------------------------------
+
+pub mod harness;
+
+/// Returns the path to a usable Chrome for Testing binary, if available.
+///
+/// Resolution: `PLAYRUST_CHROME` env var → pinned version in project cache.
+pub fn chrome_path() -> Option<PathBuf> {
+    playrust::install::resolve_cached_browser()
+}
+
+fn ffprobe_name() -> String {
+    env::var_os("PLAYRUST_FFPROBE")
+        .unwrap_or_else(|| "ffprobe".into())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 pub struct FixtureServer {

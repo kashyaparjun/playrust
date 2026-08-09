@@ -1,14 +1,18 @@
+mod support;
+
 use std::collections::BTreeMap;
-use std::env;
+use std::path::PathBuf;
+
+use libtest_mimic::Failed;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+use support::harness;
 
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_file;
@@ -22,9 +26,16 @@ const HTML: &str = r#"<!doctype html><html><body>
 <p id="status">waiting</p>
 </body></html>"#;
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn predicates_repeats_retries_and_mapped_subflows_run_in_chrome() {
+fn main() {
+    harness::run(vec![harness::async_browser_trial(
+        "predicates_repeats_retries_and_mapped_subflows_run_in_chrome",
+        predicates_repeats_retries_and_mapped_subflows_run_in_chrome,
+    )]);
+}
+
+async fn predicates_repeats_retries_and_mapped_subflows_run_in_chrome(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -106,7 +117,6 @@ steps:
     .unwrap();
 
     let flow = compile_file(&root, &BTreeMap::new()).unwrap();
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let report = run_flow(
         &host,
@@ -119,4 +129,5 @@ steps:
     server.join().unwrap();
 
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
+    Ok(())
 }

@@ -71,6 +71,21 @@ Run `playrust browser install` to preinstall the browser. `playrust run` also
 installs pinned Chrome for Testing `151.0.7922.34` automatically if needed. You
 can instead provide that exact build with `--browser PATH` or `PLAYRUST_CHROME`.
 
+## Running browser tests
+
+Browser end-to-end tests run as part of `cargo test` when prerequisites are available. Install pinned Chrome for Testing once with `playrust browser install`, or set `PLAYRUST_CHROME` to the binary path. Video tests also need `ffmpeg` and `ffprobe` on `PATH` (or `PLAYRUST_FFMPEG` / `PLAYRUST_FFPROBE`).
+
+When Chrome or ffmpeg is missing, browser tests are reported as **ignored** in the `cargo test` summary (not passed). The full browser job list matches `.github/workflows/ci.yml` (`browser_smoke`, `session_e2e`, and the other local-fixture crates).
+
+Environment gates:
+
+- `PLAYRUST_REQUIRE_E2E=1` — strict mode used in CI; missing browser, ffmpeg, or live-e2e prerequisites **fail** the run instead of being ignored.
+- `PLAYRUST_LIVE_E2E=1` — required for the Wikipedia live-network tests (`wikipedia_*_e2e`).
+
+CI runs browser e2e with `--test-threads=4` (trial 2026-08-09: ephemeral fixture ports and temp artifact dirs; no flakes observed locally).
+
+Four library unit tests in `src/runner/tests.rs` touch private runner APIs, so they stay `#[ignore]` (real ignored counts, not false passes). CI's `browser-smoke` job runs them with `--include-ignored`, `PLAYRUST_REQUIRE_E2E=1`, and a real browser. Locally with Chrome: `cargo test --lib -- --include-ignored`. Integration e2e crates use libtest-mimic for runtime ignores.
+
 ## Agent sessions
 
 `playrust session --protocol ndjson` is the interactive agent interface. It eagerly opens one isolated Chromium context, reads one JSON command per stdin line, and writes one JSON response per stdout line; diagnostics go only to stderr. Every response contains the command `id`, `ok`, stable `session_id`, monotonically increasing `revision`, and either `result` or a structured `error`.

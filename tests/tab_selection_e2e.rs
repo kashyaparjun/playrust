@@ -1,9 +1,11 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use libtest_mimic::Failed;
+use support::harness;
 
 use playrust::browser::{BrowserHost, Viewport};
 use playrust::flow::compile_yaml;
@@ -19,10 +21,16 @@ const ROOT: &str = r#"<!doctype html><body>
 const NAMED: &str = r#"<!doctype html><body><p id="page">named</p></body>"#;
 const BY_URL: &str = r#"<!doctype html><body><p id="page">url</p></body>"#;
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn selects_named_and_exact_url_pages_inside_the_flow_context() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+fn main() {
+    harness::run(vec![harness::async_browser_trial(
+        "selects_named_and_exact_url_pages_inside_the_flow_context",
+        selects_named_and_exact_url_pages_inside_the_flow_context,
+    )]);
+}
+
+async fn selects_named_and_exact_url_pages_inside_the_flow_context(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(&[
         ("/", "text/html", ROOT),
         ("/named", "text/html", NAMED),
@@ -81,6 +89,7 @@ async fn selects_named_and_exact_url_pages_inside_the_flow_context() {
 
     host.dispose_context(other).await.unwrap();
     host.shutdown().await.unwrap();
+    Ok(())
 }
 
 async fn wait_for_flow_pages_to_close(

@@ -3,8 +3,9 @@ mod support;
 use std::fs;
 use std::path::Path;
 
+use libtest_mimic::Failed;
 use playrust::report::FlowStatus;
-use support::{assert_h264_video, assert_png, ffmpeg_path, playrust, read_report};
+use support::{assert_h264_video, assert_png, ffmpeg_path, harness, playrust, read_report};
 
 const FLOW: &str = r##"version: 1
 name: wikipedia-redaction-failure
@@ -21,15 +22,20 @@ steps:
       target: { css: "${missing_target}" }
 "##;
 
-#[test]
-#[ignore = "requires Wikipedia network access, pinned Chromium, FFmpeg, and ffprobe"]
-fn failed_flow_redacts_secrets_and_retains_debug_artifacts() {
+fn main() {
+    harness::run(vec![harness::live_wikipedia_trial(
+        "failed_flow_redacts_secrets_and_retains_debug_artifacts",
+        failed_flow_redacts_secrets_and_retains_debug_artifacts,
+    )]);
+}
+
+fn failed_flow_redacts_secrets_and_retains_debug_artifacts() -> Result<(), Failed> {
+    let ffmpeg = ffmpeg_path();
     let secret = "#playrust-wikipedia-secret-canary";
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("failure.yaml");
     let artifacts = directory.path().join("artifacts");
     fs::write(&flow, FLOW).expect("write failing flow");
-    let ffmpeg = ffmpeg_path();
     let output = playrust(
         &[
             "run",
@@ -74,4 +80,5 @@ fn failed_flow_redacts_secrets_and_retains_debug_artifacts() {
     assert_h264_video(Path::new(
         flow.artifacts.recording.as_deref().expect("recording"),
     ));
+    Ok(())
 }

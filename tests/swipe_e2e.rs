@@ -2,8 +2,9 @@ mod support;
 
 use std::fs;
 
+use libtest_mimic::Failed;
 use playrust::report::FlowStatus;
-use support::{FixtureServer, assert_success, playrust, read_report};
+use support::{FixtureServer, assert_success, harness, playrust, read_report};
 
 const HTML: &str = r#"<!doctype html><body><div id="card" style="margin:200px;width:200px;height:100px;background:#ccc">Swipe</div><p id="status">pending</p><script>
 let start;
@@ -13,9 +14,14 @@ card.addEventListener('mousedown', event => start = event.clientX);
 addEventListener('mouseup', event => result.textContent = event.clientX - start <= -100 ? 'swiped' : 'short');
 </script></body>"#;
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn swipes_once_from_an_actionable_target() {
+fn main() {
+    harness::run(vec![harness::browser_cli_trial(
+        "swipes_once_from_an_actionable_target",
+        swipes_once_from_an_actionable_target,
+    )]);
+}
+
+fn swipes_once_from_an_actionable_target() -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("swipe.yaml");
@@ -41,4 +47,5 @@ fn swipes_once_from_an_actionable_target() {
     server.shutdown();
     assert_success("run", &run);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+    Ok(())
 }

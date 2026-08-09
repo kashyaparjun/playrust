@@ -2,8 +2,9 @@ mod support;
 
 use std::fs;
 
+use libtest_mimic::Failed;
 use playrust::report::FlowStatus;
-use support::{FixtureServer, assert_success, playrust, read_report};
+use support::{FixtureServer, assert_success, harness, playrust, read_report};
 
 const HTML: &str = r#"<!doctype html><body><main id="list"></main><script>
 let page = 0;
@@ -17,9 +18,14 @@ addEventListener('wheel', event => { if (event.deltaY > 0) { page++; render(); }
 render();
 </script></body>"#;
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn scrolls_a_virtualized_list_until_the_target_exists() {
+fn main() {
+    harness::run(vec![harness::browser_cli_trial(
+        "scrolls_a_virtualized_list_until_the_target_exists",
+        scrolls_a_virtualized_list_until_the_target_exists,
+    )]);
+}
+
+fn scrolls_a_virtualized_list_until_the_target_exists() -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("scroll-until-visible.yaml");
@@ -45,4 +51,5 @@ fn scrolls_a_virtualized_list_until_the_target_exists() {
     server.shutdown();
     assert_success("run", &run);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+    Ok(())
 }

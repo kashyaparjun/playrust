@@ -1,25 +1,31 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use libtest_mimic::Failed;
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_yaml;
 use playrust::report::FlowStatus;
 use playrust::runner::{CancellationToken, RunOptions, run_flow};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
-use support::{FixtureServer, ffmpeg_path};
+use support::{FixtureServer, harness};
 
 const HTML: &str = r#"<!doctype html><html><body><button id="change" onclick="document.body.style.background='blue'">change</button></body></html>"#;
 const ROUTES: &[(&str, &str, &str)] = &[("/", "text/html", HTML)];
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
-async fn manual_recording_finalizes_on_stop_failure_and_cancellation() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
-    let ffmpeg = PathBuf::from(ffmpeg_path());
+fn main() {
+    harness::run(vec![harness::async_browser_video_trial(
+        "manual_recording_finalizes_on_stop_failure_and_cancellation",
+        manual_recording_finalizes_on_stop_failure_and_cancellation,
+    )]);
+}
+
+async fn manual_recording_finalizes_on_stop_failure_and_cancellation(
+    chrome: PathBuf,
+    ffmpeg: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(ROUTES);
     let host = BrowserHost::launch(chrome, false).await.unwrap();
 
@@ -119,6 +125,7 @@ async fn manual_recording_finalizes_on_stop_failure_and_cancellation() {
     assert_recording(&report.artifacts.recording);
 
     host.shutdown().await.unwrap();
+    Ok(())
 }
 
 async fn preflight(flow: &playrust::flow::CompiledFlow, ffmpeg: &Path, directory: &Path) {

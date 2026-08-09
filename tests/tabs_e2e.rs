@@ -1,9 +1,11 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use libtest_mimic::Failed;
+use support::harness;
 
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_yaml;
@@ -21,8 +23,20 @@ const POPUP: &str = r#"<!doctype html><html><body>
 <button id="locate" onclick="navigator.geolocation.getCurrentPosition(p => position.textContent = `${p.coords.latitude},${p.coords.longitude},${p.coords.accuracy}`)">Locate</button>
 </body></html>"#;
 
-#[test]
-fn page_switching_rejects_enabled_video() {
+fn main() {
+    harness::run(vec![
+        harness::plain_trial(
+            "page_switching_rejects_enabled_video",
+            page_switching_rejects_enabled_video,
+        ),
+        harness::async_browser_trial(
+            "popup_and_opener_switch_active_page_state",
+            popup_and_opener_switch_active_page_state,
+        ),
+    ]);
+}
+
+fn page_switching_rejects_enabled_video() -> Result<(), Failed> {
     let error = compile_yaml(
         "version: 1\nname: unsafe-video\nsteps: [{ switch_page: popup }]\n",
         "unsafe-video.yaml",
@@ -38,12 +52,10 @@ fn page_switching_rejects_enabled_video() {
     )
     .expect_err("named page switching must reject default-on video");
     assert!(error.to_string().contains("requires settings.video: off"));
+    Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn popup_and_opener_switch_active_page_state() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+async fn popup_and_opener_switch_active_page_state(chrome: PathBuf) -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html", ROOT), ("/popup", "text/html", POPUP)]);
     let source = format!(
         r##"version: 1
@@ -104,6 +116,7 @@ steps:
         "{:#?}",
         report.failures
     );
+    Ok(())
 }
 
 async fn wait_for_context_pages_to_close(host: &BrowserHost, origin: &str) {

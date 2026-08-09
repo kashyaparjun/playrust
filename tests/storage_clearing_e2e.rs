@@ -1,9 +1,11 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use libtest_mimic::Failed;
+use support::harness;
 
 use playrust::browser::{BrowserHost, Viewport};
 use playrust::flow::compile_yaml;
@@ -42,10 +44,16 @@ const ROUTES: &[(&str, &str, &str)] = &[
     ("/sw.js", "text/javascript", WORKER),
 ];
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-async fn extended_clear_targets_preserve_other_state_and_contexts() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+fn main() {
+    harness::run(vec![harness::async_browser_trial(
+        "extended_clear_targets_preserve_other_state_and_contexts",
+        extended_clear_targets_preserve_other_state_and_contexts,
+    )]);
+}
+
+async fn extended_clear_targets_preserve_other_state_and_contexts(
+    chrome: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(ROUTES);
     let source = format!(
         "version: 1\nname: storage-clearing\nbase_url: {}\nsettings: {{ video: off }}\nsteps:\n  - open: /\n  - assert: {{ text: {{ target: {{ css: '#status' }}, equals: ready }} }}\n  - clear: indexeddb\n  - clear: cache-storage\n  - clear: service-workers\n  - click: {{ target: {{ css: '#inspect' }} }}\n  - assert: {{ text: {{ target: {{ css: '#state' }}, equals: 'cookie=flow=present;local=present;session=present;db=0;cache=0;workers=0' }} }}\n",
@@ -98,4 +106,5 @@ async fn extended_clear_targets_preserve_other_state_and_contexts() {
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
     assert_eq!(other_state, vec![1, 1, 1]);
     assert_eq!(other_dom, "flow=present;present;present");
+    Ok(())
 }

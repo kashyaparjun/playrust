@@ -3,8 +3,11 @@ mod support;
 use std::fs;
 use std::path::Path;
 
+use libtest_mimic::Failed;
 use playrust::report::{AggregateStatus, FlowStatus};
-use support::{assert_h264_video, assert_png, assert_success, ffmpeg_path, playrust, read_report};
+use support::{
+    assert_h264_video, assert_png, assert_success, ffmpeg_path, harness, playrust, read_report,
+};
 
 const FLOW: &str = r##"version: 1
 name: wikipedia-search
@@ -53,9 +56,15 @@ steps:
       name: rust-article
 "##;
 
-#[test]
-#[ignore = "requires Wikipedia network access, pinned Chromium, FFmpeg, and ffprobe"]
-fn search_flow_exercises_interactions_assertions_and_default_video() {
+fn main() {
+    harness::run(vec![harness::live_wikipedia_trial(
+        "search_flow_exercises_interactions_assertions_and_default_video",
+        search_flow_exercises_interactions_assertions_and_default_video,
+    )]);
+}
+
+fn search_flow_exercises_interactions_assertions_and_default_video() -> Result<(), Failed> {
+    let ffmpeg = ffmpeg_path();
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("search.yaml");
     let artifacts = directory.path().join("artifacts");
@@ -72,7 +81,6 @@ fn search_flow_exercises_interactions_assertions_and_default_video() {
     );
     assert_success("check", &checked);
 
-    let ffmpeg = ffmpeg_path();
     let run = playrust(
         &[
             "run",
@@ -106,4 +114,5 @@ fn search_flow_exercises_interactions_assertions_and_default_video() {
     let junit = fs::read_to_string(artifacts.join("junit.xml")).expect("read JUnit report");
     assert!(junit.contains("tests=\"1\""), "{junit}");
     assert!(junit.contains("failures=\"0\""), "{junit}");
+    Ok(())
 }

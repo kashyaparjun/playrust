@@ -2,14 +2,20 @@ mod support;
 
 use std::fs;
 
+use libtest_mimic::Failed;
 use playrust::report::FlowStatus;
-use support::{FixtureServer, assert_success, playrust, read_report};
+use support::{FixtureServer, assert_success, harness, playrust, read_report};
 
 const HTML: &str = r#"<!doctype html><body><p id="late" hidden>ready</p><script>setTimeout(() => document.querySelector('#late').hidden = false, 300)</script></body>"#;
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn uses_the_explicit_step_timeout_for_visibility() {
+fn main() {
+    harness::run(vec![harness::browser_cli_trial(
+        "uses_the_explicit_step_timeout_for_visibility",
+        uses_the_explicit_step_timeout_for_visibility,
+    )]);
+}
+
+fn uses_the_explicit_step_timeout_for_visibility() -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("wait-until-visible.yaml");
@@ -35,4 +41,5 @@ fn uses_the_explicit_step_timeout_for_visibility() {
     server.shutdown();
     assert_success("run", &run);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+    Ok(())
 }

@@ -2,16 +2,28 @@ mod support;
 
 use std::fs;
 
+use libtest_mimic::Failed;
 use playrust::report::FlowStatus;
-use support::{FixtureServer, assert_success, playrust, read_report};
+use support::{FixtureServer, assert_success, harness, playrust, read_report};
 
 const HTML: &str = r#"<!doctype html><html><head><title>Fixture</title></head><body>
 <label for="result">Result</label><input id="result">
 </body></html>"#;
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn page_script_receives_separate_arguments_and_saves_a_flow_local_value() {
+fn main() {
+    harness::run(vec![
+        harness::browser_cli_trial(
+            "page_script_receives_separate_arguments_and_saves_a_flow_local_value",
+            page_script_receives_separate_arguments_and_saves_a_flow_local_value,
+        ),
+        harness::browser_cli_trial(
+            "runtime_script_failures_are_redacted_and_keep_subflow_provenance",
+            runtime_script_failures_are_redacted_and_keep_subflow_provenance,
+        ),
+    ]);
+}
+
+fn page_script_receives_separate_arguments_and_saves_a_flow_local_value() -> Result<(), Failed> {
     let server = FixtureServer::start_with(|_| (200, "text/html; charset=utf-8", HTML));
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("scripting.yaml");
@@ -64,11 +76,10 @@ steps:
     );
     assert_success("run scripting fixture", &output);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn runtime_script_failures_are_redacted_and_keep_subflow_provenance() {
+fn runtime_script_failures_are_redacted_and_keep_subflow_provenance() -> Result<(), Failed> {
     let server = FixtureServer::start_with(|_| (200, "text/html; charset=utf-8", HTML));
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("failure.yaml");
@@ -116,4 +127,5 @@ fn runtime_script_failures_are_redacted_and_keep_subflow_provenance() {
         fs::read_to_string(artifacts.join("report.json")).expect("read report")
     );
     assert!(!diagnostics.contains("runtime-canary"), "{diagnostics}");
+    Ok(())
 }

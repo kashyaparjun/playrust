@@ -30,3 +30,94 @@ tar = "0.4"
 zip = "4"
 tokio = { version = "1", features = ["full"] }
 url = "2"
+
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+[[test]]
+name = "advanced_selectors_e2e"
+harness = false
+
+[[test]]
+name = "browser_prerequisites_e2e"
+harness = false
+
+[[test]]
+name = "browser_smoke"
+harness = false
+
+[[test]]
+name = "flow_control_e2e"
+harness = false
+
+[[test]]
+name = "frames_e2e"
+harness = false
+
+[[test]]
+name = "http_e2e"
+harness = false
+
+[[test]]
+name = "long_press_e2e"
+harness = false
+
+[[test]]
+name = "pause_e2e"
+harness = false
+
+[[test]]
+name = "recording_controls_e2e"
+harness = false
+
+[[test]]
+name = "scripting_e2e"
+harness = false
+
+[[test]]
+name = "scroll_until_visible_e2e"
+harness = false
+
+[[test]]
+name = "session_e2e"
+harness = false
+
+[[test]]
+name = "storage_clearing_e2e"
+harness = false
+
+[[test]]
+name = "swipe_e2e"
+harness = false
+
+[[test]]
+name = "tab_selection_e2e"
+harness = false
+
+[[test]]
+name = "tabs_e2e"
+harness = false
+
+[[test]]
+name = "visual_assertion_e2e"
+harness = false
+
+[[test]]
+name = "wait_until_stable_e2e"
+harness = false
+
+[[test]]
+name = "wait_until_visible_e2e"
+harness = false
+
+[[test]]
+name = "wikipedia_failure_e2e"
+harness = false
+
+[[test]]
+name = "wikipedia_navigation_e2e"
+harness = false
+
+[[test]]
+name = "wikipedia_search_e2e"
+harness = false

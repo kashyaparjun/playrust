@@ -2,16 +2,22 @@ mod support;
 
 use std::fs;
 
+use libtest_mimic::Failed;
 use playrust::report::FlowStatus;
-use support::{FixtureServer, assert_success, playrust, read_report};
+use support::{FixtureServer, assert_success, harness, playrust, read_report};
 
 const HTML: &str = r#"<!doctype html><html><body>
 <label for="token">Token</label><input id="token">
 </body></html>"#;
 
-#[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
-fn http_setup_saves_bounded_json_for_later_page_values() {
+fn main() {
+    harness::run(vec![harness::browser_cli_trial(
+        "http_setup_saves_bounded_json_for_later_page_values",
+        http_setup_saves_bounded_json_for_later_page_values,
+    )]);
+}
+
+fn http_setup_saves_bounded_json_for_later_page_values() -> Result<(), Failed> {
     let server = FixtureServer::start_with(|request| {
         if request.starts_with("POST /setup ")
             && request.to_ascii_lowercase().contains("x-setup: yes")
@@ -65,4 +71,5 @@ steps:
     );
     assert_success("run HTTP fixture", &output);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+    Ok(())
 }

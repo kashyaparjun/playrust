@@ -1,25 +1,31 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use libtest_mimic::Failed;
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_yaml;
 use playrust::report::FlowStatus;
 use playrust::runner::{RunOptions, run_flow};
-use support::{FixtureServer, assert_h264_video, ffmpeg_path, video_duration};
+use support::{FixtureServer, assert_h264_video, harness, video_duration};
 
 const HTML: &str = "<!doctype html><html><body><h1>pause fixture</h1></body></html>";
 
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME, FFmpeg, and ffprobe"]
-async fn pause_adds_deliberate_dwell_time_to_a_recording() {
+fn main() {
+    harness::run(vec![harness::async_browser_video_trial(
+        "pause_adds_deliberate_dwell_time_to_a_recording",
+        pause_adds_deliberate_dwell_time_to_a_recording,
+    )]);
+}
+
+async fn pause_adds_deliberate_dwell_time_to_a_recording(
+    chrome: PathBuf,
+    ffmpeg: PathBuf,
+) -> Result<(), Failed> {
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
-    let ffmpeg = PathBuf::from(ffmpeg_path());
     let host = BrowserHost::launch(chrome, false).await.unwrap();
 
     let baseline = compile_recording_flow(&server, "baseline", None);
@@ -53,6 +59,7 @@ async fn pause_adds_deliberate_dwell_time_to_a_recording() {
     );
 
     host.shutdown().await.unwrap();
+    Ok(())
 }
 
 fn compile_recording_flow(
