@@ -1,4 +1,4 @@
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use super::{AggregateReport, AggregateStatus, FlowStatus};
 
@@ -206,16 +206,13 @@ fn push_artifact(
 }
 
 fn safe_relative_artifact(root: &Path, artifact: &Path) -> Option<String> {
-    // Artifact paths are often rooted at the report directory, either as an
-    // absolute path under `root` or as a cwd-relative path that still begins
-    // with `root` (the default `--artifacts playrust-artifacts` shape).
-    let path = match artifact.strip_prefix(root) {
-        Ok(stripped) => stripped,
-        Err(_) if artifact.is_absolute() => return None,
-        Err(_) => artifact,
-    };
-    if path.as_os_str().is_empty()
-        || path.components().any(|component| {
+    // Normalize relative/absolute mixtures (e.g. default `--artifacts playrust-artifacts`
+    // with an absolute artifact path) before computing the report-relative link.
+    let abs_root = absolute_path(root)?;
+    let abs_artifact = absolute_path(artifact)?;
+    let relative = abs_artifact.strip_prefix(&abs_root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
             matches!(
                 component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
@@ -224,11 +221,24 @@ fn safe_relative_artifact(root: &Path, artifact: &Path) -> Option<String> {
     {
         return None;
     }
-    let resolved = root.join(path);
-    if !resolved.is_file() {
+
+    // Follow symlinks and require the resolved target to stay under the report root.
+    let canon_root = abs_root.canonicalize().ok()?;
+    let canon_artifact = abs_artifact.canonicalize().ok()?;
+    if !canon_artifact.is_file() {
         return None;
     }
-    Some(path.to_string_lossy().replace('\\', "/"))
+    canon_artifact.strip_prefix(&canon_root).ok()?;
+
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn absolute_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_owned())
+    } else {
+        Some(std::env::current_dir().ok()?.join(path))
+    }
 }
 
 fn escape_html(value: &str) -> String {

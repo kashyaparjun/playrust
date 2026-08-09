@@ -890,6 +890,92 @@ mod tests {
     }
 
     #[test]
+    fn html_embeds_when_report_root_is_relative_and_artifact_paths_are_absolute() {
+        let root = PathBuf::from(format!(
+            "playrust-artifacts-html-mixed-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let abs_root = std::env::current_dir().unwrap().join(&root);
+        let screenshot = abs_root.join("flow-a").join("shot.png");
+        let recording = abs_root.join("flow-a").join("recording.mp4");
+        fs::create_dir_all(screenshot.parent().unwrap()).unwrap();
+        fs::write(&screenshot, b"png").unwrap();
+        fs::write(&recording, b"mp4").unwrap();
+        assert!(!root.is_absolute());
+        assert!(screenshot.is_absolute());
+
+        let mut artifact_report = flow(FlowStatus::Passed, None);
+        artifact_report.artifacts = ArtifactPaths {
+            directory: abs_root.join("flow-a").display().to_string(),
+            screenshots: vec![screenshot.display().to_string()],
+            recording: Some(recording.display().to_string()),
+            ..ArtifactPaths::default()
+        };
+        let report = AggregateReport::new(
+            RunnerInfo {
+                name: "playrust".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            1,
+            None,
+            1,
+            vec![artifact_report],
+        );
+
+        let html = html::render(&report, &root);
+
+        assert!(html.contains("href=\"flow-a/shot.png\""));
+        assert!(html.contains("src=\"flow-a/shot.png\""));
+        assert!(html.contains("href=\"flow-a/recording.mp4\">Open</a>"));
+        assert!(!html.contains("Missing artifact"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn html_rejects_symlink_artifacts_that_escape_report_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside.png");
+        fs::write(&outside, b"png").unwrap();
+        let root = directory.path().join("artifacts");
+        let link = root.join("flow-a").join("shot.png");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let mut artifact_report = flow(FlowStatus::Passed, None);
+        artifact_report.artifacts = ArtifactPaths {
+            directory: root.join("flow-a").display().to_string(),
+            screenshots: vec![link.display().to_string()],
+            ..ArtifactPaths::default()
+        };
+        let report = AggregateReport::new(
+            RunnerInfo {
+                name: "playrust".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            1,
+            None,
+            1,
+            vec![artifact_report],
+        );
+
+        let html = html::render(&report, &root);
+
+        assert!(html.contains("Missing artifact"));
+        assert!(!html.contains("src=\"flow-a/shot.png\""));
+        assert!(!html.contains("href=\"flow-a/shot.png\""));
+    }
+
+    #[test]
     fn html_is_published_at_fixed_destination() {
         let report = AggregateReport::new(
             RunnerInfo {
