@@ -205,6 +205,31 @@ pub struct RawSecret {
     pub env: String,
 }
 
+/// `open` accepts either a plain URL string (the legacy form) or a mapping
+/// with a `url` and an optional `wait_until` settle condition.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RawOpen {
+    Url(String),
+    Detailed(Box<RawOpenOptions>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawOpenOptions {
+    pub url: String,
+    pub wait_until: Option<RawSettle>,
+}
+
+/// A structured settle condition. Exactly one of `visible` or `stable` is
+/// expected; `compile_operation` validates this.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSettle {
+    pub visible: Option<RawLocator>,
+    pub stable: Option<RawLocator>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawStep {
@@ -217,7 +242,7 @@ pub struct RawStep {
     pub r#while: Option<RawWhile>,
     pub repeat: Option<usize>,
     pub retry: Option<usize>,
-    pub open: Option<String>,
+    pub open: Option<RawOpen>,
     pub click: Option<RawClick>,
     pub double_click: Option<RawClick>,
     pub fill: Option<RawFill>,
@@ -727,6 +752,7 @@ pub enum Expression {
 pub enum Operation {
     Open {
         url: Resolved<Url>,
+        settle: Option<SettleCondition>,
     },
     Click {
         target: Locator,
@@ -810,6 +836,17 @@ pub enum Operation {
         save_as: Option<String>,
     },
     Assert(Assertion),
+}
+
+/// A post-navigation settling condition attached to an `open` step.
+///
+/// The navigation step waits for document loading to complete and then, if a
+/// settle condition is present, waits for the condition to be satisfied before
+/// the step succeeds. Both phases are bounded by the normal step timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettleCondition {
+    Visible(Locator),
+    Stable(Locator),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2246,7 +2283,11 @@ fn compile_operation(
     }
 
     if let Some(raw) = step.open {
-        let value = interpolate(&format!("step {index} open"), &raw, inputs)?;
+        let (raw_url, raw_settle) = match raw {
+            RawOpen::Url(url) => (url, None),
+            RawOpen::Detailed(options) => (options.url, options.wait_until),
+        };
+        let value = interpolate(&format!("step {index} open"), &raw_url, inputs)?;
         require_non_empty(&format!("step {index} open"), value.expose())?;
         let (url, base_secret) = match Url::parse(value.expose()) {
             Ok(url) => (
@@ -2269,8 +2310,10 @@ fn compile_operation(
             }
             Err(_) => return invalid(format!("step {index} open is not a valid URL")),
         };
+        let settle = compile_settle(raw_settle, index, inputs)?;
         return Ok(Operation::Open {
             url: Resolved::new(url, value.secret || base_secret),
+            settle,
         });
     }
     if let Some(raw) = step.click {
@@ -2835,6 +2878,30 @@ fn compile_locator(
     inputs: &BTreeMap<String, Resolved<String>>,
 ) -> Result<Locator, FlowError> {
     compile_locator_at(raw, index, inputs, 0)
+}
+
+fn compile_settle(
+    raw: Option<RawSettle>,
+    index: usize,
+    inputs: &BTreeMap<String, Resolved<String>>,
+) -> Result<Option<SettleCondition>, FlowError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match (raw.visible, raw.stable) {
+        (Some(target), None) => Ok(Some(SettleCondition::Visible(compile_locator(
+            target, index, inputs,
+        )?))),
+        (None, Some(target)) => Ok(Some(SettleCondition::Stable(compile_locator(
+            target, index, inputs,
+        )?))),
+        (Some(_), Some(_)) => invalid(format!(
+            "step {index} open wait_until accepts exactly one of visible or stable"
+        )),
+        (None, None) => invalid(format!(
+            "step {index} open wait_until requires exactly one of visible or stable"
+        )),
+    }
 }
 
 fn compile_locator_at(

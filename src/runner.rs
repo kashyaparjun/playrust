@@ -48,8 +48,8 @@ use crate::flow::{
     Assertion, ClearTarget, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, GuardKind,
     Key, Locator, LocatorStrategy, MAX_RUNTIME_VALUE_BYTES, Modifier, NamedKey,
     NativeDialogResponse, Operation, PageSwitch, PresentationOverlays, RecordingControl, Redactor,
-    RelationKind, RelativePoint, Resolved, TextMatch, UrlExpectation, VideoMode, VisualExpectation,
-    When,
+    RelationKind, RelativePoint, Resolved, SettleCondition, TextMatch, UrlExpectation, VideoMode,
+    VisualExpectation, When,
 };
 use crate::locator::{
     Actionability, LocatorEngine, LocatorError, Observation, POLL_INTERVAL, ResolvedElement,
@@ -1802,9 +1802,13 @@ async fn execute_step(
         return Ok(None);
     }
     match &step.operation {
-        Operation::Open { url } => navigate(active, url.expose().as_str(), deadline)
-            .await
-            .map(|_| None),
+        Operation::Open { url, settle } => {
+            navigate(active, url.expose().as_str(), deadline).await?;
+            if let Some(settle) = settle {
+                settle_after_open(active, settle, deadline).await?;
+            }
+            Ok(None)
+        }
         Operation::Click { target, position } => {
             let element =
                 wait_actionable(active, target, Actionability::CLICK, *position, deadline).await?;
@@ -2424,6 +2428,44 @@ async fn navigate(active: &ActiveContext, url: &str, deadline: Instant) -> Resul
             );
         }
         sleep_until_poll(deadline).await;
+    }
+}
+
+async fn settle_after_open(
+    active: &ActiveContext,
+    settle: &SettleCondition,
+    deadline: Instant,
+) -> Result<(), StepError> {
+    let (target, requirements) = match settle {
+        SettleCondition::Visible(target) => (target, Actionability::VISIBLE),
+        SettleCondition::Stable(target) => (target, Actionability::STABLE),
+    };
+    active
+        .locator()
+        .wait_unique(target, requirements, None, deadline)
+        .await
+        .map_err(settle_locator_error)?;
+    Ok(())
+}
+
+fn settle_locator_error(error: LocatorError) -> StepError {
+    match error {
+        LocatorError::Timeout { last } => {
+            let category = match last {
+                Observation::NoMatch | Observation::Multiple { .. } => FailureCategory::Locator,
+                Observation::Unavailable { .. } => FailureCategory::Protocol,
+                _ => FailureCategory::Actionability,
+            };
+            StepError::new(
+                category,
+                "open settle condition was not satisfied before the step deadline",
+            )
+            .deadline()
+            .observed(last.to_string())
+        }
+        LocatorError::Protocol(message) | LocatorError::InvalidResponse(message) => {
+            StepError::new(FailureCategory::Protocol, message)
+        }
     }
 }
 

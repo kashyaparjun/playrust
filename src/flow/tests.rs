@@ -121,7 +121,7 @@ steps:
     assert_eq!(flow.steps.len(), 15);
     assert!(matches!(
         &flow.steps[0].operation,
-        Operation::Open { url } if url.expose().as_str() == "https://example.test/home"
+        Operation::Open { url, .. } if url.expose().as_str() == "https://example.test/home"
     ));
     assert!(matches!(
         &flow.steps[3].operation,
@@ -1066,7 +1066,7 @@ fn expands_nested_subflows_in_place_with_file_scoped_configuration() {
     assert_eq!(flow.steps[2].timeout, DEFAULT_TIMEOUT);
     assert!(matches!(
         &flow.steps[1].operation,
-        Operation::Open { url } if url.expose().as_str() == "https://child.test/base/page"
+        Operation::Open { url, .. } if url.expose().as_str() == "https://child.test/base/page"
     ));
     assert!(matches!(
         &flow.steps[2].operation,
@@ -1525,4 +1525,62 @@ fn run_retry_expands_only_across_assertion_only_subflows() {
         .unwrap_err()
         .to_string();
     assert!(message.contains("assertion-only subflow"), "{message}");
+}
+
+#[test]
+fn open_accepts_a_wait_until_visible_settle_condition() {
+    let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { url: /article, wait_until: { visible: { css: '#firstHeading' } } }\n";
+    let flow = compile(source).expect("compile");
+    let Operation::Open { url, settle } = &flow.steps[0].operation else {
+        panic!("expected open: {:?}", flow.steps[0].operation);
+    };
+    assert_eq!(url.expose().as_str(), "https://example.test/article");
+    assert!(matches!(settle, Some(SettleCondition::Visible(_))));
+}
+
+#[test]
+fn open_accepts_a_wait_until_stable_settle_condition() {
+    let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { url: /x, wait_until: { stable: { test_id: hero } } }\n";
+    let flow = compile(source).expect("compile");
+    let Operation::Open { url: _, settle } = &flow.steps[0].operation else {
+        panic!("expected open: {:?}", flow.steps[0].operation);
+    };
+    assert!(matches!(settle, Some(SettleCondition::Stable(_))));
+}
+
+#[test]
+fn open_settle_is_optional_and_backward_compatible() {
+    let source =
+        "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: /home\n";
+    let flow = compile(source).expect("compile");
+    assert!(matches!(
+        &flow.steps[0].operation,
+        Operation::Open { settle: None, .. }
+    ));
+}
+
+#[test]
+fn open_wait_until_rejects_both_visible_and_stable() {
+    let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { url: /x, wait_until: { visible: { css: a }, stable: { css: b } } }\n";
+    let message = error(source);
+    assert!(
+        message.contains("wait_until accepts exactly one of visible or stable"),
+        "{message}"
+    );
+}
+
+#[test]
+fn open_wait_until_rejects_an_empty_condition() {
+    let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { url: /x, wait_until: {} }\n";
+    let message = error(source);
+    assert!(
+        message.contains("wait_until requires exactly one of visible or stable"),
+        "{message}"
+    );
+}
+
+#[test]
+fn open_wait_until_requires_a_url() {
+    let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { wait_until: { visible: { css: a } } }\n";
+    assert!(compile(source).is_err());
 }

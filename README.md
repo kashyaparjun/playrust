@@ -216,6 +216,7 @@ Each file resolves its own `base_url`, default `settings.timeout`, `vars`, and `
 | Action | Form |
 | --- | --- |
 | Navigate | `open: /path` (requires `base_url`) or an absolute HTTP(S) URL |
+| Navigate and settle | `open: { url: /article, wait_until: { visible: { css: "#firstHeading" } } }` |
 | Click | `click: { target: { test_id: submit }, position: { x: 8, y: 12 } }` |
 | Click viewport point | `click: { point: { x: 100, y: 200 } }` |
 | Double click | `double_click: { target: { test_id: item }, position: { x: 8, y: 12 } }` |
@@ -253,6 +254,8 @@ Scroll sends one wheel input at the viewport center; positive values move right/
 `wait_until_visible` is the explicit positive visibility wait; set a longer step `timeout` when the normal flow timeout is too short. `wait_until_stable` waits for a unique visible target whose bounding box is unchanged across two polling samples. Both use the same locator polling and deadline diagnostics as actionability. Back navigates one browser-history entry and fails when there is no previous entry. Supported named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Delete`, arrow keys, `Home`, `End`, `PageUp`, and `PageDown`. A key may also be one printable non-whitespace character. Modifiers are `Alt`, `Control`, `Meta`, and `Shift`.
 
 `pause` adds deliberate dwell time after a page is ready, for example so a recorded demo remains readable. Unlike the readiness waits above, it does not inspect the page or wait for a condition. Its duration must be positive and at most `60s`; the step stops early with the normal interruption or timeout result when flow cancellation or its step deadline occurs. Pause is an action and cannot use assertion retries.
+
+`open` may take a structured form with `url` and an optional `wait_until` settle condition so that flows navigating through several pages do not each need a separate `wait_until_visible` step. `wait_until` accepts exactly one of `visible` or `stable`, each wrapping a locator that uses the same strategies as `wait_until_visible`/`wait_until_stable`. After navigation completes and `document.readyState` is non-`loading`, the settle condition is polled with the normal step `timeout` bounding both phases. A settle timeout is reported with the same locator/deadline diagnostics as a standalone wait, distinguished from a navigation timeout by the message `open settle condition was not satisfied before the step deadline`. The plain-string `open: /path` form remains valid and is unchanged.
 
 `dialog` responds to a pending native `alert`, `confirm`, `prompt`, or `beforeunload` dialog. Prompt text is optional and is valid only with `action: accept`. The step fails as an automation error when no dialog is pending.
 
