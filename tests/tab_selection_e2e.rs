@@ -1,8 +1,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use playrust::browser::{BrowserHost, Viewport};

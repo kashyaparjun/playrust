@@ -1,17 +1,15 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::Command;
 
 use playrust::browser::BrowserHost;
 use playrust::flow::{compile_yaml, compile_yaml_with_env};
 use playrust::report::FlowStatus;
 use playrust::runner::{RunOptions, run_flow};
-use support::{FixtureServer, ffmpeg_path};
+use support::FixtureServer;
 
 const SECRET: &str = "presentation-overlay-secret";
 const HTML: &str = r#"<!doctype html><html><body style="min-height:2000px">
@@ -86,7 +84,7 @@ steps:
     let report = run_flow(
         &host,
         &flow,
-        &RunOptions::new(directory.path()).with_ffmpeg(ffmpeg_path()),
+        &RunOptions::new(directory.path()).with_ffmpeg(&ffmpeg),
     )
     .await;
     assert_eq!(report.status, FlowStatus::Passed, "{:#?}", report.failures);
@@ -94,6 +92,7 @@ steps:
     assert_video_contains_synchronized_markers(
         Path::new(report.artifacts.recording.as_deref().unwrap()),
         directory.path(),
+        &ffmpeg,
     );
     host.shutdown().await.unwrap();
 }
@@ -146,7 +145,7 @@ async fn presentation_overlays_are_recording_only_and_do_not_change_screenshots(
     let plain = run_flow(
         &host,
         &compile_recording_flow("plain", "on", "{}", "  - screenshot: { name: page }\n"),
-        &RunOptions::new(directory.path().join("plain")).with_ffmpeg(ffmpeg_path()),
+        &RunOptions::new(directory.path().join("plain")).with_ffmpeg(&ffmpeg),
     )
     .await;
     let overlay = run_flow(
@@ -157,7 +156,7 @@ async fn presentation_overlays_are_recording_only_and_do_not_change_screenshots(
             "{ step: true, url: true, pointer: true }",
             "  - screenshot: { name: page }\n",
         ),
-        &RunOptions::new(directory.path().join("overlay")).with_ffmpeg(ffmpeg_path()),
+        &RunOptions::new(directory.path().join("overlay")).with_ffmpeg(&ffmpeg),
     )
     .await;
     assert_eq!(plain.status, FlowStatus::Passed, "{:#?}", plain.failures);
@@ -181,10 +180,10 @@ fn assert_recording(recording: &Option<String>) {
     assert!(path.metadata().unwrap().len() > 0);
 }
 
-fn assert_video_contains_synchronized_markers(recording: &Path, directory: &Path) {
+fn assert_video_contains_synchronized_markers(recording: &Path, directory: &Path, ffmpeg: &str) {
     let frames = directory.join("decoded-overlay-frames");
     fs::create_dir(&frames).unwrap();
-    let output = Command::new(ffmpeg_path())
+    let output = Command::new(ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(recording)
         .args(["-vf", "fps=15"])

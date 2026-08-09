@@ -1,7 +1,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,7 +9,7 @@ use playrust::flow::compile_yaml;
 use playrust::report::FlowStatus;
 use playrust::runner::{CancellationToken, RunOptions, run_flow};
 use playrust::video::{VideoConfig, preflight_ffmpeg};
-use support::{FixtureServer, ffmpeg_path};
+use support::FixtureServer;
 
 const HTML: &str = r#"<!doctype html><html><body><button id="change" onclick="document.body.style.background='blue'">change</button></body></html>"#;
 const ROUTES: &[(&str, &str, &str)] = &[("/", "text/html", HTML)];

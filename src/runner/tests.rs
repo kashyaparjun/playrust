@@ -13,14 +13,12 @@ fn require_browser(test_name: &str) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Ok(root) = install::cache_root() {
-        if let Ok(platform) = Platform::current() {
-            if let Ok(path) = install::cached_browser_path(&root, PINNED_CHROME_VERSION, platform) {
-                if path.is_file() {
-                    return Some(path);
-                }
-            }
-        }
+    if let Ok(root) = install::cache_root()
+        && let Ok(platform) = Platform::current()
+        && let Ok(path) = install::cached_browser_path(&root, PINNED_CHROME_VERSION, platform)
+        && path.is_file()
+    {
+        return Some(path);
     }
     if std::env::var_os("PLAYRUST_REQUIRE_BROWSER").is_some_and(|value| {
         !matches!(

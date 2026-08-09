@@ -1,8 +1,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
-use std::path::PathBuf;
 
 use playrust::browser::BrowserHost;
 use playrust::flow::compile_yaml;

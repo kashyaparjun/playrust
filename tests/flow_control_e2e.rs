@@ -1,10 +1,8 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
