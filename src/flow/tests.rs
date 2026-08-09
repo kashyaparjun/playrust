@@ -1716,6 +1716,22 @@ fn redactor_redacts_percent_encoded_secrets_in_both_space_forms() {
 }
 
 #[test]
+fn redactor_redacts_lowercase_percent_encoded_secrets() {
+    let mut redactor = Redactor::default();
+    redactor.add_secret("p@ss w0rd/x=y".to_owned());
+    let url = "https://api.test/?q=p%40ss%20w0rd%2fx%3dy&keep=visible";
+    let redacted = redactor.redact(url);
+    assert!(redacted.contains("[REDACTED]"), "{redacted}");
+    assert!(!redacted.contains("p%40ss%20w0rd%2fx%3dy"), "{redacted}");
+    assert!(redacted.contains("visible"));
+    let form = "grant_type=password&q=p%40ss+w0rd%2fx%3dy&keep=visible";
+    let redacted = redactor.redact(form);
+    assert!(redacted.contains("[REDACTED]"), "{redacted}");
+    assert!(!redacted.contains("p%40ss+w0rd%2fx%3dy"), "{redacted}");
+    assert!(redacted.contains("visible"));
+}
+
+#[test]
 fn redactor_redacts_base64_encoded_secrets_in_standard_and_urlsafe_alphabets() {
     let mut redactor = Redactor::default();
     redactor.add_secret("PLAINTEXT+SECRET/VALUE".to_owned());

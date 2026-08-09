@@ -143,8 +143,12 @@ impl Redactor {
 
     fn register_variants(&mut self, secret: &str) {
         self.variants.push(secret.to_owned());
-        self.variants.push(percent_encode(secret, false));
-        self.variants.push(percent_encode(secret, true));
+        // Percent-encoding hex digits are case-insensitive in URLs, but
+        // str::replace is not — register both cases for each space form.
+        self.variants.push(percent_encode(secret, false, false));
+        self.variants.push(percent_encode(secret, false, true));
+        self.variants.push(percent_encode(secret, true, false));
+        self.variants.push(percent_encode(secret, true, true));
         self.variants.push(STANDARD.encode(secret.as_bytes()));
         self.variants
             .push(STANDARD_NO_PAD.encode(secret.as_bytes()));
@@ -160,13 +164,15 @@ impl Redactor {
     }
 }
 
-fn percent_encode(value: &str, form: bool) -> String {
+fn percent_encode(value: &str, form: bool, lower_hex: bool) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             encoded.push(byte as char);
         } else if form && byte == b' ' {
             encoded.push('+');
+        } else if lower_hex {
+            encoded.push_str(&format!("%{byte:02x}"));
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
         }
