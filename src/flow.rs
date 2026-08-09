@@ -217,7 +217,7 @@ pub enum RawOpen {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawOpenOptions {
-    pub url: String,
+    pub url: Option<String>,
     pub wait_until: Option<RawSettle>,
 }
 
@@ -2285,7 +2285,12 @@ fn compile_operation(
     if let Some(raw) = step.open {
         let (raw_url, raw_settle) = match raw {
             RawOpen::Url(url) => (url, None),
-            RawOpen::Detailed(options) => (options.url, options.wait_until),
+            RawOpen::Detailed(options) => {
+                let Some(url) = options.url else {
+                    return invalid(format!("step {index} open requires url"));
+                };
+                (url, options.wait_until)
+            }
         };
         let value = interpolate(&format!("step {index} open"), &raw_url, inputs)?;
         require_non_empty(&format!("step {index} open"), value.expose())?;

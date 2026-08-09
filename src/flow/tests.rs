@@ -1560,6 +1560,19 @@ fn open_settle_is_optional_and_backward_compatible() {
 }
 
 #[test]
+fn open_accepts_a_structured_url_without_wait_until() {
+    let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { url: /home }\n";
+    let flow = compile(source).expect("compile");
+    assert!(matches!(
+        &flow.steps[0].operation,
+        Operation::Open {
+            settle: None,
+            url
+        } if url.expose().as_str() == "https://example.test/home"
+    ));
+}
+
+#[test]
 fn open_wait_until_rejects_both_visible_and_stable() {
     let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { url: /x, wait_until: { visible: { css: a }, stable: { css: b } } }\n";
     let message = error(source);
@@ -1582,5 +1595,6 @@ fn open_wait_until_rejects_an_empty_condition() {
 #[test]
 fn open_wait_until_requires_a_url() {
     let source = "version: 1\nname: settle\nbase_url: https://example.test/\nsteps:\n  - open: { wait_until: { visible: { css: a } } }\n";
-    assert!(compile(source).is_err());
+    let message = error(source);
+    assert!(message.contains("open requires url"), "{message}");
 }

@@ -21,6 +21,9 @@ const REDIRECT_HTML: &str =
 /// Final page after the client-side redirect.
 const DONE_HTML: &str = r#"<!doctype html><body><h1 id="done">arrived</h1></body>"#;
 
+/// Page whose target moves, then stops — same fixture shape as wait_until_stable_e2e.
+const MOVING_HTML: &str = r#"<!doctype html><style>#moving { width:100px; height:50px; background:#ccc; animation:move 600ms linear } @keyframes move { from { transform:translateX(0) } to { transform:translateX(300px) } }</style><body><div id="moving"></div><p id="status">moving</p><script>document.querySelector('#moving').addEventListener('animationend', () => document.querySelector('#status').textContent = 'stable')</script></body>"#;
+
 fn write_flow(
     directory: &std::path::Path,
     name: &str,
@@ -95,17 +98,26 @@ fn open_settle_timeout_is_reported_when_the_element_never_appears() {
     );
     let report = read_report(&artifacts);
     assert_eq!(report.flows[0].status, FlowStatus::Failed);
-    assert_eq!(
-        report.flows[0].failures[0].category,
-        FailureCategory::Locator
-    );
+    let failure = &report.flows[0].failures[0];
+    assert_eq!(failure.category, FailureCategory::Locator);
     assert!(
-        report.flows[0].failures[0]
+        failure
             .message
             .as_str()
             .contains("open settle condition was not satisfied before the step deadline"),
         "expected settle timeout message, got {}",
-        report.flows[0].failures[0].message
+        failure.message
+    );
+    let step = failure.step.as_ref().expect("step context");
+    assert_eq!(step.operation, "open");
+    assert_eq!(
+        step.locator.as_ref().map(|locator| locator.as_str()),
+        Some("css=\"#missing\"")
+    );
+    assert_eq!(failure.timeout_ms, Some(1000));
+    assert!(
+        failure.last_observed.is_some(),
+        "settle timeout should include last_observed"
     );
 }
 
@@ -150,6 +162,33 @@ fn open_settle_follows_a_client_side_redirect() {
         "open-settle-redirect",
         &server.url(),
         "  - timeout: 2s\n    open: { url: /, wait_until: { visible: { css: '#done' } } }\n",
+    );
+
+    let run = playrust(
+        &[
+            "run",
+            flow.to_str().unwrap(),
+            "--artifacts",
+            artifacts.to_str().unwrap(),
+        ],
+        &[],
+    );
+    server.shutdown();
+    assert_success("run", &run);
+    assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+fn open_settles_until_a_moving_element_becomes_stable() {
+    let server = FixtureServer::start(&[("/", "text/html", MOVING_HTML)]);
+    let directory = tempfile::tempdir().expect("create E2E directory");
+    let artifacts = directory.path().join("artifacts");
+    let flow = write_flow(
+        directory.path(),
+        "open-settle-stable",
+        &server.url(),
+        "  - timeout: 2s\n    open: { url: /, wait_until: { stable: { css: '#moving' } } }\n  - assert: { text: { target: { css: '#status' }, equals: stable } }\n",
     );
 
     let run = playrust(

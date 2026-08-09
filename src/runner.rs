@@ -1805,6 +1805,13 @@ async fn execute_step(
         Operation::Open { url, settle } => {
             navigate(active, url.expose().as_str(), deadline).await?;
             if let Some(settle) = settle {
+                if Instant::now() >= deadline {
+                    return Err(StepError::new(
+                        FailureCategory::Timeout,
+                        "navigation completed without enough remaining time for the open settle condition",
+                    )
+                    .deadline());
+                }
                 settle_after_open(active, settle, deadline).await?;
             }
             Ok(None)
@@ -4300,6 +4307,10 @@ fn operation_locator(operation: &Operation) -> Option<&Locator> {
         | Operation::SwitchFrame(FrameSwitch::Target(target))
         | Operation::Assert(Assertion::Text { target, .. }) => Some(target),
         Operation::Assert(Assertion::Visible(target) | Assertion::Hidden(target)) => Some(target),
+        Operation::Open {
+            settle: Some(SettleCondition::Visible(target) | SettleCondition::Stable(target)),
+            ..
+        } => Some(target),
         Operation::Open { .. }
         | Operation::ClickPoint { .. }
         | Operation::Scroll { .. }

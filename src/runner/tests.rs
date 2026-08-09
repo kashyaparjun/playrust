@@ -507,6 +507,32 @@ fn interaction_step_contexts_include_only_targeted_locators() {
 }
 
 #[test]
+fn open_settle_step_context_includes_the_settle_locator() {
+    let flow = compile_yaml_with_env(
+        "version: 1\nname: x\nbase_url: https://example.test/\nsteps:\n  - open: { url: /a, wait_until: { visible: { css: '#heading' } } }\n  - open: { url: /b, wait_until: { stable: { test_id: hero } } }\n  - open: /c\n",
+        "x.yaml",
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let visible = step_context(&flow, &flow.steps[0]);
+    assert_eq!(visible.operation, "open");
+    assert_eq!(
+        visible.locator.as_ref().map(SafeText::as_str),
+        Some("css=\"#heading\"")
+    );
+    let stable = step_context(&flow, &flow.steps[1]);
+    assert_eq!(stable.operation, "open");
+    assert_eq!(
+        stable.locator.as_ref().map(SafeText::as_str),
+        Some("test_id=\"hero\"")
+    );
+    let plain = step_context(&flow, &flow.steps[2]);
+    assert_eq!(plain.operation, "open");
+    assert!(plain.locator.is_none());
+}
+
+#[test]
 fn included_step_context_preserves_child_source_and_local_number() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root.yaml");
