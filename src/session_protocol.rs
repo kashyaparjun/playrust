@@ -26,6 +26,8 @@ use crate::session_snapshot::{ElementRef, ReferenceError};
 /// Maximum bytes before the newline in one NDJSON command envelope.
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
 
+const SESSION_NOT_OPEN_MESSAGE: &str = "the browser session is not open";
+
 #[derive(Debug)]
 pub struct SessionOptions {
     pub browser: PathBuf,
@@ -176,6 +178,11 @@ impl ProtocolState {
                 details,
             }),
         }
+    }
+
+    /// Recoverable error when the browser session is unavailable (for example after close).
+    fn not_started(&mut self, id: Value) -> Response {
+        self.error(id, "not_started", SESSION_NOT_OPEN_MESSAGE, None)
     }
 
     fn write_report(&self, chromium: &ChromiumInfo) -> anyhow::Result<()> {
@@ -431,12 +438,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     );
                 }
                 let Some(active_session) = session.as_mut() else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "the browser session is not open",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
@@ -635,12 +637,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 screenshot,
             } => {
                 let Some(opened) = &session else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before inspecting the session",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
@@ -678,12 +675,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 since,
             } => {
                 let Some(opened) = session.as_mut() else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before capturing a snapshot",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
@@ -806,12 +798,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
             }
             SessionCommand::Act { action } => {
                 let Some(opened) = session.as_mut() else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before acting",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
@@ -963,12 +950,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     continue;
                 }
                 let Some(opened) = session.as_mut() else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before scrolling",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
@@ -1028,12 +1010,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
             }
             SessionCommand::Dialog { action, text } => {
                 let Some(opened) = session.as_ref() else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before handling a dialog",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
@@ -1087,12 +1064,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     break;
                 }
                 let response = match session.as_ref() {
-                    None => state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before exporting a bundle",
-                        None,
-                    ),
+                    None => state.not_started(request.id),
                     Some(opened) => {
                         match export_bundle(&options.artifacts, &mut state, &name, opened) {
                             Ok(result) => state.response(request.id, result),
@@ -1137,16 +1109,13 @@ pub async fn run(options: SessionOptions) -> ExitCode {
             }
             SessionCommand::Close => {
                 let Some(session) = session.take() else {
-                    let response = state.error(
-                        request.id,
-                        "not_started",
-                        "submit a valid flow before closing the session",
-                        None,
-                    );
+                    let response = state.not_started(request.id);
                     if write_response(&mut stdout, &response).await.is_err() {
                         exit_code = ExitCode::Infrastructure;
                         break;
                     }
+                    // Nothing left to close; stop accepting further commands.
+                    close_session = true;
                     continue;
                 };
                 let mut close_result = match session.close(&host).await {
@@ -1905,5 +1874,51 @@ mod tests {
         };
         assert_eq!(state.response(json!(1), json!({})).revision, 1);
         assert_eq!(state.error(json!(2), "test", "failed", None).revision, 2);
+    }
+
+    #[test]
+    fn not_started_matches_protocol_contract_when_session_option_is_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("session.ndjson");
+        let mut state = ProtocolState {
+            id: "session".to_owned(),
+            revision: 0,
+            submissions: 0,
+            inspections: 0,
+            started: Instant::now(),
+            reports: Vec::new(),
+            artifacts: directory.path().to_owned(),
+            snapshot_count: 0,
+            journal: JournalWriter::open(&journal_path).unwrap(),
+            journal_path,
+            events: Vec::new(),
+            bundle: None,
+            artifact_error: None,
+        };
+        let mut session: Option<()> = None;
+        let response = match session.as_mut() {
+            Some(_) => panic!("expected no session"),
+            None => state.not_started(json!(7)),
+        };
+
+        assert!(!response.ok);
+        assert_eq!(response.id, json!(7));
+        assert_eq!(response.session_id, "session");
+        assert_eq!(response.revision, 1);
+        assert!(response.result.is_none());
+        let error = response.error.expect("error payload");
+        assert_eq!(error.code, "not_started");
+        assert_eq!(error.message, SESSION_NOT_OPEN_MESSAGE);
+        assert!(error.details.is_none());
+
+        // Defense-in-depth path stays recoverable: a later command can still get a
+        // structured not_started instead of panicking when Option is None.
+        session = None;
+        let again = match session.as_ref() {
+            Some(_) => panic!("expected no session"),
+            None => state.not_started(json!("close")),
+        };
+        assert_eq!(again.revision, 2);
+        assert_eq!(again.error.expect("error").code, "not_started");
     }
 }

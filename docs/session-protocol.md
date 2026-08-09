@@ -234,6 +234,7 @@ Stable protocol errors include:
 | `settings_conflict` | Submission viewport/geolocation conflicts with session settings. | Yes |
 | `busy` | Command is not allowed during an active submission. | Yes |
 | `not_active` | `cancel` arrived while no submission was active. | Yes |
+| `not_started` | Browser session is not open (for example after close). | Yes |
 | `output_not_found` | Named runtime output is unavailable. | Yes |
 | `dialog_pending` | A native dialog must be handled before mutation. | Yes |
 | `unknown_reference` | Ref was never issued by this session. | Yes |
