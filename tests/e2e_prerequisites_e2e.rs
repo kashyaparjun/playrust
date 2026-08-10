@@ -9,10 +9,10 @@ use support::{FixtureServer, chrome_env, chrome_path, require_browser, require_l
 
 #[test]
 fn chrome_path_resolves_playrust_chrome_env() {
-    let Some(_chrome) = require_browser("chrome_path_resolves_playrust_chrome_env") else {
+    let Some(chrome) = require_browser("chrome_path_resolves_playrust_chrome_env") else {
         return;
     };
-    let (key, value) = chrome_env(&chrome);
+    let (key, _value) = chrome_env(&chrome);
     let resolved = std::env::var_os(&key).map(PathBuf::from);
     assert_eq!(resolved.as_deref(), Some(chrome.as_path()));
     assert_eq!(chrome_path(), Some(chrome));
