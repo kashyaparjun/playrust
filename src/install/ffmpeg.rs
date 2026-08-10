@@ -4,10 +4,10 @@ use std::{
     fs::{self, File},
     io,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
+use liblzma::read::XzDecoder;
 use reqwest::Url;
 use tokio::io::AsyncWriteExt;
 
@@ -17,41 +17,82 @@ use super::{
 };
 
 pub const FFMPEG_ENV: &str = "PLAYRUST_FFMPEG";
+pub const FFPROBE_ENV: &str = "PLAYRUST_FFPROBE";
 pub const PINNED_FFMPEG_VERSION: &str = "7.1.5-12-g1fdbca85aa";
 
-const FFMPEG_BINARY: &str = if cfg!(windows) {
-    "ffmpeg.exe"
-} else {
-    "ffmpeg"
-};
 const VERSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
-struct FfmpegRelease {
+struct FfmpegArtifact {
     url: &'static str,
     sha256: &'static str,
+}
+
+struct FfmpegRelease {
+    /// Primary archive. For BtbN Linux/Windows this contains ffmpeg + ffprobe.
+    archive: FfmpegArtifact,
+    /// Optional second archive when ffprobe is shipped separately (macOS).
+    ffprobe_archive: Option<FfmpegArtifact>,
 }
 
 impl Platform {
     fn ffmpeg_release(self) -> FfmpegRelease {
         match self {
             Self::Linux64 => FfmpegRelease {
-                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz",
-                sha256: "6b1fe14ec5daa1385197d883491527e578479929ddb77456e296d5aa78c4b3b3",
+                archive: FfmpegArtifact {
+                    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz",
+                    sha256: "6b1fe14ec5daa1385197d883491527e578479929ddb77456e296d5aa78c4b3b3",
+                },
+                ffprobe_archive: None,
             },
             Self::Win64 => FfmpegRelease {
-                url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-7.1.zip",
-                sha256: "f82de4709d339c28f1e04d0b40c348f983becf5a3e11185a72c2bac4e6ba3b2d",
+                archive: FfmpegArtifact {
+                    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-7.1.zip",
+                    sha256: "f82de4709d339c28f1e04d0b40c348f983becf5a3e11185a72c2bac4e6ba3b2d",
+                },
+                ffprobe_archive: None,
             },
-            Self::MacArm64 | Self::MacX64 => FfmpegRelease {
-                url: "https://evermeet.cx/ffmpeg/ffmpeg-7.1.zip",
-                sha256: "5a1303c7babaffff3c32c141ff49c7f44bd3b3b3e7dcea992fd7d04b6558ef43",
+            // evermeet provides Intel-only macOS builds; also ship matching ffprobe.
+            Self::MacX64 => FfmpegRelease {
+                archive: FfmpegArtifact {
+                    url: "https://evermeet.cx/ffmpeg/ffmpeg-7.1.zip",
+                    sha256: "5a1303c7babaffff3c32c141ff49c7f44bd3b3b3e7dcea992fd7d04b6558ef43",
+                },
+                ffprobe_archive: Some(FfmpegArtifact {
+                    url: "https://evermeet.cx/ffmpeg/ffprobe-7.1.zip",
+                    sha256: "fc289c963346d7dc0891cbaed02ba270e8abec54df9259e22d59559018b25709",
+                }),
+            },
+            // Native Apple Silicon static builds (ZIP). evermeet is x86_64-only.
+            Self::MacArm64 => FfmpegRelease {
+                archive: FfmpegArtifact {
+                    url: "https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffmpeg.zip",
+                    sha256: "5267ef149ee0d208057a1b316aac079b661b0476574dee5da7d225769773c603",
+                },
+                ffprobe_archive: Some(FfmpegArtifact {
+                    url: "https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffprobe.zip",
+                    sha256: "7778fbb533fb60d3336cbd9a9e51eced71658f020b570c7203590c1c41d42f50",
+                }),
             },
         }
     }
 
     fn ffmpeg_platform_name(self) -> &'static str {
         self.chrome_for_testing_name()
+    }
+
+    fn ffmpeg_binary_name(self) -> &'static str {
+        match self {
+            Self::Win64 => "ffmpeg.exe",
+            Self::Linux64 | Self::MacArm64 | Self::MacX64 => "ffmpeg",
+        }
+    }
+
+    fn ffprobe_binary_name(self) -> &'static str {
+        match self {
+            Self::Win64 => "ffprobe.exe",
+            Self::Linux64 | Self::MacArm64 | Self::MacX64 => "ffprobe",
+        }
     }
 }
 
@@ -70,7 +111,19 @@ pub fn cached_ffmpeg_path(
     Ok(root
         .join(version)
         .join(platform.ffmpeg_platform_name())
-        .join(FFMPEG_BINARY))
+        .join(platform.ffmpeg_binary_name()))
+}
+
+pub fn cached_ffprobe_path(
+    root: &Path,
+    version: &str,
+    platform: Platform,
+) -> Result<PathBuf, InstallError> {
+    validate_component("FFmpeg version", version)?;
+    Ok(root
+        .join(version)
+        .join(platform.ffmpeg_platform_name())
+        .join(platform.ffprobe_binary_name()))
 }
 
 pub async fn resolve_or_install_ffmpeg(explicit: Option<&Path>) -> Result<PathBuf, InstallError> {
@@ -88,7 +141,7 @@ pub async fn resolve_or_install_ffmpeg(explicit: Option<&Path>) -> Result<PathBu
         return Ok(path);
     }
 
-    if let Some(path) = ffmpeg_on_path()
+    if let Some(path) = binary_on_path(Platform::current()?.ffmpeg_binary_name())
         && validate_ffmpeg_async(&path, "PATH").await.is_ok()
     {
         return Ok(path);
@@ -110,12 +163,16 @@ pub async fn install_ffmpeg() -> Result<PathBuf, InstallError> {
             other => other,
         })?;
     let cached = cached_ffmpeg_path(&root, PINNED_FFMPEG_VERSION, platform)?;
+    let cached_probe = cached_ffprobe_path(&root, PINNED_FFMPEG_VERSION, platform)?;
 
-    if cached.is_file() && validate_ffmpeg_async(&cached, "cache").await.is_ok() {
+    if cached.is_file()
+        && cached_probe.is_file()
+        && validate_ffmpeg_async(&cached, "cache").await.is_ok()
+    {
         return Ok(cached);
     }
 
-    if cached.exists() {
+    if cached.exists() || cached_probe.exists() {
         let platform_dir = root
             .join(PINNED_FFMPEG_VERSION)
             .join(platform.ffmpeg_platform_name());
@@ -138,10 +195,37 @@ pub async fn install_ffmpeg() -> Result<PathBuf, InstallError> {
         ))
     })?;
 
-    let archive_path = platform_dir.join(archive_file_name(release.url));
-    download_release(release, &archive_path).await?;
-    extract_ffmpeg(&archive_path, &cached)?;
+    let archive_path = platform_dir.join(archive_file_name(release.archive.url));
+    download_release(&release.archive, &archive_path).await?;
+    extract_named_binaries(
+        &archive_path,
+        platform,
+        &[
+            (platform.ffmpeg_binary_name(), &cached),
+            (platform.ffprobe_binary_name(), &cached_probe),
+        ],
+        release.ffprobe_archive.is_none(),
+    )?;
     let _ = fs::remove_file(&archive_path);
+
+    if let Some(ffprobe) = release.ffprobe_archive {
+        let probe_archive = platform_dir.join(archive_file_name(ffprobe.url));
+        download_release(&ffprobe, &probe_archive).await?;
+        extract_named_binaries(
+            &probe_archive,
+            platform,
+            &[(platform.ffprobe_binary_name(), &cached_probe)],
+            true,
+        )?;
+        let _ = fs::remove_file(&probe_archive);
+    }
+
+    if !cached_probe.is_file() {
+        return Err(InstallError::BinaryNotFound {
+            binary: platform.ffprobe_binary_name(),
+        });
+    }
+
     validate_ffmpeg_async(&cached, "installed cache").await?;
     Ok(cached)
 }
@@ -150,13 +234,18 @@ async fn cached_ffmpeg_if_valid() -> Result<Option<PathBuf>, InstallError> {
     let platform = Platform::current()?;
     let root = ffmpeg_cache_root()?;
     let cached = cached_ffmpeg_path(&root, PINNED_FFMPEG_VERSION, platform)?;
-    if cached.is_file() && validate_ffmpeg_async(&cached, "cache").await.is_ok() {
+    let probe = cached_ffprobe_path(&root, PINNED_FFMPEG_VERSION, platform)?;
+    if cached.is_file() && probe.is_file() && validate_ffmpeg_async(&cached, "cache").await.is_ok()
+    {
         return Ok(Some(cached));
     }
     Ok(None)
 }
 
-async fn download_release(release: FfmpegRelease, destination: &Path) -> Result<(), InstallError> {
+async fn download_release(
+    release: &FfmpegArtifact,
+    destination: &Path,
+) -> Result<(), InstallError> {
     let url = Url::parse(release.url).map_err(|error| {
         ffmpeg_install_error(format!(
             "invalid FFmpeg download URL {:?}: {error}",
@@ -210,13 +299,18 @@ async fn download_release(release: FfmpegRelease, destination: &Path) -> Result<
     Ok(())
 }
 
-fn extract_ffmpeg(archive: &Path, destination: &Path) -> Result<(), InstallError> {
+fn extract_named_binaries(
+    archive: &Path,
+    platform: Platform,
+    targets: &[(&str, &Path)],
+    require_all: bool,
+) -> Result<(), InstallError> {
     if let Some(name) = archive.file_name().and_then(|name| name.to_str()) {
         if name.ends_with(".zip") {
-            return extract_ffmpeg_from_zip(archive, destination);
+            return extract_from_zip(archive, targets, require_all);
         }
         if name.ends_with(".tar.xz") {
-            return extract_ffmpeg_from_tar_xz(archive, destination);
+            return extract_from_tar_xz(archive, platform, targets, require_all);
         }
     }
     Err(InstallError::UnsupportedArchive {
@@ -224,7 +318,19 @@ fn extract_ffmpeg(archive: &Path, destination: &Path) -> Result<(), InstallError
     })
 }
 
-fn extract_ffmpeg_from_zip(archive: &Path, destination: &Path) -> Result<(), InstallError> {
+fn missing_binary_label(name: &str) -> &'static str {
+    if name == "ffprobe" || name == "ffprobe.exe" {
+        "ffprobe"
+    } else {
+        "ffmpeg"
+    }
+}
+
+fn extract_from_zip(
+    archive: &Path,
+    targets: &[(&str, &Path)],
+    require_all: bool,
+) -> Result<(), InstallError> {
     let file = File::open(archive).map_err(|error| InstallError::ArchiveRead {
         path: archive.to_owned(),
         error,
@@ -233,6 +339,7 @@ fn extract_ffmpeg_from_zip(archive: &Path, destination: &Path) -> Result<(), Ins
         path: archive.to_owned(),
         error: io::Error::other(error),
     })?;
+    let mut found = vec![false; targets.len()];
     for index in 0..zip.len() {
         let mut entry = zip
             .by_index(index)
@@ -242,9 +349,14 @@ fn extract_ffmpeg_from_zip(archive: &Path, destination: &Path) -> Result<(), Ins
             })?;
         let path = PathBuf::from(entry.name());
         safe_archive_path(&path)?;
-        if entry.is_file() && path.file_name().and_then(|name| name.to_str()) == Some(FFMPEG_BINARY)
-        {
-            write_extracted_binary(destination, |output| {
+        if !entry.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some(target_index) = targets.iter().position(|(binary, _)| *binary == name) {
+            write_extracted_binary(targets[target_index].1, |output| {
                 io::copy(&mut entry, output).map(|_| ()).map_err(|error| {
                     InstallError::ReleaseInstall {
                         path: archive.to_owned(),
@@ -252,88 +364,87 @@ fn extract_ffmpeg_from_zip(archive: &Path, destination: &Path) -> Result<(), Ins
                     }
                 })
             })?;
-            return Ok(());
+            found[target_index] = true;
         }
     }
-    Err(InstallError::BinaryNotFound {
-        binary: FFMPEG_BINARY,
-    })
+    if require_all {
+        for ((binary, _), ok) in targets.iter().zip(found.iter()) {
+            if !*ok {
+                return Err(InstallError::BinaryNotFound {
+                    binary: missing_binary_label(binary),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
-fn extract_ffmpeg_from_tar_xz(archive: &Path, destination: &Path) -> Result<(), InstallError> {
-    let extract_dir = archive.parent().ok_or_else(|| {
-        ffmpeg_install_error("missing FFmpeg archive parent directory".to_owned())
-    })?;
-    let temp_extract = extract_dir.join(".extract-tmp");
-    if temp_extract.exists() {
-        fs::remove_dir_all(&temp_extract).map_err(|error| InstallError::ReleaseInstall {
-            path: temp_extract.clone(),
-            error,
-        })?;
-    }
-    fs::create_dir_all(&temp_extract).map_err(|error| InstallError::ReleaseInstall {
-        path: temp_extract.clone(),
+fn extract_from_tar_xz(
+    archive: &Path,
+    platform: Platform,
+    targets: &[(&str, &Path)],
+    require_all: bool,
+) -> Result<(), InstallError> {
+    let file = File::open(archive).map_err(|error| InstallError::ArchiveRead {
+        path: archive.to_owned(),
         error,
     })?;
-
-    let status = Command::new("tar")
-        .args(["-xJf"])
-        .arg(archive)
-        .arg("-C")
-        .arg(&temp_extract)
-        .status()
+    let decoder = XzDecoder::new(file);
+    let mut tar = tar::Archive::new(decoder);
+    let mut found = vec![false; targets.len()];
+    for entry in tar
+        .entries()
         .map_err(|error| InstallError::ReleaseInstall {
             path: archive.to_owned(),
             error,
-        })?;
-    if !status.success() {
-        let _ = fs::remove_dir_all(&temp_extract);
-        return Err(InstallError::ReleaseInstall {
+        })?
+    {
+        let mut entry = entry.map_err(|error| InstallError::ReleaseInstall {
             path: archive.to_owned(),
-            error: io::Error::other(format!("tar -xJf exited with status {status}")),
-        });
-    }
-
-    let found = find_file_named(&temp_extract).inspect_err(|_error| {
-        let _ = fs::remove_dir_all(&temp_extract);
-    })?;
-    let result = write_extracted_binary(destination, |output| {
-        let mut input = File::open(&found).map_err(|error| InstallError::ReleaseInstall {
-            path: found.clone(),
             error,
         })?;
-        io::copy(&mut input, output)
-            .map(|_| ())
-            .map_err(|error| InstallError::ReleaseInstall {
-                path: destination.to_owned(),
-                error,
-            })
-    });
-    let _ = fs::remove_dir_all(&temp_extract);
-    result
-}
-
-fn find_file_named(root: &Path) -> Result<PathBuf, InstallError> {
-    for entry in fs::read_dir(root).map_err(|error| InstallError::ReleaseInstall {
-        path: root.to_owned(),
-        error,
-    })? {
-        let entry = entry.map_err(|error| InstallError::ReleaseInstall {
-            path: root.to_owned(),
+        let path = entry.path().map_err(|error| InstallError::ReleaseInstall {
+            path: archive.to_owned(),
             error,
         })?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Ok(found) = find_file_named(&path) {
-                return Ok(found);
+        safe_archive_path(path.as_ref())?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some(target_index) = targets.iter().position(|(binary, _)| *binary == name) {
+            // Avoid holding the tar entry path borrow across the write.
+            let destination = targets[target_index].1.to_owned();
+            write_extracted_binary(&destination, |output| {
+                io::copy(&mut entry, output).map(|_| ()).map_err(|error| {
+                    InstallError::ReleaseInstall {
+                        path: archive.to_owned(),
+                        error,
+                    }
+                })
+            })?;
+            found[target_index] = true;
+            if found.iter().all(|ok| *ok) {
+                break;
             }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(FFMPEG_BINARY) {
-            return Ok(path);
         }
     }
-    Err(InstallError::BinaryNotFound {
-        binary: FFMPEG_BINARY,
-    })
+    if require_all {
+        for ((binary, _), ok) in targets.iter().zip(found.iter()) {
+            if !*ok {
+                return Err(InstallError::BinaryNotFound {
+                    binary: missing_binary_label(binary),
+                });
+            }
+        }
+    } else if !found.iter().any(|ok| *ok) {
+        return Err(InstallError::BinaryNotFound {
+            binary: platform.ffmpeg_binary_name(),
+        });
+    }
+    Ok(())
 }
 
 fn write_extracted_binary(
@@ -370,8 +481,8 @@ fn archive_file_name(url: &str) -> String {
         .unwrap_or_else(|| "ffmpeg-archive".to_owned())
 }
 
-fn ffmpeg_on_path() -> Option<PathBuf> {
-    let name = OsStr::new(FFMPEG_BINARY);
+fn binary_on_path(name: &str) -> Option<PathBuf> {
+    let name = OsStr::new(name);
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths).find_map(|directory| {
             let candidate = directory.join(name);
@@ -453,7 +564,9 @@ fn validate_ffmpeg_output(
 fn ffmpeg_install_error(error: impl std::fmt::Display) -> InstallError {
     InstallError::FfmpegInstall {
         version: PINNED_FFMPEG_VERSION,
-        error: error.to_string(),
+        error: format!(
+            "{error}; run `playrust ffmpeg install`, pass --ffmpeg-path PATH, or set {FFMPEG_ENV}"
+        ),
     }
 }
 
@@ -462,11 +575,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_platform_cache_paths() {
+    fn builds_platform_cache_paths_from_platform_argument() {
         let root = Path::new("cache");
         assert_eq!(
             cached_ffmpeg_path(root, PINNED_FFMPEG_VERSION, Platform::Linux64).unwrap(),
             root.join(PINNED_FFMPEG_VERSION).join("linux64/ffmpeg")
+        );
+        assert_eq!(
+            cached_ffmpeg_path(root, PINNED_FFMPEG_VERSION, Platform::Win64).unwrap(),
+            root.join(PINNED_FFMPEG_VERSION).join("win64/ffmpeg.exe")
+        );
+        assert_eq!(
+            cached_ffprobe_path(root, PINNED_FFMPEG_VERSION, Platform::Linux64).unwrap(),
+            root.join(PINNED_FFMPEG_VERSION).join("linux64/ffprobe")
+        );
+        assert_eq!(
+            cached_ffprobe_path(root, PINNED_FFMPEG_VERSION, Platform::Win64).unwrap(),
+            root.join(PINNED_FFMPEG_VERSION).join("win64/ffprobe.exe")
         );
     }
 
