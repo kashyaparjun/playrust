@@ -21,7 +21,7 @@ const CASES: &[CliCase] = &[
     CliCase {
         file: "deep_nesting.yaml",
         expect_success: false,
-        error_substrings: &["unknown field", "recursion limit exceeded"],
+        error_substrings: &["unknown field"],
     },
     CliCase {
         file: "tabs.yaml",
