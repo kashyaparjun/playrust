@@ -20,7 +20,7 @@ fn check_compile_and_library_paths_remain_available_after_refactor() {
 
     let flow = compile_file("examples/showcase/01-login.yaml", &BTreeMap::new())
         .expect("compile via flow module");
-    assert_eq!(flow.name, "login");
+    assert_eq!(flow.name, "showcase-login");
 
     let inline = compile_yaml(
         "version: 1\nname: inline\nsteps: [{ pause: 1ms }]\n",
