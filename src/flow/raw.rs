@@ -1,8 +1,7 @@
 use super::compiled::PresentationOverlays;
-use super::{Resolved, invalid};
+use super::Resolved;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use url::Url;
 
 #[derive(Debug, Clone, Deserialize)]

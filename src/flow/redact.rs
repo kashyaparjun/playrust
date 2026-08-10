@@ -1,5 +1,5 @@
 pub const REDACTED: &str = "[REDACTED]";
-use super::{MIN_SECRET_LEN, Resolved, meets_min_secret_len};
+use super::{Resolved, meets_min_secret_len};
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},

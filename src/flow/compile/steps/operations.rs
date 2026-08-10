@@ -1,8 +1,8 @@
 use super::super::super::compiled::Viewport;
 use super::super::super::compiled::{
-    Assertion, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, Guard, GuardKind,
-    Locator, LocatorRelation, LocatorStrategy, Operation, RelationKind, RuntimeValue,
-    SettleCondition, UrlExpectation, VisualExpectation, When,
+    Assertion, FrameSwitch,
+    Locator, LocatorRelation, LocatorStrategy, Operation, RelationKind,
+    SettleCondition, UrlExpectation, VisualExpectation,
 };
 use super::super::super::duration::parse_duration;
 use super::super::super::interpolate::{
@@ -13,26 +13,20 @@ use super::super::super::parse::{
     parse_absolute_url, parse_key, parse_modifier, parse_url_path, validate_http_url,
 };
 use super::super::super::raw::*;
-use super::super::super::redact::Redactor;
 use super::super::super::validate::{
-    is_windows_reserved_name, validate_baseline_path, validate_count, validate_crop,
-    validate_gesture_delta, validate_input_name, validate_screenshot_name,
+    validate_baseline_path, validate_crop,
+    validate_gesture_delta, validate_screenshot_name,
 };
 use super::super::super::{
-    DEFAULT_LONG_PRESS_DURATION, DEFAULT_SWIPE_DURATION, DEFAULT_TIMEOUT, FlowError,
-    MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_NODES, MAX_FLOW_STEPS, MAX_GESTURE_DURATION,
-    MAX_HTTP_HEADERS, MAX_LOCATOR_DEPTH, MAX_PAUSE_DURATION, MAX_REPEAT, MAX_RETRIES,
-    MAX_WHILE_ITERATIONS, MIN_SECRET_LEN, Resolved, invalid, meets_min_secret_len,
+    DEFAULT_LONG_PRESS_DURATION, DEFAULT_SWIPE_DURATION, FlowError, MAX_GESTURE_DURATION,
+    MAX_HTTP_HEADERS, MAX_LOCATOR_DEPTH, MAX_PAUSE_DURATION, Resolved, invalid,
     require_non_empty, require_scalar_size,
 };
-use crate::browser::Geolocation;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
-use super::control::CompiledWhen;
-use super::control::{compile_expression, compile_run_vars, compile_when, compile_while};
 
 pub(crate) fn compile_operation(
     step: RawStep,

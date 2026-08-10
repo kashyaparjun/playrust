@@ -4,7 +4,7 @@ use super::raw::{RawFlow, VideoMode};
 use super::validate::{
     validate_expanded_steps, validate_expanded_steps_with_outputs, validate_page_switching_video,
 };
-use super::{FlowError, MAX_FLOW_SOURCE_BYTES, invalid, require_source_size, with_path};
+use super::{FlowError, invalid, require_source_size};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};

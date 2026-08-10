@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;

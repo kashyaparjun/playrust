@@ -7,7 +7,10 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use playrust::browser::BrowserHost;
-use playrust::flow::{compile_file, compile_yaml};
+use playrust::flow::{
+    FrameLocation, PageLocation, RawLocator, RawSettings, RawStep, RawVariable, RawViewport,
+    ViewportPoint, compile_file, compile_yaml,
+};
 use playrust::report::FlowStatus;
 use playrust::runner::{RunOptions, run_flow};
 use serde_json::{Value, json};
@@ -29,6 +32,33 @@ fn check_compile_and_library_paths_remain_available_after_refactor() {
     )
     .expect("compile inline yaml");
     assert_eq!(inline.steps.len(), 1);
+
+    // Prior public raw/surface paths must remain reachable after the split.
+    let _: Option<RawSettings> = None;
+    let _: Option<RawStep> = None;
+    let _: Option<RawLocator> = None;
+    let _: Option<RawViewport> = None;
+    let _: Option<RawVariable> = None;
+    let _: Option<PageLocation> = None;
+    let _: Option<FrameLocation> = None;
+    let _: Option<ViewportPoint> = None;
+    let settings = RawSettings {
+        timeout: None,
+        viewport: Some(RawViewport {
+            width: 1280,
+            height: 720,
+        }),
+        video: None,
+        geolocation: None,
+        overlays: None,
+    };
+    assert!(settings.viewport.is_some());
+    let _ = (
+        RawVariable::Literal("x".into()),
+        PageLocation::Popup,
+        FrameLocation::Main,
+        ViewportPoint { x: 1, y: 2 },
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -85,7 +115,7 @@ fn decomposed_session_protocol_handles_act_and_snapshot() {
 }
 
 struct Session {
-    child: std::process::Child,
+    child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
 }

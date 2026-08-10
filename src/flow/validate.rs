@@ -2,16 +2,13 @@ use super::compiled::{
     CompiledFlow, CompiledStep, Crop, Expression, Guard, GuardKind, Operation, RuntimeValue,
     Viewport, When,
 };
-use super::duration::parse_duration;
-use super::interpolate::interpolate;
 use super::raw::{RawCrop, RecordingControl, VideoMode};
 use super::{
-    FlowError, MAX_FLOW_STEPS, MAX_GESTURE_DELTA, MAX_GESTURE_DURATION, MAX_RETRIES, Resolved,
+    FlowError, MAX_GESTURE_DELTA,
     invalid, is_subflow, require_non_empty, require_scalar_size,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub(crate) fn validate_subflow_path(
     run: &str,

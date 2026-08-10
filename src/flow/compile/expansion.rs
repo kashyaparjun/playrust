@@ -1,5 +1,5 @@
 use super::super::compiled::{
-    CompiledFlow, CompiledStep, Guard, GuardKind, Operation, Viewport, When,
+    CompiledFlow, Guard, GuardKind, Operation, Viewport, When,
 };
 use super::super::parse::read_flow;
 use super::super::raw::{RawFlow, RawRun, RawViewport, VideoMode};

@@ -4,7 +4,7 @@ use super::raw::{
     VideoMode, ViewportPoint,
 };
 use super::redact::{REDACTED, Redactor};
-use super::{FlowError, Resolved, invalid};
+use super::{FlowError, Resolved};
 use crate::browser::Geolocation;
 use serde::Deserialize;
 use serde_json::Value;

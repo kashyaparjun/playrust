@@ -1,12 +1,11 @@
 use super::compiled::{Key, Modifier, NamedKey};
 use super::raw::RawFlow;
 use super::{
-    FlowError, MAX_FLOW_SOURCE_BYTES, Resolved, discover_directory, invalid, is_subflow, is_yaml,
-    normalized_path, require_non_empty, require_scalar_size, require_source_size, with_path,
+    FlowError, MAX_FLOW_SOURCE_BYTES, Resolved, discover_directory, invalid, is_yaml,
+    normalized_path, require_source_size, with_path,
 };
 use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};

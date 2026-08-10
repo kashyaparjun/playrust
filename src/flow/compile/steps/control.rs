@@ -1,40 +1,32 @@
 use super::super::super::compiled::Viewport;
 use super::super::super::compiled::{
-    Assertion, CompiledFlow, CompiledStep, Crop, Expression, FrameSwitch, Guard, GuardKind,
-    Locator, LocatorRelation, LocatorStrategy, Operation, RelationKind, RuntimeValue,
-    SettleCondition, UrlExpectation, VisualExpectation, When,
+    CompiledFlow, CompiledStep, Expression, Guard, GuardKind, Operation, When,
 };
 use super::super::super::duration::parse_duration;
 use super::super::super::interpolate::{
-    compile_runtime_value, compile_save_as, interpolate, interpolate_non_empty,
+    compile_runtime_value, interpolate,
     interpolate_non_secret,
 };
-use super::super::super::parse::{
-    parse_absolute_url, parse_key, parse_modifier, parse_url_path, validate_http_url,
-};
+use super::super::super::parse::parse_absolute_url;
 use super::super::super::raw::*;
 use super::super::super::redact::Redactor;
 use super::super::super::validate::{
-    is_windows_reserved_name, validate_baseline_path, validate_count, validate_crop,
-    validate_gesture_delta, validate_input_name, validate_screenshot_name,
+    validate_count, validate_input_name,
 };
 use super::super::super::{
-    DEFAULT_LONG_PRESS_DURATION, DEFAULT_SWIPE_DURATION, DEFAULT_TIMEOUT, FlowError,
-    MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_NODES, MAX_FLOW_STEPS, MAX_GESTURE_DURATION,
-    MAX_HTTP_HEADERS, MAX_LOCATOR_DEPTH, MAX_PAUSE_DURATION, MAX_REPEAT, MAX_RETRIES,
+    DEFAULT_TIMEOUT, FlowError,
+    MAX_EXPRESSION_DEPTH, MAX_EXPRESSION_NODES, MAX_FLOW_STEPS, MAX_REPEAT, MAX_RETRIES,
     MAX_WHILE_ITERATIONS, MIN_SECRET_LEN, Resolved, invalid, meets_min_secret_len,
     require_non_empty, require_scalar_size,
 };
 use crate::browser::Geolocation;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-use url::Url;
+use std::path::PathBuf;
 
 use super::super::super::compiled::FlowSettings;
 use super::operations::{
-    compile_assertion, compile_gesture_duration, compile_locator, compile_locator_at,
-    compile_operation, compile_settle,
+    compile_locator,
+    compile_operation,
 };
 
 pub(crate) fn compile_raw_inner(
