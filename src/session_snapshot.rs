@@ -358,11 +358,12 @@ impl SnapshotStore {
             .iter()
             .enumerate()
             .map(|(index, element)| {
-                u64::try_from(index)
-                    .map_err(|_| SnapshotError::ReferenceExhausted)
-                    .map(|index| (element.identity.clone(), ElementRef(first_ref + index)))
+                (
+                    element.identity.clone(),
+                    ElementRef(first_ref + u64::try_from(index).expect("element count fits u64")),
+                )
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .collect::<BTreeMap<_, _>>();
         let mut latest = BTreeMap::new();
         let mut stored = BTreeMap::new();
         let elements = capture

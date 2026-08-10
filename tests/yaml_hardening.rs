@@ -1,80 +1,65 @@
 //! Adversarial YAML corpus and property tests for the serde-saphyr trust boundary.
 
+mod support;
+
 use playrust::flow::{
     FlowError, MAX_FLOW_SOURCE_BYTES, MAX_SCALAR_BYTES, compile_yaml_with_env, parse_yaml,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;
-use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{YAML_ADVERSARIAL_FILES, read_yaml_fixture};
 
-const FIXTURE_DIR: &str = "tests/fixtures/yaml";
-const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock / receive timeout for corpus parses (spec: 2s per file).
 const FIXTURE_WALL_CLOCK_BOUND: Duration = Duration::from_secs(2);
 
-struct FixtureCase {
+struct FixtureOutcome {
     file: &'static str,
     expect_ok: bool,
     error_substrings: &'static [&'static str],
 }
 
-const FIXTURES: &[FixtureCase] = &[
-    FixtureCase {
+/// Parser-layer expectations keyed by shared fixture names.
+const PARSER_OUTCOMES: &[FixtureOutcome] = &[
+    FixtureOutcome {
         file: "alias_bomb.yaml",
         expect_ok: false,
         error_substrings: &["alias expansion limit exceeded"],
     },
-    FixtureCase {
+    FixtureOutcome {
         file: "deep_nesting.yaml",
         expect_ok: false,
         error_substrings: &["unknown field", "recursion limit exceeded"],
     },
-    FixtureCase {
+    FixtureOutcome {
         file: "large_scalar.yaml",
         expect_ok: true,
         error_substrings: &[],
     },
-    FixtureCase {
+    FixtureOutcome {
         file: "tabs.yaml",
         expect_ok: false,
         error_substrings: &["valid YAML whitespace"],
     },
-    FixtureCase {
+    FixtureOutcome {
         file: "bom_crlf.yaml",
         expect_ok: true,
         error_substrings: &[],
     },
-    FixtureCase {
+    FixtureOutcome {
         file: "duplicate_keys_at_depth.yaml",
         expect_ok: false,
         error_substrings: &["duplicate mapping key"],
     },
-    FixtureCase {
+    FixtureOutcome {
         file: "merge_keys.yaml",
         expect_ok: false,
         error_substrings: &["merge keys are not allowed"],
     },
 ];
-
-fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(FIXTURE_DIR)
-        .join(name)
-}
-
-fn read_fixture(name: &str) -> String {
-    let bytes = fs::read(fixture_path(name)).unwrap_or_else(|error| {
-        panic!("failed to read fixture {name}: {error}");
-    });
-    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-    String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| {
-        panic!("fixture {name} is not valid UTF-8: {error}");
-    })
-}
 
 enum BoundedParse {
     Ok,
@@ -86,12 +71,12 @@ enum BoundedParse {
 fn parse_fixture_bounded(source: &str, timeout: Duration) -> (BoundedParse, Duration) {
     let source = source.to_owned();
     let (tx, rx) = mpsc::channel();
+    let started = Instant::now();
     thread::spawn(move || {
         let outcome = catch_unwind(AssertUnwindSafe(|| parse_yaml(&source)));
         let _ = tx.send(outcome);
     });
 
-    let started = Instant::now();
     let bounded = match rx.recv_timeout(timeout) {
         Ok(Ok(Ok(_))) => BoundedParse::Ok,
         Ok(Ok(Err(error))) => BoundedParse::YamlError(match error {
@@ -119,22 +104,26 @@ fn assert_structured_yaml_error(message: &str, expected: &[&str]) {
 }
 
 #[test]
-fn adversarial_yaml_corpus_is_bounded_and_structured() {
-    for case in FIXTURES {
-        let source = read_fixture(case.file);
-        let (outcome, elapsed) = parse_fixture_bounded(&source, PARSE_TIMEOUT);
+fn adversarial_fixture_table_covers_shared_corpus() {
+    let mut names: Vec<_> = PARSER_OUTCOMES.iter().map(|case| case.file).collect();
+    names.sort_unstable();
+    let mut shared: Vec<_> = YAML_ADVERSARIAL_FILES.to_vec();
+    shared.sort_unstable();
+    assert_eq!(names, shared);
+}
 
-        assert!(
-            elapsed < FIXTURE_WALL_CLOCK_BOUND,
-            "{} exceeded wall-clock bound of {:?}: took {:?}",
-            case.file,
-            FIXTURE_WALL_CLOCK_BOUND,
-            elapsed
-        );
+#[test]
+fn adversarial_yaml_corpus_is_bounded_and_structured() {
+    for case in PARSER_OUTCOMES {
+        let source = read_yaml_fixture(case.file);
+        let (outcome, elapsed) = parse_fixture_bounded(&source, FIXTURE_WALL_CLOCK_BOUND);
 
         match outcome {
             BoundedParse::TimedOut => {
-                panic!("{} timed out after {:?}", case.file, PARSE_TIMEOUT);
+                panic!(
+                    "{} timed out after {:?} (elapsed {:?})",
+                    case.file, FIXTURE_WALL_CLOCK_BOUND, elapsed
+                );
             }
             BoundedParse::Panicked(message) => {
                 panic!("{} panicked: {message}", case.file);
@@ -160,7 +149,7 @@ fn adversarial_yaml_corpus_is_bounded_and_structured() {
 
 #[test]
 fn large_scalar_fixture_exceeds_compile_limit_without_panicking() {
-    let source = read_fixture("large_scalar.yaml");
+    let source = read_yaml_fixture("large_scalar.yaml");
     let result = compile_yaml_with_env(
         &source,
         "large_scalar.yaml",

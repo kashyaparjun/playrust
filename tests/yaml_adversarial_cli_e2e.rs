@@ -1,65 +1,65 @@
 mod support;
 
-use std::path::PathBuf;
+use support::{YAML_ADVERSARIAL_FILES, assert_success, playrust, yaml_fixture_path};
 
-use support::{assert_success, playrust};
-
-const FIXTURE_DIR: &str = "tests/fixtures/yaml";
-
-struct CliCase {
+struct CliOutcome {
     file: &'static str,
     expect_success: bool,
     error_substrings: &'static [&'static str],
 }
 
-const CASES: &[CliCase] = &[
-    CliCase {
+/// CLI-layer expectations keyed by shared fixture names.
+const CLI_OUTCOMES: &[CliOutcome] = &[
+    CliOutcome {
         file: "alias_bomb.yaml",
         expect_success: false,
         error_substrings: &["alias expansion limit exceeded"],
     },
-    CliCase {
+    CliOutcome {
         file: "deep_nesting.yaml",
         expect_success: false,
         error_substrings: &["unknown field"],
     },
-    CliCase {
+    CliOutcome {
         file: "tabs.yaml",
         expect_success: false,
         error_substrings: &["valid YAML whitespace"],
     },
-    CliCase {
+    CliOutcome {
         file: "duplicate_keys_at_depth.yaml",
         expect_success: false,
         error_substrings: &["duplicate mapping key"],
     },
-    CliCase {
+    CliOutcome {
         file: "merge_keys.yaml",
         expect_success: false,
         error_substrings: &["merge keys are not allowed"],
     },
-    CliCase {
+    CliOutcome {
         file: "bom_crlf.yaml",
         expect_success: true,
         error_substrings: &[],
     },
-    CliCase {
+    CliOutcome {
         file: "large_scalar.yaml",
         expect_success: false,
         error_substrings: &["exceeds the maximum scalar size of 65536 bytes"],
     },
 ];
 
-fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(FIXTURE_DIR)
-        .join(name)
+#[test]
+fn cli_fixture_table_covers_shared_corpus() {
+    let mut names: Vec<_> = CLI_OUTCOMES.iter().map(|case| case.file).collect();
+    names.sort_unstable();
+    let mut shared: Vec<_> = YAML_ADVERSARIAL_FILES.to_vec();
+    shared.sort_unstable();
+    assert_eq!(names, shared);
 }
 
 #[test]
 fn playrust_check_rejects_adversarial_yaml_corpus() {
-    for case in CASES {
-        let path = fixture_path(case.file);
+    for case in CLI_OUTCOMES {
+        let path = yaml_fixture_path(case.file);
         let output = playrust(&["check", path.to_str().unwrap()], &[]);
         if case.expect_success {
             assert_success(&format!("check {}", case.file), &output);
@@ -90,7 +90,7 @@ fn playrust_check_rejects_adversarial_yaml_corpus() {
 
 #[test]
 fn playrust_run_rejects_alias_bomb_before_browser_launch() {
-    let path = fixture_path("alias_bomb.yaml");
+    let path = yaml_fixture_path("alias_bomb.yaml");
     let output = playrust(
         &[
             "run",
