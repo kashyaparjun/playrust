@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -15,6 +17,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+// Invariant: RwLock poison only follows a panic in a prior holder.
+#[allow(clippy::expect_used)]
+fn read_sessions(s: &RwLock<Sessions>) -> std::sync::RwLockReadGuard<'_, Sessions> {
+    s.read().expect("OOPIF session state poisoned")
+}
+#[allow(clippy::expect_used)]
+fn write_sessions(s: &RwLock<Sessions>) -> std::sync::RwLockWriteGuard<'_, Sessions> {
+    s.write().expect("OOPIF session state poisoned")
+}
 
 #[derive(Default)]
 struct Sessions {
@@ -76,7 +87,7 @@ impl OopifRouter {
         loop {
             let notified = self.changed.notified();
             {
-                let sessions = self.sessions.read().expect("OOPIF session state poisoned");
+                let sessions = read_sessions(&self.sessions);
                 if sessions.by_target.contains_key(target) {
                     return Ok(());
                 }
@@ -95,11 +106,7 @@ impl OopifRouter {
     }
 
     pub fn has_target(&self, target: &str) -> bool {
-        self.sessions
-            .read()
-            .expect("OOPIF session state poisoned")
-            .by_target
-            .contains_key(target)
+        read_sessions(&self.sessions).by_target.contains_key(target)
     }
 
     async fn command(&self, target: &str, method: &str, mut params: Value) -> Result<Value> {
@@ -107,10 +114,7 @@ impl OopifRouter {
             || method == "Runtime.callFunctionOn"
                 && params.get("objectId").is_none()
                 && params.get("executionContextId").is_none())
-            && let Some(context) = self
-                .sessions
-                .read()
-                .expect("OOPIF session state poisoned")
+            && let Some(context) = read_sessions(&self.sessions)
                 .execution_contexts
                 .get(&(target.to_owned(), target.to_owned()))
         {
@@ -152,9 +156,7 @@ impl OopifRouter {
     }
 
     pub fn execution_context(&self, target: &str, frame: &str) -> Option<i64> {
-        self.sessions
-            .read()
-            .expect("OOPIF session state poisoned")
+        read_sessions(&self.sessions)
             .execution_contexts
             .get(&(target.to_owned(), frame.to_owned()))
             .copied()
@@ -245,7 +247,7 @@ async fn run<S>(
         tokio::select! {
             request = requests.recv() => match request {
                 Some(Request::Command { target, method, params, reply }) => {
-                    let session = sessions.read().expect("OOPIF session state poisoned")
+                    let session = read_sessions(&sessions)
                         .by_target.get(&target).cloned();
                     let Some(session) = session else {
                         let _ = reply.send(Err(anyhow!("active OOPIF target is detached")));
@@ -313,7 +315,7 @@ async fn run<S>(
                             attaching.remove(&target);
                             if let Some(session) = message.pointer("/result/sessionId").and_then(Value::as_str).map(str::to_owned) {
                                 {
-                                    let mut state = sessions.write().expect("OOPIF session state poisoned");
+                                    let mut state = write_sessions(&sessions);
                                     if let Some(previous) = state.by_target.insert(target.clone(), session.clone()) {
                                         state.by_session.remove(&previous);
                                     }
@@ -367,7 +369,7 @@ async fn run<S>(
                             message.get("sessionId").and_then(Value::as_str),
                             message.pointer("/params/context/id").and_then(Value::as_i64),
                         ) {
-                            let mut state = sessions.write().expect("OOPIF session state poisoned");
+                            let mut state = write_sessions(&sessions);
                             if let (Some(target), Some(frame)) = (
                                 state.by_session.get(session).cloned(),
                                 message.pointer("/params/context/auxData/frameId").and_then(Value::as_str),
@@ -379,7 +381,7 @@ async fn run<S>(
                     }
                     Some("Runtime.executionContextsCleared") => {
                         if let Some(session) = message.get("sessionId").and_then(Value::as_str) {
-                            let mut state = sessions.write().expect("OOPIF session state poisoned");
+                            let mut state = write_sessions(&sessions);
                             if let Some(target) = state.by_session.get(session).cloned() {
                                 state.execution_contexts.retain(|(endpoint, _), _| endpoint != &target);
                             }
@@ -416,7 +418,7 @@ async fn run<S>(
                             message.pointer("/params/sessionId").and_then(Value::as_str),
                         ) {
                             {
-                                let mut state = sessions.write().expect("OOPIF session state poisoned");
+                                let mut state = write_sessions(&sessions);
                                 if let Some(previous) = state.by_target.insert(target.to_owned(), session.to_owned()) {
                                     state.by_session.remove(&previous);
                                 }
@@ -444,7 +446,7 @@ async fn run<S>(
                     }
                     Some("Target.detachedFromTarget") => {
                         if let Some(session) = message.pointer("/params/sessionId").and_then(Value::as_str) {
-                            let mut state = sessions.write().expect("OOPIF session state poisoned");
+                            let mut state = write_sessions(&sessions);
                             if let Some(target) = state.by_session.remove(session)
                                 && state
                                     .by_target
@@ -460,7 +462,7 @@ async fn run<S>(
                     }
                     Some("Target.targetDestroyed") => {
                         if let Some(target) = message.pointer("/params/targetId").and_then(Value::as_str) {
-                            let mut state = sessions.write().expect("OOPIF session state poisoned");
+                            let mut state = write_sessions(&sessions);
                             if let Some(session) = state.by_target.remove(target) {
                                 state.by_session.remove(&session);
                             }
@@ -538,9 +540,6 @@ where
 }
 
 fn fail(sessions: &RwLock<Sessions>, changed: &Notify, error: &str) {
-    sessions
-        .write()
-        .expect("OOPIF session state poisoned")
-        .failed = Some(error.to_owned());
+    write_sessions(sessions).failed = Some(error.to_owned());
     changed.notify_waiters();
 }
