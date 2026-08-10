@@ -1,0 +1,4 @@
+version: 1
+name: merge-keys
+<<: { settings: { timeout: 30s } }
+steps: [{ open: https://x.test }]
