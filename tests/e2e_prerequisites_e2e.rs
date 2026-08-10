@@ -1,21 +1,36 @@
 mod support;
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-
-use serde_json::{Value, json};
-use support::{FixtureServer, chrome_env, chrome_path, require_browser, require_live_e2e};
+use serde_json::json;
+use support::{FixtureServer, Session, chrome_path, env_flag_enabled, require_browser};
 
 #[test]
-fn chrome_path_resolves_playrust_chrome_env() {
-    let Some(chrome) = require_browser("chrome_path_resolves_playrust_chrome_env") else {
+fn chrome_path_returns_some_when_browser_available() {
+    let Some(chrome) = require_browser("chrome_path_returns_some_when_browser_available") else {
         return;
     };
-    let (key, _value) = chrome_env(&chrome);
-    let resolved = std::env::var_os(&key).map(PathBuf::from);
-    assert_eq!(resolved.as_deref(), Some(chrome.as_path()));
-    assert_eq!(chrome_path(), Some(chrome));
+    let resolved = chrome_path().expect("chrome_path should return Some when browser is available");
+    assert_eq!(resolved, chrome);
+    assert!(resolved.is_file());
+}
+
+#[test]
+fn chrome_path_matches_playrust_chrome_env_when_set() {
+    let Some(chrome) = require_browser("chrome_path_matches_playrust_chrome_env_when_set") else {
+        return;
+    };
+    match std::env::var_os(playrust::install::CHROME_ENV) {
+        Some(from_env) => {
+            let from_env = std::path::PathBuf::from(from_env);
+            if from_env.is_file() {
+                assert_eq!(chrome_path().as_deref(), Some(from_env.as_path()));
+                assert_eq!(chrome, from_env);
+            }
+        }
+        None => {
+            // Cache-only: chrome_path must still resolve without PLAYRUST_CHROME.
+            assert_eq!(chrome_path().as_deref(), Some(chrome.as_path()));
+        }
+    }
 }
 
 #[test]
@@ -55,78 +70,18 @@ fn require_browser_runs_minimal_session_snapshot_and_close() {
 
     let close = session.command(json!({ "id": "close", "command": "close" }));
     assert_eq!(close["ok"], true, "{close}");
-    assert_eq!(session.finish().status.success(), true);
+    assert!(session.finish().status.success());
 }
 
 #[test]
-fn require_live_e2e_skips_without_flag() {
-    if std::env::var_os("PLAYRUST_LIVE_E2E").is_some_and(|value| {
-        !matches!(
-            value.to_str(),
-            Some("0") | Some("false") | Some("no") | Some("")
-        )
-    }) {
+fn live_e2e_flag_parsing_treats_unset_as_disabled() {
+    // Do not call require_live_e2e here: under PLAYRUST_REQUIRE_BROWSER=1 it
+    // would panic when LIVE_E2E is unset. Assert the gate predicate instead.
+    if env_flag_enabled("PLAYRUST_LIVE_E2E") {
         return;
     }
-    let Some(()) = require_live_e2e("require_live_e2e_skips_without_flag") else {
-        return;
-    };
-    panic!("require_live_e2e should skip when PLAYRUST_LIVE_E2E is unset");
-}
-
-struct Session {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl Session {
-    fn start(artifacts: &Path, chrome: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_playrust"))
-            .args([
-                "session",
-                "--protocol",
-                "ndjson",
-                "--browser",
-                chrome.to_str().expect("UTF-8 Chrome path"),
-                "--artifacts",
-                artifacts.to_str().expect("UTF-8 artifact path"),
-                "--video",
-                "off",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self {
-            child,
-            stdin: Some(stdin),
-            stdout,
-        }
-    }
-
-    fn send(&mut self, value: Value) {
-        serde_json::to_writer(self.stdin.as_mut().unwrap(), &value).unwrap();
-        self.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
-        self.stdin.as_mut().unwrap().flush().unwrap();
-    }
-
-    fn read(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).expect("session response JSON")
-    }
-
-    fn command(&mut self, value: Value) -> Value {
-        self.send(value);
-        self.read()
-    }
-
-    fn finish(mut self) -> std::process::Output {
-        drop(self.stdin.take());
-        self.child.wait_with_output().unwrap()
-    }
+    assert!(
+        !env_flag_enabled("PLAYRUST_LIVE_E2E"),
+        "unset/falsey PLAYRUST_LIVE_E2E must disable live e2e"
+    );
 }

@@ -39,7 +39,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test all features
-        run: cargo test --all-features --locked
+        # --show-output keeps eprintln! skip notices visible on green runs.
+        run: cargo test --all-features --locked -- --show-output
       - name: Clippy
         run: cargo clippy --all-features --all-targets --locked -- -D warnings
 
@@ -67,6 +68,8 @@ jobs:
           PLAYRUST_FFMPEG: /usr/bin/ffmpeg
           PLAYRUST_NO_SANDBOX: "1"
           PLAYRUST_REQUIRE_BROWSER: "1"
+        # Trial: ports are ephemeral / profiles are tempdirs, so full serialization
+        # was unnecessary; --test-threads=4 kept. --show-output surfaces skip notices.
         run: >-
           cargo test --locked
           --test browser_smoke
@@ -89,8 +92,11 @@ jobs:
           --test wait_until_visible_e2e
           --test open_settle_e2e
           --test secret_recording_warning_e2e
+          --test encoding_aware_redaction_e2e
+          --test html_artifact_viewer_e2e
+          --test presentation_overlays_e2e
           --test e2e_prerequisites_e2e
-          -- --test-threads=4
+          -- --test-threads=4 --show-output
       - name: Run pause cancellation test
         env:
           PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
@@ -99,3 +105,4 @@ jobs:
         run: >-
           cargo test --locked --lib
           cancelling_an_in_flight_compiled_pause_interrupts_the_flow
+          -- --show-output

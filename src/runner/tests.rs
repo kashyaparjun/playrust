@@ -4,20 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::install::{self, PINNED_CHROME_VERSION, Platform};
+use crate::install;
 
 fn require_browser(test_name: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(install::CHROME_ENV) {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Ok(root) = install::cache_root()
-        && let Ok(platform) = Platform::current()
-        && let Ok(path) = install::cached_browser_path(&root, PINNED_CHROME_VERSION, platform)
-        && path.is_file()
-    {
+    if let Some(path) = install::resolve_existing_browser() {
         return Some(path);
     }
     if std::env::var_os("PLAYRUST_REQUIRE_BROWSER").is_some_and(|value| {
