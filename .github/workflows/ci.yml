@@ -97,3 +97,29 @@ jobs:
           cargo test --locked --lib
           cancelling_an_in_flight_compiled_pause_interrupts_the_flow
           -- --ignored
+
+  ffmpeg-provisioning-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/playrust
+            target
+          key: ffmpeg-provisioning-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install pinned Chromium
+        run: cargo run --locked -- browser install
+      - name: Run FFmpeg provisioning e2e
+        env:
+          PLAYRUST_CHROME: /home/runner/.cache/playrust/chrome-for-testing/151.0.7922.34/linux64/chrome-linux64/chrome
+          PLAYRUST_FFMPEG_E2E: "1"
+          PLAYRUST_NO_SANDBOX: "1"
+          # Preserve cargo while excluding a bare PATH that drops ~/.cargo/bin.
+          # Tests shadow system ffmpeg via a fake bin dir prepended in-process.
+          PATH: /home/runner/.cargo/bin:/usr/bin:/bin
+        run: cargo test --locked --test ffmpeg_provisioning_e2e -- --test-threads=1

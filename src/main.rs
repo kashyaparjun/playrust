@@ -14,7 +14,8 @@ use playrust::flow::{
     parse_duration,
 };
 use playrust::install::{
-    PINNED_CHROME_VERSION, install_browser, install_release, resolve_or_install_browser,
+    PINNED_CHROME_VERSION, PINNED_FFMPEG_VERSION, install_browser, install_ffmpeg, install_release,
+    resolve_or_install_browser, resolve_or_install_ffmpeg,
 };
 use playrust::report::{
     AggregateReport, ArtifactPaths, ChromiumInfo, ExitCode, Failure, FailureCategory, FlowReport,
@@ -47,6 +48,7 @@ enum Command {
     Session(SessionArgs),
     /// Manage the pinned Chrome for Testing installation.
     Browser(BrowserArgs),
+    Ffmpeg(FfmpegArgs),
 }
 
 #[derive(Debug, Args)]
@@ -90,7 +92,7 @@ struct RunArgs {
     /// Override video recording for every flow.
     #[arg(long, value_name = "MODE")]
     video: Option<VideoMode>,
-    /// Path to FFmpeg; defaults to resolving ffmpeg on PATH.
+    /// Path to FFmpeg; auto-provisioned when video is enabled.
     #[arg(long)]
     ffmpeg_path: Option<PathBuf>,
     /// Root directory for flow artifacts and report.json.
@@ -189,7 +191,17 @@ struct BrowserArgs {
 
 #[derive(Debug, Subcommand)]
 enum BrowserCommand {
-    /// Download and validate the pinned Chrome for Testing build.
+    Install,
+}
+
+#[derive(Debug, Args)]
+struct FfmpegArgs {
+    #[command(subcommand)]
+    command: FfmpegCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum FfmpegCommand {
     Install,
 }
 
@@ -260,6 +272,21 @@ async fn main() {
                 ExitCode::Infrastructure
             }
         },
+        Command::Ffmpeg(FfmpegArgs {
+            command: FfmpegCommand::Install,
+        }) => match install_ffmpeg().await {
+            Ok(path) => {
+                println!(
+                    "Installed FFmpeg {PINNED_FFMPEG_VERSION} (ffmpeg + ffprobe): {}",
+                    path.display()
+                );
+                ExitCode::Success
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::Infrastructure
+            }
+        },
     };
     std::process::exit(exit_code.as_i32());
 }
@@ -284,7 +311,17 @@ async fn session(args: SessionArgs) -> ExitCode {
                 browser,
                 headed: args.headed,
                 artifacts: args.artifacts,
-                ffmpeg_path: args.ffmpeg_path,
+                ffmpeg_path: if matches!(args.video, SessionVideoMode::On) {
+                    match resolve_or_install_ffmpeg(args.ffmpeg_path.as_deref()).await {
+                        Ok(path) => Some(path),
+                        Err(error) => {
+                            eprintln!("error: {error}");
+                            return ExitCode::Infrastructure;
+                        }
+                    }
+                } else {
+                    args.ffmpeg_path.clone()
+                },
                 settings: playrust::runner::SessionSettings {
                     timeout: args.timeout,
                     viewport: playrust::flow::Viewport {
@@ -441,10 +478,19 @@ async fn run(args: RunArgs) -> ExitCode {
         .iter()
         .find(|run| run.flow.settings.video != VideoMode::Off)
     {
-        let ffmpeg_path = args
-            .ffmpeg_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        let ffmpeg_path = match resolve_or_install_ffmpeg(args.ffmpeg_path.as_deref()).await {
+            Ok(path) => path,
+            Err(error) => {
+                return finish_report(
+                    started,
+                    &args.artifacts,
+                    args.junit,
+                    args.html,
+                    None,
+                    setup_failure_reports(&runs, FailureCategory::Recording, error.to_string()),
+                );
+            }
+        };
         let preflight = VideoConfig {
             mode: VideoMode::On,
             ffmpeg_path: ffmpeg_path.clone(),
