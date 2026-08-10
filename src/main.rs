@@ -277,7 +277,7 @@ async fn main() {
         }) => match install_ffmpeg().await {
             Ok(path) => {
                 println!(
-                    "Installed FFmpeg {PINNED_FFMPEG_VERSION}: {}",
+                    "Installed FFmpeg {PINNED_FFMPEG_VERSION} (ffmpeg + ffprobe): {}",
                     path.display()
                 );
                 ExitCode::Success

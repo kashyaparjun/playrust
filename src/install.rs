@@ -19,8 +19,8 @@ use tokio::time::timeout;
 mod ffmpeg;
 
 pub use ffmpeg::{
-    FFMPEG_ENV, PINNED_FFMPEG_VERSION, cached_ffmpeg_path, ffmpeg_cache_root, install_ffmpeg,
-    resolve_or_install_ffmpeg,
+    FFMPEG_ENV, FFPROBE_ENV, PINNED_FFMPEG_VERSION, cached_ffmpeg_path, cached_ffprobe_path,
+    ffmpeg_cache_root, install_ffmpeg, resolve_or_install_ffmpeg,
 };
 
 pub const CHROME_ENV: &str = "PLAYRUST_CHROME";
