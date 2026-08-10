@@ -965,3 +965,36 @@ fn screencast_errors_retain_failure_only_video() {
     assert!(should_retain_video(true, &[]));
     assert!(!should_retain_video(false, &[]));
 }
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+async fn empty_interactive_flow_returns_protocol_error_without_panic() {
+    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let host = BrowserHost::launch(chrome, false).await.unwrap();
+    let seed = crate::flow::compile_yaml(
+        "version: 1\nname: seed\nsettings: { video: off }\nsteps: [{ pause: 1ms }]\n",
+        "seed.yaml",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let mut runtime = SessionRuntime::open(&host, &seed).await.unwrap();
+    let empty = CompiledFlow {
+        source: PathBuf::from("empty.yaml"),
+        name: "empty".into(),
+        base_url: None,
+        settings: seed.settings,
+        inputs: BTreeMap::new(),
+        steps: Vec::new(),
+        manual_recording: false,
+        redactor: crate::flow::Redactor::default(),
+    };
+    let artifacts = tempfile::tempdir().unwrap();
+    let error = runtime
+        .execute_interactive(&host, &empty, artifacts.path(), std::future::ready(()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.category, FailureCategory::Protocol);
+    assert_eq!(error.message, "interactive flow has no steps");
+    runtime.close(&host).await.unwrap();
+    host.shutdown().await.unwrap();
+}

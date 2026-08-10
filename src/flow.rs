@@ -1805,6 +1805,8 @@ fn compile_raw_expanded(
                 .peek()
                 .is_some_and(|step| step.source_index == local_index)
             {
+                // Invariant: peek() just confirmed the next step matches
+                // local_index, so next() cannot return None here.
                 #[allow(clippy::expect_used)]
                 let step = compiled.next().expect("peeked step");
                 steps.push(step);
@@ -2143,6 +2145,8 @@ fn compile_when(
         )?)));
     }
     #[allow(clippy::expect_used)]
+    // Invariant: callers validate that exactly one when-predicate is set and
+    // expression was already handled above, so variable must be Some.
     let predicate = raw.variable.expect("predicate count checked");
     validate_input_name(&predicate.name)?;
     let actual = inputs.get(&predicate.name).ok_or_else(|| {
@@ -2277,6 +2281,8 @@ fn compile_expression_inner(
         });
     }
     #[allow(clippy::expect_used)]
+    // Invariant: callers validate that exactly one expression operator is set
+    // and equals/not_equals were already handled, so boolean must be Some.
     Ok(Expression::Boolean(compile_runtime_value(
         &format!("step {index} expression.boolean"),
         raw.boolean.as_deref().expect("operator count checked"),
@@ -2774,6 +2780,8 @@ fn compile_operation(
         });
     }
     #[allow(clippy::expect_used)]
+    // Invariant: callers validate that exactly one operation kind is present
+    // and all other kinds were already handled, so assertion must be Some.
     Ok(Operation::Assert(compile_assertion(
         step.assertion.expect("operation count checked"),
         index,
@@ -2967,6 +2975,8 @@ fn compile_assertion(
     }
 
     #[allow(clippy::expect_used)]
+    // Invariant: callers validate that exactly one assertion kind is present
+    // and screenshot was already handled, so url must be Some.
     let url = raw.url.expect("assertion count checked");
     let expectation = match (url.equals, url.path) {
         (Some(value), None) => {
@@ -3086,6 +3096,8 @@ fn compile_locator_at(
         LocatorStrategy::Label(interpolate_non_empty(&context, &value, inputs)?)
     } else {
         #[allow(clippy::expect_used)]
+        // Invariant: callers validate that exactly one locator strategy is set
+        // and css/text/label were already handled, so role must be Some.
         let role = raw.role.expect("strategy count checked");
         LocatorStrategy::Role {
             value: interpolate_non_empty(&context, &role.value, inputs)?,
@@ -3317,6 +3329,8 @@ fn parse_url_path(index: usize, value: Resolved<String>) -> Result<Resolved<Stri
         return invalid(format!("step {index} URL path must start with one slash"));
     }
     #[allow(clippy::expect_used)]
+    // Invariant: "https://playrust.invalid" is a compile-time constant absolute
+    // URL; Url::parse cannot fail for it.
     let parsed = Url::parse("https://playrust.invalid")
         .expect("constant URL is valid")
         .join(value.expose())

@@ -287,6 +287,8 @@ impl ActiveContext {
     fn target(&self) -> CdpTarget<'_> {
         self.oopif_index()
             .map_or(CdpTarget::Root(&self.page), |index| {
+                // Invariant: oopif_index() only returns Some when self.router
+                // is Some and has_target for that frame, so as_deref succeeds.
                 #[allow(clippy::expect_used)]
                 CdpTarget::Oopif(
                     self.router.as_deref().expect("OOPIF router missing"),
@@ -304,6 +306,8 @@ impl ActiveContext {
                     .is_some_and(|router| router.has_target(frame.id.as_ref()))
             })
             .map_or(CdpTarget::Root(&self.page), |index| {
+                // Invariant: rposition only matches when router is Some and
+                // has_target for that frame, so as_deref succeeds.
                 #[allow(clippy::expect_used)]
                 CdpTarget::Oopif(
                     self.router.as_deref().expect("OOPIF router missing"),
@@ -700,6 +704,8 @@ impl SessionRuntime {
             }
         }
         #[allow(clippy::expect_used)]
+        // Invariant: role candidate enumeration always pushes at least the
+        // primary role locator before this call site, so pop cannot be None.
         let mut locator = candidates.pop().expect("role candidate exists");
         let all = self.active.locator().resolve_all(&locator).await?;
         locator.index = all

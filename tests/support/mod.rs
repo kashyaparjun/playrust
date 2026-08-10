@@ -2,10 +2,10 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -14,6 +14,101 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use playrust::report::AggregateReport;
+use serde_json::Value;
+
+/// NDJSON session protocol harness shared by session e2e tests.
+pub struct Session {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Session {
+    pub fn start(artifacts: &Path) -> Self {
+        Self::start_with_video(artifacts, "off")
+    }
+
+    pub fn start_recorded(artifacts: &Path) -> Self {
+        Self::start_with_video(artifacts, "on")
+    }
+
+    pub fn start_with_video(artifacts: &Path, video: &str) -> Self {
+        let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_playrust"))
+            .args([
+                "session",
+                "--protocol",
+                "ndjson",
+                "--browser",
+                chrome.to_str().expect("UTF-8 Chrome path"),
+                "--artifacts",
+                artifacts.to_str().expect("UTF-8 artifact path"),
+                "--video",
+                video,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn playrust session");
+        let stdin = child.stdin.take().expect("session stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("session stdout"));
+        Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+        }
+    }
+
+    pub fn send(&mut self, value: Value) {
+        serde_json::to_writer(self.stdin.as_mut().expect("session stdin open"), &value)
+            .expect("write session request");
+        self.send_raw(b"\n");
+    }
+
+    pub fn send_raw(&mut self, bytes: &[u8]) {
+        let stdin = self.stdin.as_mut().expect("session stdin open");
+        stdin.write_all(bytes).expect("write session bytes");
+        stdin.flush().expect("flush session stdin");
+    }
+
+    pub fn read(&mut self) -> Value {
+        self.read_optional()
+            .expect("session closed before responding")
+    }
+
+    pub fn read_optional(&mut self) -> Option<Value> {
+        let mut line = String::new();
+        self.stdout
+            .read_line(&mut line)
+            .expect("read session response");
+        (!line.is_empty()).then(|| serde_json::from_str(&line).expect("session response JSON"))
+    }
+
+    pub fn command(&mut self, value: Value) -> Value {
+        self.send(value);
+        self.read()
+    }
+
+    pub fn close_input(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    pub fn finish(mut self) -> Output {
+        drop(self.stdin.take());
+        self.child.wait_with_output().expect("wait for session")
+    }
+}
+
+pub fn assert_exit(output: Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_playrust"));

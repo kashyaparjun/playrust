@@ -258,6 +258,7 @@ struct StoredSnapshot {
 
 impl Default for SnapshotStore {
     fn default() -> Self {
+        // Invariant: 2 is a compile-time non-zero constant.
         #[allow(clippy::expect_used)]
         Self::new(NonZeroUsize::new(2).expect("two is non-zero"))
     }

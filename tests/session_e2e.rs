@@ -1,13 +1,12 @@
 mod support;
 
 use std::env;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use support::{FixtureServer, read_report};
+use support::{FixtureServer, Session, assert_exit, read_report};
 
 #[test]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
@@ -597,96 +596,6 @@ fn large_page_snapshot_is_bounded() {
         true
     );
     assert_exit(session.finish(), 0);
-}
-
-struct Session {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl Session {
-    fn start(artifacts: &Path) -> Self {
-        Self::start_with_video(artifacts, "off")
-    }
-
-    fn start_recorded(artifacts: &Path) -> Self {
-        Self::start_with_video(artifacts, "on")
-    }
-
-    fn start_with_video(artifacts: &Path, video: &str) -> Self {
-        let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_playrust"))
-            .args([
-                "session",
-                "--protocol",
-                "ndjson",
-                "--browser",
-                chrome.to_str().expect("UTF-8 Chrome path"),
-                "--artifacts",
-                artifacts.to_str().expect("UTF-8 artifact path"),
-                "--video",
-                video,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        Self {
-            child,
-            stdin: Some(stdin),
-            stdout,
-        }
-    }
-
-    fn send(&mut self, value: Value) {
-        serde_json::to_writer(self.stdin.as_mut().unwrap(), &value).unwrap();
-        self.send_raw(b"\n");
-    }
-
-    fn send_raw(&mut self, bytes: &[u8]) {
-        let stdin = self.stdin.as_mut().unwrap();
-        stdin.write_all(bytes).unwrap();
-        stdin.flush().unwrap();
-    }
-
-    fn read(&mut self) -> Value {
-        self.read_optional()
-            .expect("session closed before responding")
-    }
-
-    fn read_optional(&mut self) -> Option<Value> {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        (!line.is_empty()).then(|| serde_json::from_str(&line).unwrap())
-    }
-
-    fn command(&mut self, value: Value) -> Value {
-        self.send(value);
-        self.read()
-    }
-
-    fn close_input(&mut self) {
-        drop(self.stdin.take());
-    }
-
-    fn finish(mut self) -> Output {
-        drop(self.stdin.take());
-        self.child.wait_with_output().unwrap()
-    }
-}
-
-fn assert_exit(output: Output, expected: i32) {
-    assert_eq!(
-        output.status.code(),
-        Some(expected),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn only_entry(path: &Path) -> PathBuf {
