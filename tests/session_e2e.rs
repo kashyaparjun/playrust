@@ -27,6 +27,46 @@ fn fatal_browser_startup_exits_4() {
 
 #[test]
 #[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
+fn removed_commands_return_unknown_command_and_session_continues() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = Session::start(&directory.path().join("artifacts"));
+
+    for (id, command, payload) in [
+        (
+            "submit",
+            "submit",
+            json!({ "flow": "version: 1\nname: x\nsteps: []\n" }),
+        ),
+        ("inspect", "inspect", json!({})),
+        ("output", "output", json!({ "name": "missing" })),
+        ("cancel", "cancel", json!({})),
+    ] {
+        let mut request = payload;
+        request["id"] = json!(id);
+        request["command"] = json!(command);
+        let response = session.command(request);
+        assert_eq!(response["ok"], false, "{command}: {response}");
+        assert_eq!(response["error"]["code"], "unknown_command", "{command}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("removed in v0.3.0"),
+            "{command}: {response}"
+        );
+    }
+
+    let snapshot = session.command(json!({ "id": "snapshot", "command": "snapshot" }));
+    assert_eq!(snapshot["ok"], true, "{snapshot}");
+    assert_eq!(snapshot["result"]["url"], "about:blank");
+
+    let close = session.command(json!({ "id": "close", "command": "close" }));
+    assert_eq!(close["ok"], true, "{close}");
+    assert_exit(session.finish(), 0);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
     const SECRET: &str = "session-secret-canary";
     unsafe { std::env::set_var("PLAYRUST_SESSION_TEST_SECRET", SECRET) };
