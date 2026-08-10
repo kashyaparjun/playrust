@@ -1,8 +1,8 @@
+mod support;
+
 use std::collections::BTreeMap;
-use std::env;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -95,9 +95,12 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, color: Rgba<u8>) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn deterministic_visual_assertion_passes_and_retains_failure_artifacts() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) = support::require_browser(
+        "deterministic_visual_assertion_passes_and_retains_failure_artifacts",
+    ) else {
+        return;
+    };
     let fixture = Fixture::start();
     let directory = tempfile::tempdir().unwrap();
     write_png(

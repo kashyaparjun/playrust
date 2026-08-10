@@ -46,8 +46,13 @@ fn check_rejects_short_declared_secrets_without_leaking_value() {
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn encoding_aware_redaction_hides_raw_and_percent_encoded_secrets_in_diagnostics() {
+    let Some(chrome) = support::require_browser(
+        "encoding_aware_redaction_hides_raw_and_percent_encoded_secrets_in_diagnostics",
+    ) else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", FIXTURE)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("encoding-redaction.yaml");
@@ -69,7 +74,7 @@ fn encoding_aware_redaction_hides_raw_and_percent_encoded_secrets_in_diagnostics
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[("TOKEN", SECRET)],
+        &[("TOKEN", SECRET), (&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
 
@@ -96,8 +101,13 @@ fn encoding_aware_redaction_hides_raw_and_percent_encoded_secrets_in_diagnostics
 }
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn short_runtime_string_outputs_are_not_over_redacted_in_diagnostics() {
+    let Some(chrome) = support::require_browser(
+        "short_runtime_string_outputs_are_not_over_redacted_in_diagnostics",
+    ) else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html; charset=utf-8", FIXTURE)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("short-runtime.yaml");
@@ -118,7 +128,7 @@ fn short_runtime_string_outputs_are_not_over_redacted_in_diagnostics() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
 

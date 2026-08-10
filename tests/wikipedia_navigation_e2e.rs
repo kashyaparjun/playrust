@@ -31,13 +31,32 @@ steps:
 "##;
 
 #[test]
-#[ignore = "requires Wikipedia network access, pinned Chromium, FFmpeg, and ffprobe"]
 fn navigation_flow_uses_environment_defaults_and_cropped_artifacts() {
+    let Some(()) = support::require_live_e2e(
+        "navigation_flow_uses_environment_defaults_and_cropped_artifacts",
+    ) else {
+        return;
+    };
+    let Some(chrome) =
+        support::require_browser("navigation_flow_uses_environment_defaults_and_cropped_artifacts")
+    else {
+        return;
+    };
+    let Some(_ffmpeg) =
+        support::require_ffmpeg("navigation_flow_uses_environment_defaults_and_cropped_artifacts")
+    else {
+        return;
+    };
+    let Some(_ffprobe) =
+        support::require_ffprobe("navigation_flow_uses_environment_defaults_and_cropped_artifacts")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("navigation.yaml");
     let artifacts = directory.path().join("artifacts");
     fs::write(&flow, FLOW).expect("write navigation flow");
-    let environment = [("PLAYRUST_WIKI_ARTICLE", "/wiki/Rust_(programming_language)")];
     let ffmpeg = ffmpeg_path();
     let run = playrust(
         &[
@@ -48,7 +67,10 @@ fn navigation_flow_uses_environment_defaults_and_cropped_artifacts() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &environment,
+        &[
+            (&chrome_env.0, &chrome_env.1),
+            ("PLAYRUST_WIKI_ARTICLE", "/wiki/Rust_(programming_language)"),
+        ],
     );
     assert_success("run", &run);
 

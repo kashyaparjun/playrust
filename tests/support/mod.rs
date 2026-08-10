@@ -1,11 +1,16 @@
 #![allow(dead_code)]
 
+//! Shared e2e helpers.
+//!
+//! Skip notices use `eprintln!`. Enable `--show-output` (or `--nocapture`) on
+//! `cargo test` so skips remain visible when tests pass.
+
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -13,7 +18,199 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use playrust::install;
 use playrust::report::AggregateReport;
+use serde_json::Value;
+
+/// Resolve Chrome: `PLAYRUST_CHROME` env var, then the Playrust cache. Never downloads.
+pub fn chrome_path() -> Option<PathBuf> {
+    install::resolve_existing_browser()
+}
+
+/// True when `name` is set to a truthy value (not `0`/`false`/`no`/empty).
+pub fn env_flag_enabled(name: &str) -> bool {
+    env::var_os(name).is_some_and(|value| {
+        !matches!(
+            value.to_str(),
+            Some("0") | Some("false") | Some("no") | Some("")
+        )
+    })
+}
+
+fn skip_or_fail(test_name: &str, message: &str) {
+    if env_flag_enabled("PLAYRUST_REQUIRE_BROWSER") {
+        panic!("{test_name}: {message}");
+    }
+    eprintln!("SKIP {test_name}: {message}");
+}
+
+/// Returns Chrome when available; otherwise prints a skip notice or fails when
+/// `PLAYRUST_REQUIRE_BROWSER=1`.
+pub fn require_browser(test_name: &str) -> Option<PathBuf> {
+    match chrome_path() {
+        Some(path) => Some(path),
+        None => {
+            skip_or_fail(
+                test_name,
+                "no Chrome available (set PLAYRUST_CHROME or run `playrust browser install`)",
+            );
+            None
+        }
+    }
+}
+
+fn command_exists(program: &str) -> bool {
+    Command::new(program)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Returns ffmpeg when available; otherwise prints a skip notice or fails when
+/// `PLAYRUST_REQUIRE_BROWSER=1`.
+pub fn require_ffmpeg(test_name: &str) -> Option<String> {
+    let path = ffmpeg_path();
+    if command_exists(&path) {
+        return Some(path);
+    }
+    skip_or_fail(
+        test_name,
+        "ffmpeg not available (set PLAYRUST_FFMPEG or install ffmpeg)",
+    );
+    None
+}
+
+/// Returns ffprobe when available; otherwise prints a skip notice or fails when
+/// `PLAYRUST_REQUIRE_BROWSER=1`.
+pub fn require_ffprobe(test_name: &str) -> Option<String> {
+    let path = env::var_os("PLAYRUST_FFPROBE")
+        .unwrap_or_else(|| "ffprobe".into())
+        .to_string_lossy()
+        .into_owned();
+    if command_exists(&path) {
+        return Some(path);
+    }
+    skip_or_fail(
+        test_name,
+        "ffprobe not available (set PLAYRUST_FFPROBE or install ffmpeg)",
+    );
+    None
+}
+
+/// Gate for live-network tests (Wikipedia). Set `PLAYRUST_LIVE_E2E=1` to run.
+pub fn require_live_e2e(test_name: &str) -> Option<()> {
+    if env_flag_enabled("PLAYRUST_LIVE_E2E") {
+        return Some(());
+    }
+    skip_or_fail(
+        test_name,
+        "set PLAYRUST_LIVE_E2E=1 to run live network tests",
+    );
+    None
+}
+
+/// NDJSON session protocol harness shared by session / prerequisites e2e tests.
+pub struct Session {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Session {
+    pub fn start(artifacts: &Path, chrome: &Path) -> Self {
+        Self::start_with_video(artifacts, "off", chrome)
+    }
+
+    pub fn start_recorded(artifacts: &Path, chrome: &Path) -> Self {
+        Self::start_with_video(artifacts, "on", chrome)
+    }
+
+    pub fn start_with_video(artifacts: &Path, video: &str, chrome: &Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_playrust"))
+            .args([
+                "session",
+                "--protocol",
+                "ndjson",
+                "--browser",
+                chrome.to_str().expect("UTF-8 Chrome path"),
+                "--artifacts",
+                artifacts.to_str().expect("UTF-8 artifact path"),
+                "--video",
+                video,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn playrust session");
+        let stdin = child.stdin.take().expect("session stdin");
+        let stdout = BufReader::new(child.stdout.take().expect("session stdout"));
+        Self {
+            child,
+            stdin: Some(stdin),
+            stdout,
+        }
+    }
+
+    pub fn send(&mut self, value: Value) {
+        serde_json::to_writer(self.stdin.as_mut().expect("session stdin open"), &value)
+            .expect("write session request");
+        self.send_raw(b"\n");
+    }
+
+    pub fn send_raw(&mut self, bytes: &[u8]) {
+        let stdin = self.stdin.as_mut().expect("session stdin open");
+        stdin.write_all(bytes).expect("write session bytes");
+        stdin.flush().expect("flush session stdin");
+    }
+
+    pub fn read(&mut self) -> Value {
+        self.read_optional()
+            .expect("session closed before responding")
+    }
+
+    pub fn read_optional(&mut self) -> Option<Value> {
+        let mut line = String::new();
+        self.stdout
+            .read_line(&mut line)
+            .expect("read session response");
+        (!line.is_empty()).then(|| serde_json::from_str(&line).expect("session response JSON"))
+    }
+
+    pub fn command(&mut self, value: Value) -> Value {
+        self.send(value);
+        self.read()
+    }
+
+    pub fn close_input(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    pub fn finish(mut self) -> Output {
+        drop(self.stdin.take());
+        self.child.wait_with_output().expect("wait for session")
+    }
+}
+
+pub fn assert_exit(output: Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub fn chrome_env(chrome: &Path) -> (String, String) {
+    (
+        install::CHROME_ENV.to_owned(),
+        chrome.to_string_lossy().into_owned(),
+    )
+}
 
 pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_playrust"));

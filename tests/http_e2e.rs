@@ -10,8 +10,13 @@ const HTML: &str = r#"<!doctype html><html><body>
 </body></html>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn http_setup_saves_bounded_json_for_later_page_values() {
+    let Some(chrome) =
+        support::require_browser("http_setup_saves_bounded_json_for_later_page_values")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start_with(|request| {
         if request.starts_with("POST /setup ")
             && request.to_ascii_lowercase().contains("x-setup: yes")
@@ -61,7 +66,7 @@ steps:
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     assert_success("run HTTP fixture", &output);
     assert_eq!(read_report(&artifacts).flows[0].status, FlowStatus::Passed);

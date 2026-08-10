@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Read, Write};
@@ -190,12 +192,10 @@ impl Drop for FixtureServer {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn browser_flow_smoke() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
+    let Some(chrome) = support::require_browser("browser_flow_smoke") else {
+        return;
+    };
     let server = FixtureServer::start(HTML);
 
     let flow_files = tempfile::tempdir().expect("create subflow directory");
@@ -301,12 +301,10 @@ steps:
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn clear_state_is_scoped_to_the_active_flow() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
+    let Some(chrome) = support::require_browser("clear_state_is_scoped_to_the_active_flow") else {
+        return;
+    };
     let server = FixtureServer::start(STATE_HTML);
     let url = format!("http://{}", server.address);
     let flow = compile_yaml(
@@ -362,12 +360,11 @@ steps:
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn geolocation_is_applied_only_to_the_flow_context() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
+    let Some(chrome) = support::require_browser("geolocation_is_applied_only_to_the_flow_context")
+    else {
+        return;
+    };
     let server = FixtureServer::start(GEOLOCATION_HTML);
     let url = format!("http://{}", server.address);
     let flow = compile_yaml(
@@ -420,15 +417,17 @@ steps:
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
 async fn browser_video_flow_smoke() {
-    let chrome = PathBuf::from(
-        env::var_os("PLAYRUST_CHROME")
-            .expect("set PLAYRUST_CHROME to the pinned Chrome executable"),
-    );
-    let ffmpeg = env::var_os("PLAYRUST_FFMPEG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let Some(chrome) = support::require_browser("browser_video_flow_smoke") else {
+        return;
+    };
+    let Some(ffmpeg) = support::require_ffmpeg("browser_video_flow_smoke") else {
+        return;
+    };
+    let Some(_ffprobe) = support::require_ffprobe("browser_video_flow_smoke") else {
+        return;
+    };
+    let ffmpeg = PathBuf::from(ffmpeg);
     let server = FixtureServer::start(VIDEO_HTML);
     let flow = compile_yaml(
         &format!(
