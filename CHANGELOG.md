@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Breaking (v0.3):** Session protocol removed deprecated v1 commands (`submit`, `inspect`, `export`, and related aliases). Clients must use the current act/snapshot/dialog/scroll/output command set documented in `docs/session-protocol.md`. Update automation that still sends the removed commands before upgrading.
 - **Breaking:** Declared `secrets` shorter than four characters now fail `playrust check` and flow compile. The error names the secret variable, never its value. Flows that relied on short declared secrets must use longer values or remove those secrets.
 
 ### Notes

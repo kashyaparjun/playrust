@@ -1615,7 +1615,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn export_not_started_skips_report_persistence() {
         let mut ctx = test_protocol();
         let session: Option<()> = None;

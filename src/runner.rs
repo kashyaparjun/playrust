@@ -1296,7 +1296,7 @@ async fn execute_flow(
                 Ok(FlowRecordingStartup::Cancelled(finish)) => {
                     interrupted = true;
                     if let Some(finish) = finish {
-                        apply_recording_finish(Err(finish), &mut artifacts, &mut recording_error);
+                        apply_recording_finish(finish, &mut artifacts, &mut recording_error);
                     }
                 }
                 Err(error) => {
@@ -1388,7 +1388,7 @@ async fn execute_flow(
                             interrupted = true;
                             if let Some(finish) = finish {
                                 apply_recording_finish(
-                                    Err(finish),
+                                    finish,
                                     &mut artifacts,
                                     &mut recording_error,
                                 );

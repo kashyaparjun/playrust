@@ -73,7 +73,9 @@ pub struct RecordingController {
 
 pub enum FlowRecordingStartup {
     Ready(Option<FlowRecording>),
-    Cancelled(Option<FlowRecordingFinish>),
+    /// Early cancellation after optional recording cleanup. `Ok` keeps any
+    /// finalized path; `Err` records cleanup/finalization failures.
+    Cancelled(Option<Result<Option<PathBuf>, FlowRecordingFinish>>),
 }
 
 pub struct FlowRecording {
@@ -339,7 +341,7 @@ impl FlowRecording {
                             partial: partial_path,
                             recording: None,
                         });
-                return Ok(FlowRecordingStartup::Cancelled(cleanup));
+                return Ok(FlowRecordingStartup::Cancelled(cleanup.map(Err)));
             }
             FlowStartAwait::Deadline => {
                 return Err(flow_start_cleanup_error(
@@ -367,7 +369,7 @@ impl FlowRecording {
                                 partial: partial_path,
                                 recording: None,
                             });
-                    return Ok(FlowRecordingStartup::Cancelled(cleanup));
+                    return Ok(FlowRecordingStartup::Cancelled(cleanup.map(Err)));
                 }
                 FlowStartAwait::Deadline => {
                     return Err(flow_start_cleanup_error(
@@ -424,11 +426,7 @@ impl FlowRecording {
             FlowStartAwait::Ready(first_frame) => first_frame,
             FlowStartAwait::Cancelled => {
                 return Ok(FlowRecordingStartup::Cancelled(Some(
-                    session
-                        .finish(page, true, Instant::now())
-                        .await
-                        .err()
-                        .unwrap(),
+                    session.finish(page, true, Instant::now()).await,
                 )));
             }
             FlowStartAwait::Deadline => {

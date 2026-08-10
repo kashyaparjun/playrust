@@ -2,12 +2,12 @@ mod support;
 
 use std::env;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use support::{FixtureServer, read_report};
+use support::FixtureServer;
 
 #[test]
 fn fatal_browser_startup_exits_4() {
@@ -409,10 +409,6 @@ impl Session {
         self.read()
     }
 
-    fn close_input(&mut self) {
-        drop(self.stdin.take());
-    }
-
     fn finish(mut self) -> Output {
         drop(self.stdin.take());
         self.child.wait_with_output().unwrap()
@@ -427,13 +423,4 @@ fn assert_exit(output: Output, expected: i32) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn only_entry(path: &Path) -> PathBuf {
-    std::fs::read_dir(path)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path()
 }
