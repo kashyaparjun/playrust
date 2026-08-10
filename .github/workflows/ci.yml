@@ -89,6 +89,7 @@ jobs:
           --test wait_until_visible_e2e
           --test open_settle_e2e
           --test secret_recording_warning_e2e
+          --test e2e_prerequisites_e2e
           -- --test-threads=4
       - name: Run pause cancellation test
         env:
