@@ -8,7 +8,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use chromiumoxide::Page;
 use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxPropertyName, AxValue, GetFullAxTreeParams,
@@ -22,10 +21,9 @@ use chromiumoxide::cdp::browser_protocol::input::{
     InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, EventJavascriptDialogOpening, EventScreencastFrame, FrameId,
-    GetFrameTreeParams, GetNavigationHistoryParams, HandleJavaScriptDialogParams, NavigateParams,
-    NavigateToHistoryEntryParams, ScreencastFrameAckParams, StartScreencastFormat,
-    StartScreencastParams, StopScreencastParams, Viewport as ScreenshotViewport,
+    CaptureScreenshotFormat, EventJavascriptDialogOpening, FrameId, GetFrameTreeParams,
+    GetNavigationHistoryParams, HandleJavaScriptDialogParams, NavigateParams,
+    NavigateToHistoryEntryParams, Viewport as ScreenshotViewport,
 };
 use chromiumoxide::cdp::browser_protocol::storage::{ClearCookiesParams, ClearDataForOriginParams};
 use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
@@ -41,7 +39,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::Notify;
 
 use crate::browser::{BrowserContext, BrowserHost, BrowserStatus, Geolocation, Viewport};
 use crate::flow::{
@@ -56,6 +54,9 @@ use crate::locator::{
     id_selector, retryable, retryable_cdp_message, text_matches,
 };
 use crate::oopif::{CdpTarget, OopifRouter};
+use crate::recording::{
+    FlowCancellation, FlowRecording, FlowRecordingStartup, apply_recording_finish, settle_video,
+};
 use crate::report::{
     ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, SafeText, StepContext,
 };
@@ -63,14 +64,12 @@ use crate::session_snapshot::{
     Bounds as SnapshotBounds, CapturedElement, CapturedSnapshot, LocatorIdentity,
     Scroll as SnapshotScroll, SemanticNode, SemanticState, Viewport as SnapshotViewport,
 };
-use crate::video::{VideoConfig, VideoRecorder};
+use crate::video::VideoConfig;
 use crate::visual;
 
 const SCREENSHOT_NAME: &str = "failure.png";
 const RECORDING_NAME: &str = "recording.mp4";
 const SECONDARY_TIMEOUT: Duration = Duration::from_secs(2);
-const VIDEO_FINALIZE_TIMEOUT: Duration = Duration::from_secs(20);
-const FINAL_FRAME_DELAY: Duration = Duration::from_millis(250);
 const INSPECT_AX_DEPTH: i64 = 8;
 const INSPECT_AX_NODES: usize = 500;
 const INSPECT_AX_BYTES: usize = 256 * 1024;
@@ -371,6 +370,17 @@ impl CancellationToken {
         }
     }
 }
+
+impl FlowCancellation for CancellationToken {
+    fn is_cancelled(&self) -> bool {
+        CancellationToken::is_cancelled(self)
+    }
+    fn cancelled(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(CancellationToken::cancelled(self))
+    }
+}
+
+pub use crate::recording::SessionRecordingFinish;
 
 /// Per-flow resources. Give each concurrent flow a distinct artifact directory.
 #[derive(Clone, Debug)]
@@ -1277,16 +1287,16 @@ async fn execute_flow(
     let manual_recording = flow.manual_recording;
     if !interrupted && !manual_recording {
         if let Some(deadline) = Instant::now().checked_add(flow.settings.timeout) {
-            match start_video(&page, flow, options, deadline).await {
-                Ok(VideoStartup::Ready(session)) => {
+            match start_flow_recording(&page, flow, options, deadline).await {
+                Ok(FlowRecordingStartup::Ready(session)) => {
                     video = session;
                     runtime.presentation_overlay_recording = video.is_some();
                     interrupted = is_cancelled(options.cancellation.as_ref());
                 }
-                Ok(VideoStartup::Cancelled(finish)) => {
+                Ok(FlowRecordingStartup::Cancelled(finish)) => {
                     interrupted = true;
                     if let Some(finish) = finish {
-                        apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                        apply_recording_finish(finish, &mut artifacts, &mut recording_error);
                     }
                 }
                 Err(error) => {
@@ -1369,15 +1379,19 @@ async fn execute_flow(
             }
             match control {
                 RecordingControl::Start => {
-                    match start_video(&active.page, flow, options, deadline).await {
-                        Ok(VideoStartup::Ready(session)) => {
+                    match start_flow_recording(&active.page, flow, options, deadline).await {
+                        Ok(FlowRecordingStartup::Ready(session)) => {
                             video = session;
                             runtime.presentation_overlay_recording = video.is_some();
                         }
-                        Ok(VideoStartup::Cancelled(finish)) => {
+                        Ok(FlowRecordingStartup::Cancelled(finish)) => {
                             interrupted = true;
                             if let Some(finish) = finish {
-                                apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                                apply_recording_finish(
+                                    finish,
+                                    &mut artifacts,
+                                    &mut recording_error,
+                                );
                             }
                         }
                         Err(error) => {
@@ -1401,7 +1415,7 @@ async fn execute_flow(
                                 video_stop_at.expect("recording stop set"),
                             )
                             .await;
-                        apply_video_finish(finish, &mut artifacts, &mut recording_error);
+                        apply_recording_finish(finish, &mut artifacts, &mut recording_error);
                     }
                     deactivate_presentation_overlay(&active, &mut runtime).await;
                 }
@@ -1545,7 +1559,7 @@ async fn execute_flow(
                 video_stop_at.unwrap_or_else(Instant::now),
             )
             .await;
-        apply_video_finish(finish, &mut artifacts, &mut recording_error);
+        apply_recording_finish(finish, &mut artifacts, &mut recording_error);
     }
     deactivate_presentation_overlay(&active, &mut runtime).await;
 
@@ -1581,17 +1595,6 @@ async fn execute_flow(
     session.outputs = runtime.outputs;
     session.redactor = runtime.redactor;
     report(flow, started, artifacts, failures, interrupted)
-}
-
-async fn settle_video(page: &Page) {
-    let _ = tokio::time::timeout(
-        SECONDARY_TIMEOUT,
-        page.evaluate(
-            "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
-        ),
-    )
-    .await;
-    tokio::time::sleep(FINAL_FRAME_DELAY).await;
 }
 
 async fn pause_until(duration: Duration, deadline: Instant) -> Result<(), StepError> {
@@ -3556,564 +3559,38 @@ async fn call_on_target<T: DeserializeOwned>(
         .map_err(|error| StepError::new(FailureCategory::Protocol, error.to_string()))
 }
 
-struct VideoSession {
-    stop: Option<oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<(VideoRecorder, Result<(), String>)>,
-    partial_path: PathBuf,
-}
-
-struct ScreencastSource {
-    page: Page,
-    stop: Option<oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<Result<(), String>>,
-}
-
-pub(crate) struct SessionRecorder {
-    recorder: Option<VideoRecorder>,
-    source: Option<ScreencastSource>,
-    output_path: PathBuf,
-    partial_path: PathBuf,
-    viewport_width: u32,
-    viewport_height: u32,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SessionRecordingFinish {
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub partial_path: Option<String>,
-    pub warnings: Vec<String>,
-}
-
-impl SessionRecorder {
-    pub(crate) async fn start(config: VideoConfig, page: &Page) -> Result<Self, String> {
-        tokio::fs::create_dir_all(
-            config
-                .output_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        )
-        .await
-        .map_err(|error| format!("create recording directory: {error}"))?;
-        let recorder = VideoRecorder::start(&config)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut session = Self {
-            output_path: config.output_path.clone(),
-            partial_path: config.partial_path(),
-            recorder: Some(recorder),
-            source: None,
-            viewport_width: config.viewport_width,
-            viewport_height: config.viewport_height,
-            warnings: Vec::new(),
-        };
-        session.bind(page).await?;
-        Ok(session)
-    }
-
-    pub(crate) async fn bind(&mut self, page: &Page) -> Result<(), String> {
-        if self
-            .source
-            .as_ref()
-            .is_some_and(|source| source.page.target_id() == page.target_id())
-        {
-            return Ok(());
-        }
-        self.stop_source().await;
-        let Some(recorder) = &self.recorder else {
-            return Ok(());
-        };
-        let mut events = page
-            .event_listener::<EventScreencastFrame>()
-            .await
-            .map_err(|error| format!("listen for screencast frames: {error}"))?;
-        page.execute(
-            StartScreencastParams::builder()
-                .format(StartScreencastFormat::Jpeg)
-                .quality(90)
-                .max_width(i64::from(self.viewport_width))
-                .max_height(i64::from(self.viewport_height))
-                .every_nth_frame(1)
-                .build(),
-        )
-        .await
-        .map_err(|error| format!("start screencast: {error}"))?;
-        let sink = recorder.frame_sink();
-        let task_page = page.clone();
-        let (stop, mut stop_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => return Ok(()),
-                    event = events.next() => {
-                        let Some(event) = event else {
-                            return Err("screencast event stream closed".to_owned());
-                        };
-                        task_page
-                            .execute(ScreencastFrameAckParams::new(event.session_id))
-                            .await
-                            .map_err(|error| format!("acknowledge screencast frame: {error}"))?;
-                        let jpeg = base64::engine::general_purpose::STANDARD
-                            .decode(event.data.as_ref() as &[u8])
-                            .map_err(|error| format!("decode screencast frame: {error}"))?;
-                        sink.push_frame(jpeg);
-                    }
-                }
-            }
-        });
-        self.source = Some(ScreencastSource {
-            page: page.clone(),
-            stop: Some(stop),
-            task,
-        });
-        Ok(())
-    }
-
-    async fn stop_source(&mut self) {
-        let Some(mut source) = self.source.take() else {
-            return;
-        };
-        if let Some(error) = stop_screencast(&source.page).await {
-            self.warnings.push(error);
-        }
-        if let Some(stop) = source.stop.take() {
-            let _ = stop.send(());
-        }
-        match tokio::time::timeout(SECONDARY_TIMEOUT, &mut source.task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => self.warnings.push(error),
-            Ok(Err(error)) => self
-                .warnings
-                .push(format!("screencast task failed: {error}")),
-            Err(_) => {
-                source.task.abort();
-                self.warnings
-                    .push("screencast task shutdown timed out".to_owned());
-            }
-        }
-    }
-
-    pub(crate) async fn finalize(mut self) -> SessionRecordingFinish {
-        let final_frame = if let Some(source) = &self.source {
-            settle_video(&source.page).await;
-            match source
-                .page
-                .screenshot(
-                    ScreenshotParams::builder()
-                        .format(CaptureScreenshotFormat::Jpeg)
-                        .quality(90)
-                        .build(),
-                )
-                .await
-            {
-                Ok(frame) => Some(frame),
-                Err(error) => {
-                    self.warnings
-                        .push(format!("capture final recording frame: {error}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        self.stop_source().await;
-        if let (Some(recorder), Some(frame)) = (&self.recorder, final_frame) {
-            recorder.push_frame(frame);
-        }
-        let result = match self.recorder.take() {
-            Some(recorder) => {
-                tokio::time::timeout(
-                    VIDEO_FINALIZE_TIMEOUT,
-                    recorder.finalize(Instant::now(), false),
-                )
-                .await
-            }
-            None => return self.finish_result(None),
-        };
-        let path = match result {
-            Ok(Ok(path)) => path,
-            Ok(Err(error)) => {
-                self.warnings.push(error.to_string());
-                None
-            }
-            Err(_) => {
-                self.warnings
-                    .push("video finalization timed out".to_owned());
-                None
-            }
-        };
-        self.finish_result(path)
-    }
-
-    fn finish_result(self, path: Option<PathBuf>) -> SessionRecordingFinish {
-        let partial = self
-            .partial_path
-            .exists()
-            .then(|| path_text(&self.partial_path));
-        let complete = path.or_else(|| self.output_path.exists().then(|| self.output_path.clone()));
-        SessionRecordingFinish {
-            status: if complete.is_some() {
-                "complete"
-            } else if partial.is_some() {
-                "partial"
-            } else {
-                "failed"
-            },
-            path: complete.as_deref().map(path_text),
-            partial_path: partial,
-            warnings: self.warnings,
-        }
-    }
-}
-
-enum VideoStartup {
-    Ready(Option<VideoSession>),
-    Cancelled(Option<Result<Option<PathBuf>, VideoFinishError>>),
-}
-
-impl VideoSession {
-    async fn finish(
-        mut self,
-        page: &Page,
-        flow_failed: bool,
-        stop_at: Instant,
-    ) -> Result<Option<PathBuf>, VideoFinishError> {
-        let mut errors = Vec::new();
-        if let Some(error) = stop_screencast(page).await {
-            errors.push(error);
-        }
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        let (recorder, stream_result) =
-            match tokio::time::timeout(SECONDARY_TIMEOUT, &mut self.task).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    return Err(VideoFinishError::Complete {
-                        error: format!("screencast task failed: {error}"),
-                        partial: self.partial_path.clone(),
-                        recording: None,
-                    });
-                }
-                Err(_) => {
-                    self.task.abort();
-                    let _ = (&mut self.task).await;
-                    return Err(VideoFinishError::Complete {
-                        error: "screencast task shutdown timed out".to_owned(),
-                        partial: self.partial_path.clone(),
-                        recording: None,
-                    });
-                }
-            };
-        if let Err(error) = stream_result {
-            errors.push(error);
-        }
-        let recording = match tokio::time::timeout(
-            VIDEO_FINALIZE_TIMEOUT,
-            recorder.finalize(stop_at, should_retain_video(flow_failed, &errors)),
-        )
-        .await
-        {
-            Ok(Ok(recording)) => recording,
-            Ok(Err(error)) => {
-                return Err(VideoFinishError::Complete {
-                    error: error.to_string(),
-                    partial: self.partial_path.clone(),
-                    recording: None,
-                });
-            }
-            Err(_) => {
-                return Err(VideoFinishError::Complete {
-                    error: "video finalization timed out".to_owned(),
-                    partial: self.partial_path.clone(),
-                    recording: None,
-                });
-            }
-        };
-        if !errors.is_empty() {
-            return Err(VideoFinishError::Complete {
-                error: errors.join("; "),
-                partial: self.partial_path.clone(),
-                recording,
-            });
-        }
-        Ok(recording)
-    }
-}
-
-impl Drop for VideoSession {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-fn should_retain_video(flow_failed: bool, screencast_errors: &[String]) -> bool {
-    flow_failed || !screencast_errors.is_empty()
-}
-
-enum VideoFinishError {
-    Complete {
-        error: String,
-        partial: PathBuf,
-        recording: Option<PathBuf>,
-    },
-}
-
-fn apply_video_finish(
-    finish: Result<Option<PathBuf>, VideoFinishError>,
-    artifacts: &mut ArtifactPaths,
-    recording_error: &mut Option<String>,
-) {
-    match finish {
-        Ok(Some(path)) => artifacts.recording = Some(path_text(&path)),
-        Ok(None) => {}
-        Err(VideoFinishError::Complete {
-            error,
-            partial,
-            recording,
-        }) => {
-            if let Some(recording) = recording.filter(|path| path.exists()) {
-                artifacts.recording = Some(path_text(&recording));
-            }
-            if partial.exists() {
-                artifacts.partial_recording = Some(path_text(&partial));
-            }
-            *recording_error = Some(error);
-        }
-    }
-}
-
-async fn start_video(
+async fn start_flow_recording(
     page: &Page,
     flow: &CompiledFlow,
     options: &RunOptions,
     deadline: Instant,
-) -> Result<VideoStartup, String> {
+) -> Result<FlowRecordingStartup, String> {
     if is_cancelled(options.cancellation.as_ref()) {
-        return Ok(VideoStartup::Cancelled(None));
+        return Ok(FlowRecordingStartup::Cancelled(None));
     }
     if flow.settings.video == VideoMode::Off {
-        return Ok(VideoStartup::Ready(None));
+        return Ok(FlowRecordingStartup::Ready(None));
     }
     let ffmpeg_path = options
         .ffmpeg_path
         .as_ref()
         .ok_or_else(|| "video is enabled but no FFmpeg path was provided".to_owned())?;
-    let result = match await_video_start(
-        options.cancellation.as_ref(),
+    FlowRecording::start(
+        page,
+        VideoConfig {
+            mode: flow.settings.video,
+            ffmpeg_path: ffmpeg_path.clone(),
+            output_path: options.artifact_directory.join(RECORDING_NAME),
+            viewport_width: flow.settings.viewport.width,
+            viewport_height: flow.settings.viewport.height,
+        },
+        options
+            .cancellation
+            .as_ref()
+            .map(|token| token as &dyn FlowCancellation),
         deadline,
-        tokio::fs::create_dir_all(&options.artifact_directory),
     )
     .await
-    {
-        VideoStartAwait::Ready(result) => result,
-        VideoStartAwait::Cancelled => return Ok(VideoStartup::Cancelled(None)),
-        VideoStartAwait::Deadline => return Err("recording start deadline expired".to_owned()),
-    };
-    result.map_err(|error| format!("create artifact directory: {error}"))?;
-    let config = VideoConfig {
-        mode: flow.settings.video,
-        ffmpeg_path: ffmpeg_path.clone(),
-        output_path: options.artifact_directory.join(RECORDING_NAME),
-        viewport_width: flow.settings.viewport.width,
-        viewport_height: flow.settings.viewport.height,
-    };
-    let partial_path = config.partial_path();
-    let events = match await_video_start(
-        options.cancellation.as_ref(),
-        deadline,
-        page.event_listener::<EventScreencastFrame>(),
-    )
-    .await
-    {
-        VideoStartAwait::Ready(events) => events,
-        VideoStartAwait::Cancelled => return Ok(VideoStartup::Cancelled(None)),
-        VideoStartAwait::Deadline => return Err("recording start deadline expired".to_owned()),
-    };
-    let mut events = events.map_err(|error| error.to_string())?;
-    let command = page.execute(
-        StartScreencastParams::builder()
-            .format(StartScreencastFormat::Jpeg)
-            .quality(90)
-            .max_width(i64::from(flow.settings.viewport.width))
-            .max_height(i64::from(flow.settings.viewport.height))
-            .every_nth_frame(1)
-            .build(),
-    );
-    let started = match await_video_start(options.cancellation.as_ref(), deadline, command).await {
-        VideoStartAwait::Ready(started) => started,
-        VideoStartAwait::Cancelled => {
-            let cleanup = stop_screencast(page).await.map(|error| {
-                Err(VideoFinishError::Complete {
-                    error,
-                    partial: partial_path,
-                    recording: None,
-                })
-            });
-            return Ok(VideoStartup::Cancelled(cleanup));
-        }
-        VideoStartAwait::Deadline => {
-            return Err(video_start_cleanup_error(
-                "recording start deadline expired",
-                stop_screencast(page).await,
-            ));
-        }
-    };
-    if let Err(error) = started {
-        let cleanup = stop_screencast(page).await;
-        return Err(match cleanup {
-            Some(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
-            None => error.to_string(),
-        });
-    }
-    let recorder = match await_video_start(
-        options.cancellation.as_ref(),
-        deadline,
-        VideoRecorder::start(&config),
-    )
-    .await
-    {
-        VideoStartAwait::Ready(recorder) => recorder,
-        VideoStartAwait::Cancelled => {
-            let cleanup = stop_screencast(page).await.map(|error| {
-                Err(VideoFinishError::Complete {
-                    error,
-                    partial: partial_path,
-                    recording: None,
-                })
-            });
-            return Ok(VideoStartup::Cancelled(cleanup));
-        }
-        VideoStartAwait::Deadline => {
-            return Err(video_start_cleanup_error(
-                "recording start deadline expired",
-                stop_screencast(page).await,
-            ));
-        }
-    };
-    let recorder = match recorder {
-        Ok(recorder) => recorder,
-        Err(error) => {
-            let cleanup = stop_screencast(page).await;
-            return Err(match cleanup {
-                Some(cleanup) => format!("{error}; cleanup failed: {cleanup}"),
-                None => error.to_string(),
-            });
-        }
-    };
-    let task_page = page.clone();
-    let (stop, mut stop_rx) = oneshot::channel();
-    let (first_frame, first_frame_rx) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        let mut first_frame = Some(first_frame);
-        let result = loop {
-            tokio::select! {
-                _ = &mut stop_rx => break Ok(()),
-                event = events.next() => {
-                    let Some(event) = event else {
-                        break Err("screencast event stream closed".to_owned());
-                    };
-                    if let Err(error) = task_page.execute(ScreencastFrameAckParams::new(event.session_id)).await {
-                        break Err(format!("acknowledge screencast frame: {error}"));
-                    }
-                    match base64::engine::general_purpose::STANDARD.decode(event.data.as_ref() as &[u8]) {
-                        Ok(jpeg) => {
-                            recorder.push_frame(jpeg);
-                            if let Some(first_frame) = first_frame.take() {
-                                let _ = first_frame.send(());
-                            }
-                        }
-                        Err(error) => break Err(format!("decode screencast frame: {error}")),
-                    }
-                }
-            }
-        };
-        (recorder, result)
-    });
-    let session = VideoSession {
-        stop: Some(stop),
-        task,
-        partial_path,
-    };
-    let first_frame =
-        match await_video_start(options.cancellation.as_ref(), deadline, first_frame_rx).await {
-            VideoStartAwait::Ready(first_frame) => first_frame,
-            VideoStartAwait::Cancelled => {
-                return Ok(VideoStartup::Cancelled(Some(
-                    session.finish(page, true, Instant::now()).await,
-                )));
-            }
-            VideoStartAwait::Deadline => {
-                let cleanup = session
-                    .finish(page, true, Instant::now())
-                    .await
-                    .err()
-                    .map(|VideoFinishError::Complete { error, .. }| error);
-                return Err(video_start_cleanup_error(
-                    "recording start deadline expired",
-                    cleanup,
-                ));
-            }
-        };
-    let first_frame_error = match first_frame {
-        Ok(()) => return Ok(VideoStartup::Ready(Some(session))),
-        Err(_) => "screencast ended before the first frame".to_owned(),
-    };
-    let cleanup_error = session
-        .finish(page, true, Instant::now())
-        .await
-        .err()
-        .map(|VideoFinishError::Complete { error, .. }| error);
-    Err(match cleanup_error {
-        Some(cleanup) => format!("{first_frame_error}; cleanup failed: {cleanup}"),
-        None => first_frame_error,
-    })
-}
-
-enum VideoStartAwait<T> {
-    Ready(T),
-    Cancelled,
-    Deadline,
-}
-
-async fn await_video_start<T>(
-    cancellation: Option<&CancellationToken>,
-    deadline: Instant,
-    future: impl Future<Output = T>,
-) -> VideoStartAwait<T> {
-    tokio::select! {
-        biased;
-        _ = wait_for_cancellation(cancellation) => VideoStartAwait::Cancelled,
-        result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future) => {
-            match result {
-                Ok(result) => VideoStartAwait::Ready(result),
-                Err(_) => VideoStartAwait::Deadline,
-            }
-        }
-    }
-}
-
-fn video_start_cleanup_error(message: &str, cleanup: Option<String>) -> String {
-    cleanup.map_or_else(
-        || message.to_owned(),
-        |cleanup| format!("{message}; cleanup failed: {cleanup}"),
-    )
-}
-
-async fn stop_screencast(page: &Page) -> Option<String> {
-    match tokio::time::timeout(
-        SECONDARY_TIMEOUT,
-        page.execute(StopScreencastParams::default()),
-    )
-    .await
-    {
-        Ok(Ok(_)) => None,
-        Ok(Err(error)) => Some(format!("stop screencast: {error}")),
-        Err(_) => Some("stop screencast timed out".to_owned()),
-    }
 }
 
 async fn capture_failure_screenshot(active: &ActiveContext, directory: &Path) -> Option<PathBuf> {

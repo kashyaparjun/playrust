@@ -10,12 +10,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::browser::BrowserHost;
 use crate::browser_session::{BrowserSession, BrowserSessionClose, BrowserSessionOptions};
-use crate::flow::{CompiledFlow, VideoMode, compile_inline_yaml, compile_inline_yaml_with_video};
+use crate::flow::{CompiledFlow, VideoMode, compile_inline_yaml};
 use crate::report::{
-    AggregateReport, ChromiumInfo, ExitCode, FlowReport, FlowStatus, RunnerInfo,
-    write_aggregate_report,
+    AggregateReport, ChromiumInfo, ExitCode, FlowReport, RunnerInfo, write_aggregate_report,
 };
-use crate::runner::{CancellationToken, RunOptions, SessionSettings};
+use crate::runner::SessionSettings;
 use crate::session_dialog::DialogPolicy;
 use crate::session_journal::{
     ActionOutcome, JournalEvent, JournalWriter, build_replay_yaml, is_safe_bundle_name,
@@ -25,6 +24,8 @@ use crate::session_snapshot::{ElementRef, ReferenceError};
 
 /// Maximum bytes before the newline in one NDJSON command envelope.
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+const REMOVED_COMMANDS: &[&str] = &["submit", "inspect", "output", "cancel"];
 
 const SESSION_NOT_OPEN_MESSAGE: &str = "the browser session is not open";
 
@@ -49,17 +50,6 @@ struct Request {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum SessionCommand {
-    Submit {
-        flow: String,
-        #[serde(default)]
-        variables: BTreeMap<String, String>,
-    },
-    Inspect {
-        #[serde(default)]
-        accessibility: bool,
-        #[serde(default)]
-        screenshot: bool,
-    },
     Snapshot {
         #[serde(default)]
         screenshot: SnapshotScreenshot,
@@ -82,10 +72,6 @@ enum SessionCommand {
     Export {
         name: String,
     },
-    Output {
-        name: String,
-    },
-    Cancel,
     Close,
 }
 
@@ -129,11 +115,15 @@ struct ProtocolError {
     details: Option<Value>,
 }
 
+#[derive(Debug)]
+enum DecodeError {
+    Invalid(Value, String),
+    UnknownCommand(Value, String),
+}
+
 struct ProtocolState {
     id: String,
     revision: u64,
-    submissions: u64,
-    inspections: u64,
     started: Instant,
     reports: Vec<FlowReport>,
     artifacts: PathBuf,
@@ -286,8 +276,6 @@ pub async fn run(options: SessionOptions) -> ExitCode {
     let mut state = ProtocolState {
         id: session_id,
         revision: 0,
-        submissions: 0,
-        inspections: 0,
         started: Instant::now(),
         reports: Vec::new(),
         artifacts: session_artifacts.clone(),
@@ -381,7 +369,15 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         };
         let request = match decode_request(&line) {
             Ok(request) => request,
-            Err((id, message)) => {
+            Err(DecodeError::UnknownCommand(id, message)) => {
+                let response = state.error(id, "unknown_command", message, None);
+                if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
+                    break;
+                }
+                continue;
+            }
+            Err(DecodeError::Invalid(id, message)) => {
                 let response = state.error(id, "invalid_command", message, None);
                 if write_response(&mut stdout, &response).await.is_err() {
                     exit_code = ExitCode::Infrastructure;
@@ -392,312 +388,6 @@ pub async fn run(options: SessionOptions) -> ExitCode {
         };
 
         match request.command {
-            SessionCommand::Submit { flow, variables } => {
-                let outputs = session
-                    .as_ref()
-                    .map(BrowserSession::output_names)
-                    .unwrap_or_default();
-                if let Some(pending) = session.as_ref().and_then(BrowserSession::pending_dialog) {
-                    let response = state.error(
-                        request.id,
-                        "dialog_pending",
-                        "handle the pending native dialog before submitting",
-                        Some(json!(pending)),
-                    );
-                    if write_response(&mut stdout, &response).await.is_err() {
-                        exit_code = ExitCode::Infrastructure;
-                        break;
-                    }
-                    continue;
-                }
-                let mut compiled = match compile_inline_yaml_with_video(
-                    &flow,
-                    format!("submission-{:06}.yaml", state.submissions + 1),
-                    &variables,
-                    &outputs,
-                    Some(VideoMode::Off),
-                ) {
-                    Ok(flow) => flow,
-                    Err(error) => {
-                        let response =
-                            state.error(request.id, "validation", error.to_string(), None);
-                        if write_response(&mut stdout, &response).await.is_err() {
-                            exit_code = ExitCode::Infrastructure;
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                if let Some(existing) = &session
-                    && !existing.settings_match(&compiled)
-                {
-                    let response = state.error(
-                        request.id,
-                        "settings_conflict",
-                        "viewport and geolocation must match the first submission",
-                        None,
-                    );
-                    if write_response(&mut stdout, &response).await.is_err() {
-                        exit_code = ExitCode::Infrastructure;
-                        break;
-                    }
-                    continue;
-                }
-                let active_session =
-                    match require_session_mut(&mut session, &mut state, request.id.clone()) {
-                        Ok(opened) => opened,
-                        Err(response) => {
-                            if write_response(&mut stdout, &response).await.is_err() {
-                                exit_code = ExitCode::Infrastructure;
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-                compiled.settings.video = VideoMode::Off;
-                register_flow_secrets(&mut state.journal, &compiled);
-
-                state.submissions += 1;
-                let directory = state
-                    .artifacts
-                    .join(format!("submission-{:06}", state.submissions));
-                let cancellation = CancellationToken::new();
-                let mut run_options =
-                    RunOptions::new(directory).with_cancellation(cancellation.clone());
-                if compiled.settings.video != VideoMode::Off {
-                    run_options = run_options.with_ffmpeg(
-                        options
-                            .ffmpeg_path
-                            .clone()
-                            .unwrap_or_else(|| PathBuf::from("ffmpeg")),
-                    );
-                }
-                let mut execution =
-                    Box::pin(active_session.execute(&host, &compiled, &run_options));
-                let mut requested_close = None;
-                let mut input_closed = false;
-                let mut cancellation_requested = false;
-                let report = loop {
-                    tokio::select! {
-                        report = &mut execution => break report,
-                        command = input.read_envelope(), if requested_close.is_none() && !input_closed => {
-                            let response = match command {
-                                Ok(Envelope::Line(line)) => match decode_request(&line) {
-                                    Ok(Request { id, command: SessionCommand::Cancel }) => {
-                                        cancellation.cancel();
-                                        cancellation_requested = true;
-                                        Some(state.response(id, json!({ "cancelling": true })))
-                                    }
-                                    Ok(Request { id, command: SessionCommand::Close }) => {
-                                        cancellation.cancel();
-                                        cancellation_requested = true;
-                                        requested_close = Some(id);
-                                        None
-                                    }
-                                    Ok(Request { id, .. }) => Some(state.error(
-                                        id,
-                                        "busy",
-                                        "one mutating submission is already active",
-                                        None,
-                                    )),
-                                    Err((id, message)) => Some(state.error(
-                                        id,
-                                        "invalid_command",
-                                        message,
-                                        None,
-                                    )),
-                                },
-                                Ok(Envelope::TooLarge) => Some(state.error(
-                                    Value::Null,
-                                    "envelope_too_large",
-                                    format!("command envelope exceeds {MAX_ENVELOPE_BYTES} bytes"),
-                                    Some(json!({ "max_bytes": MAX_ENVELOPE_BYTES })),
-                                )),
-                                Ok(Envelope::Eof) => {
-                                    cancellation.cancel();
-                                    cancellation_requested = true;
-                                    input_closed = true;
-                                    None
-                                }
-                                Err(error) => {
-                                    eprintln!("error: read session command: {error}");
-                                    cancellation.cancel();
-                                    cancellation_requested = true;
-                                    exit_code = ExitCode::Infrastructure;
-                                    input_closed = true;
-                                    None
-                                }
-                            };
-                            if let Some(response) = response
-                                && write_response(&mut stdout, &response).await.is_err()
-                            {
-                                cancellation.cancel();
-                                cancellation_requested = true;
-                                exit_code = ExitCode::Infrastructure;
-                            }
-                        }
-                    }
-                };
-                drop(execution);
-                let mut report = match report {
-                    Ok(report) => report,
-                    Err(error) => {
-                        let response =
-                            state.error(request.id, "settings_conflict", error.to_string(), None);
-                        if write_response(&mut stdout, &response).await.is_err() {
-                            exit_code = ExitCode::Infrastructure;
-                            close_session = true;
-                        }
-                        continue;
-                    }
-                };
-                let fatal = report.failures.iter().any(|failure| {
-                    matches!(
-                        failure.category,
-                        crate::report::FailureCategory::BrowserLaunch
-                            | crate::report::FailureCategory::BrowserCrash
-                            | crate::report::FailureCategory::Protocol
-                            | crate::report::FailureCategory::Recording
-                    )
-                });
-                if cancellation_requested && !fatal {
-                    report.status = FlowStatus::Interrupted;
-                }
-                state.reports.push(report.clone());
-                if let Err(error) = state.append(JournalEvent::Submission {
-                    outcome: if report.status == FlowStatus::Passed {
-                        ActionOutcome::Success
-                    } else {
-                        ActionOutcome::Failed {
-                            error: "submission did not pass".to_owned(),
-                        }
-                    },
-                }) {
-                    let response = state.error(request.id, "artifacts", error.to_string(), None);
-                    let _ = write_response(&mut stdout, &response).await;
-                    exit_code = ExitCode::Infrastructure;
-                    close_session = true;
-                    continue;
-                }
-                if let Err(error) = state.write_report(&chromium) {
-                    let response = state.error(
-                        request.id,
-                        "artifacts",
-                        error.to_string(),
-                        Some(json!(report)),
-                    );
-                    let _ = write_response(&mut stdout, &response).await;
-                    exit_code = ExitCode::Infrastructure;
-                    if let Some(close_id) = requested_close {
-                        let response = match session.take() {
-                            Some(opened) => match opened.close(&host).await {
-                                Ok(result) => state.response(close_id, json!({ "closed": true, "recording": result.recording, "warnings": result.warnings })),
-                                Err(close_error) => {
-                                    state.error(close_id, "browser", close_error.to_string(), None)
-                                }
-                            },
-                            None => state.response(close_id, json!({ "closed": true })),
-                        };
-                        let _ = write_response(&mut stdout, &response).await;
-                    }
-                    close_session = true;
-                    continue;
-                }
-                let response = if report.status == FlowStatus::Passed {
-                    state.response(request.id, json!(report))
-                } else {
-                    state.error(
-                        request.id,
-                        if fatal {
-                            "browser"
-                        } else if report.status == FlowStatus::Interrupted {
-                            "cancelled"
-                        } else {
-                            "submission_failed"
-                        },
-                        "submission did not pass",
-                        Some(json!(report)),
-                    )
-                };
-                if write_response(&mut stdout, &response).await.is_err() {
-                    exit_code = ExitCode::Infrastructure;
-                    close_session = true;
-                }
-                if fatal {
-                    exit_code = ExitCode::Infrastructure;
-                } else if report.status == FlowStatus::Interrupted
-                    && exit_code != ExitCode::Infrastructure
-                {
-                    exit_code = ExitCode::Interrupted;
-                }
-                if let Some(close_id) = requested_close {
-                    let response = match session.take() {
-                        Some(opened) => match opened.close(&host).await {
-                            Ok(mut result) => match publish_close_artifacts(
-                                &mut state,
-                                &chromium,
-                                &mut result,
-                            ) {
-                                Ok(()) => state.response(close_id, json!({ "closed": true, "bundle": state.bundle, "recording": result.recording, "warnings": result.warnings })),
-                                Err(error) => {
-                                    exit_code = ExitCode::Infrastructure;
-                                    state.error(close_id, "artifacts", error.to_string(), None)
-                                }
-                            },
-                            Err(error) => {
-                                exit_code = ExitCode::Infrastructure;
-                                state.error(close_id, "browser", error.to_string(), None)
-                            }
-                        },
-                        None => state.response(close_id, json!({ "closed": true })),
-                    };
-                    if write_response(&mut stdout, &response).await.is_err() {
-                        exit_code = ExitCode::Infrastructure;
-                    }
-                    close_session = true;
-                } else {
-                    close_session |= fatal || report.status == FlowStatus::Interrupted;
-                }
-            }
-            SessionCommand::Inspect {
-                accessibility,
-                screenshot,
-            } => {
-                let opened = match require_session_ref(&session, &mut state, request.id.clone()) {
-                    Ok(opened) => opened,
-                    Err(response) => {
-                        if write_response(&mut stdout, &response).await.is_err() {
-                            exit_code = ExitCode::Infrastructure;
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                state.inspections += 1;
-                let directory = screenshot.then(|| {
-                    state
-                        .artifacts
-                        .join(format!("inspection-{:06}", state.inspections))
-                });
-                match opened
-                    .inspect(&host, accessibility, directory.as_deref())
-                    .await
-                {
-                    Ok(inspection) => {
-                        let response = state.response(request.id, json!(inspection));
-                        if write_response(&mut stdout, &response).await.is_err() {
-                            exit_code = ExitCode::Infrastructure;
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let response = state.error(request.id, "browser", error.to_string(), None);
-                        let _ = write_response(&mut stdout, &response).await;
-                        exit_code = ExitCode::Infrastructure;
-                        close_session = true;
-                    }
-                }
-            }
             SessionCommand::Snapshot {
                 screenshot,
                 accessibility,
@@ -1121,32 +811,6 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                         details,
                     }) => state.error(request.id, code, message, details),
                 };
-                if write_response(&mut stdout, &response).await.is_err() {
-                    exit_code = ExitCode::Infrastructure;
-                    break;
-                }
-            }
-            SessionCommand::Output { name } => {
-                let value = session.as_ref().and_then(|session| session.output(&name));
-                let response = match value {
-                    Some(value) => {
-                        state.response(request.id, json!({ "name": name, "value": value }))
-                    }
-                    None => state.error(
-                        request.id,
-                        "output_not_found",
-                        format!("runtime output {name:?} is unavailable"),
-                        None,
-                    ),
-                };
-                if write_response(&mut stdout, &response).await.is_err() {
-                    exit_code = ExitCode::Infrastructure;
-                    break;
-                }
-            }
-            SessionCommand::Cancel => {
-                let response =
-                    state.error(request.id, "not_active", "no submission is active", None);
                 if write_response(&mut stdout, &response).await.is_err() {
                     exit_code = ExitCode::Infrastructure;
                     break;
@@ -1593,7 +1257,7 @@ fn publish_close_artifacts(
 
 fn finalize_bundle(
     state: &mut ProtocolState,
-    recording: &mut crate::runner::SessionRecordingFinish,
+    recording: &mut crate::recording::SessionRecordingFinish,
 ) -> anyhow::Result<()> {
     let Some(bundle) = &state.bundle else {
         return Ok(());
@@ -1704,11 +1368,21 @@ impl<R: AsyncBufRead + Unpin> EnvelopeReader<R> {
     }
 }
 
-fn decode_request(line: &[u8]) -> Result<Request, (Value, String)> {
-    let value: Value =
-        serde_json::from_slice(line).map_err(|error| (Value::Null, error.to_string()))?;
+fn decode_request(line: &[u8]) -> Result<Request, DecodeError> {
+    let value: Value = serde_json::from_slice(line)
+        .map_err(|error| DecodeError::Invalid(Value::Null, error.to_string()))?;
     let id = value.get("id").cloned().unwrap_or(Value::Null);
-    serde_json::from_value(value).map_err(|error| (id, error.to_string()))
+    if let Some(command) = value.get("command").and_then(Value::as_str)
+        && REMOVED_COMMANDS.contains(&command)
+    {
+        return Err(DecodeError::UnknownCommand(
+            id,
+            format!(
+                "command {command:?} was removed in v0.3.0; use act/snapshot for interactive work or playrust run for headless YAML"
+            ),
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| DecodeError::Invalid(id, error.to_string()))
 }
 
 async fn write_response(
@@ -1735,11 +1409,10 @@ mod tests {
 
     #[test]
     fn requests_preserve_ids_and_reject_unknown_commands() {
-        let request = decode_request(br#"{"id":"a","command":"output","name":"value"}"#)
-            .expect("decode request");
-        assert_eq!(request.id, "a");
+        let error = decode_request(br#"{"id":"a","command":"output","name":"value"}"#).unwrap_err();
+        assert!(matches!(error, DecodeError::UnknownCommand(id, _) if id == "a"));
         let error = decode_request(br#"{"id":7,"command":"unknown"}"#).unwrap_err();
-        assert_eq!(error.0, 7);
+        assert!(matches!(error, DecodeError::Invalid(id, _) if id == 7));
     }
 
     #[test]
@@ -1862,9 +1535,8 @@ mod tests {
         let Envelope::Line(line) = reader.read_envelope().await.unwrap() else {
             panic!("expected completed envelope");
         };
-        let request = decode_request(&line).unwrap();
-        assert!(matches!(request.command, SessionCommand::Cancel));
-        assert_eq!(request.id, "cancel");
+        let error = decode_request(&line).unwrap_err();
+        assert!(matches!(error, DecodeError::UnknownCommand(id, _) if id == "cancel"));
     }
 
     #[test]
@@ -1895,7 +1567,7 @@ mod tests {
     fn invalid_utf8_is_an_invalid_command_with_a_null_id() {
         let error =
             decode_request(b"{\"id\":\"lost\",\"command\":\"cancel\",\"x\":\xff}").unwrap_err();
-        assert_eq!(error.0, Value::Null);
+        assert!(matches!(error, DecodeError::Invalid(Value::Null, _)));
     }
 
     #[test]
@@ -1905,8 +1577,6 @@ mod tests {
         let mut state = ProtocolState {
             id: "session".to_owned(),
             revision: 0,
-            submissions: 0,
-            inspections: 0,
             started: Instant::now(),
             reports: Vec::new(),
             artifacts: std::path::Path::new("artifacts").to_owned(),
@@ -1945,36 +1615,6 @@ mod tests {
     }
 
     #[test]
-    fn submit_not_started_skips_submission_side_effects() {
-        let mut ctx = test_protocol();
-        let mut session: Option<()> = None;
-        let submissions_before = ctx.state.submissions;
-        let events_before = ctx.state.events.len();
-
-        let rejected = match require_session_mut(&mut session, &mut ctx.state, json!(1)) {
-            Ok(_) => {
-                ctx.state.submissions += 1;
-                ctx.state
-                    .append(JournalEvent::RecorderWarning {
-                        warning: "should not register".to_owned(),
-                    })
-                    .unwrap();
-                panic!("expected not_started before submission side effects");
-            }
-            Err(response) => response,
-        };
-
-        assert_eq!(rejected.error.expect("error").code, "not_started");
-        assert_eq!(ctx.state.submissions, submissions_before);
-        assert_eq!(ctx.state.events.len(), events_before);
-        assert!(
-            std::fs::read_to_string(&ctx.state.journal_path)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn export_not_started_skips_report_persistence() {
         let mut ctx = test_protocol();
         let session: Option<()> = None;
@@ -2003,8 +1643,6 @@ mod tests {
         let state = ProtocolState {
             id: "session".to_owned(),
             revision: 0,
-            submissions: 0,
-            inspections: 0,
             started: Instant::now(),
             reports: Vec::new(),
             artifacts: directory.path().to_owned(),
