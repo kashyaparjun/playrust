@@ -67,17 +67,21 @@ For a local checkout:
 cargo install --path .
 ```
 
-Run `playrust browser install` to preinstall the browser. `playrust run` also
-installs pinned Chrome for Testing `151.0.7922.34` automatically if needed. You
-can instead provide that exact build with `--browser PATH` or `PLAYRUST_CHROME`.
+Run `playrust browser install` to preinstall the pinned Chrome for Testing
+build and the pinned FFmpeg build. `playrust run` also installs Chrome
+`151.0.7922.34` automatically if needed, and FFmpeg when video is enabled. You
+can instead provide that exact Chrome build with `--browser PATH` or
+`PLAYRUST_CHROME`.
 
-Video recording uses a pinned FFmpeg `7.1.5` static build (GPL-licensed; invoked
-as a separate process, not linked). Linux and Windows builds come from
-[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds); macOS builds come
-from [evermeet.cx](https://evermeet.cx/ffmpeg/). `playrust run` and
+Video recording uses a pinned FFmpeg static build (GPL-licensed; invoked as a
+separate process, not linked). Linux and Windows builds are BtbN GPL autobuild
+`7.1.5`; macOS x86_64 uses [evermeet.cx](https://evermeet.cx/ffmpeg/) `7.1`;
+macOS arm64 uses [osxexperts/martin-riedl](https://ffmpeg.martin-riedl.de/)
+static `9.0` because evermeet does not ship Apple Silicon. `playrust run` and
 `playrust session` auto-install FFmpeg into `~/.cache/playrust/ffmpeg/` when
-video is enabled. Preinstall with `playrust ffmpeg install`, or override with
-`--ffmpeg-path PATH` or `PLAYRUST_FFMPEG`.
+video is enabled. Preinstall with `playrust ffmpeg install` or
+`playrust browser install`, or override with `--ffmpeg-path PATH` or
+`PLAYRUST_FFMPEG`.
 
 ## Agent sessions
 

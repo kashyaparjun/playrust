@@ -38,15 +38,7 @@ fn provisioning_e2e_enabled() -> bool {
 }
 
 fn require_chrome(test_name: &str) -> Option<PathBuf> {
-    env::var_os(install::CHROME_ENV)
-        .map(PathBuf::from)
-        .filter(|path| {
-            if path.is_file() {
-                return true;
-            }
-            eprintln!("SKIP {test_name}: set PLAYRUST_CHROME to a pinned Chrome executable");
-            false
-        })
+    support::require_browser(test_name)
 }
 
 struct ProvisionedFfmpeg {

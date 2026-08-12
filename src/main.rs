@@ -191,6 +191,7 @@ struct BrowserArgs {
 
 #[derive(Debug, Subcommand)]
 enum BrowserCommand {
+    /// Download and validate the pinned Chrome for Testing build, and the pinned FFmpeg build.
     Install,
 }
 
@@ -202,6 +203,7 @@ struct FfmpegArgs {
 
 #[derive(Debug, Subcommand)]
 enum FfmpegCommand {
+    /// Download and checksum-verify the pinned FFmpeg and ffprobe builds.
     Install,
 }
 
@@ -260,12 +262,24 @@ async fn main() {
         Command::Browser(BrowserArgs {
             command: BrowserCommand::Install,
         }) => match install_browser().await {
-            Ok(path) => {
+            Ok(chrome) => {
                 println!(
                     "Installed Chrome for Testing {PINNED_CHROME_VERSION}: {}",
-                    path.display()
+                    chrome.display()
                 );
-                ExitCode::Success
+                match install_ffmpeg().await {
+                    Ok(path) => {
+                        println!(
+                            "Installed FFmpeg {PINNED_FFMPEG_VERSION} (ffmpeg + ffprobe): {}",
+                            path.display()
+                        );
+                        ExitCode::Success
+                    }
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        ExitCode::Infrastructure
+                    }
+                }
             }
             Err(error) => {
                 eprintln!("error: {error}");
