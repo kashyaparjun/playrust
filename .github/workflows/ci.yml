@@ -96,6 +96,7 @@ jobs:
           --test html_artifact_viewer_e2e
           --test presentation_overlays_e2e
           --test e2e_prerequisites_e2e
+          --test session_error_handling_e2e
           -- --test-threads=1 --show-output
       - name: Run pause cancellation test
         env:

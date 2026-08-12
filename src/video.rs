@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::{
     ffi::{OsStr, OsString},
     fmt,
@@ -213,6 +215,11 @@ struct SharedState {
     first_frame_received: bool,
     stop_at: Option<Instant>,
 }
+// Invariant: Mutex poison only follows a panic in a prior holder.
+#[allow(clippy::expect_used)]
+fn lock_frame_state(shared: &Mutex<SharedState>) -> std::sync::MutexGuard<'_, SharedState> {
+    shared.lock().expect("video frame state poisoned")
+}
 
 pub struct VideoRecorder {
     mode: VideoMode,
@@ -416,7 +423,7 @@ impl VideoRecorder {
 impl VideoFrameSink {
     /// Replaces any queued frame without blocking the source event loop.
     pub fn push_frame_at(&self, jpeg: Vec<u8>, received_at: Instant) {
-        let mut shared = self.shared.lock().expect("video frame state poisoned");
+        let mut shared = lock_frame_state(&self.shared);
         if shared.stop_at.is_some() {
             return;
         }
@@ -435,12 +442,7 @@ impl VideoFrameSink {
         let deadline = time::Instant::now() + wait;
         loop {
             let notified = self.first_frame_notify.notified();
-            if self
-                .shared
-                .lock()
-                .expect("video frame state poisoned")
-                .first_frame_received
-            {
+            if lock_frame_state(&self.shared).first_frame_received {
                 return Ok(());
             }
             if time::timeout_at(deadline, notified).await.is_err() {
@@ -450,9 +452,7 @@ impl VideoFrameSink {
     }
 
     pub fn begin_finalization(&self, stop_at: Instant) {
-        self.shared
-            .lock()
-            .expect("video frame state poisoned")
+        lock_frame_state(&self.shared)
             .stop_at
             .get_or_insert(stop_at);
         self.writer_notify.notify_one();
@@ -514,7 +514,7 @@ where
     loop {
         let notified = notify.notified();
         let (frame, stop_at) = {
-            let mut shared = shared.lock().expect("video frame state poisoned");
+            let mut shared = lock_frame_state(&shared);
             (shared.latest.take(), shared.stop_at)
         };
 
@@ -667,6 +667,7 @@ fn output_text(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

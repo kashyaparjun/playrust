@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
@@ -285,6 +287,9 @@ impl ActiveContext {
     fn target(&self) -> CdpTarget<'_> {
         self.oopif_index()
             .map_or(CdpTarget::Root(&self.page), |index| {
+                // Invariant: oopif_index() only returns Some when self.router
+                // is Some and has_target for that frame, so as_deref succeeds.
+                #[allow(clippy::expect_used)]
                 CdpTarget::Oopif(
                     self.router.as_deref().expect("OOPIF router missing"),
                     self.frames[index].id.as_ref(),
@@ -301,6 +306,9 @@ impl ActiveContext {
                     .is_some_and(|router| router.has_target(frame.id.as_ref()))
             })
             .map_or(CdpTarget::Root(&self.page), |index| {
+                // Invariant: rposition only matches when router is Some and
+                // has_target for that frame, so as_deref succeeds.
+                #[allow(clippy::expect_used)]
                 CdpTarget::Oopif(
                     self.router.as_deref().expect("OOPIF router missing"),
                     self.frames[index].id.as_ref(),
@@ -695,6 +703,9 @@ impl SessionRuntime {
                 return Ok(locator.clone());
             }
         }
+        #[allow(clippy::expect_used)]
+        // Invariant: role candidate enumeration always pushes at least the
+        // primary role locator before this call site, so pop cannot be None.
         let mut locator = candidates.pop().expect("role candidate exists");
         let all = self.active.locator().resolve_all(&locator).await?;
         locator.index = all
@@ -714,7 +725,11 @@ impl SessionRuntime {
     where
         F: Future<Output = ()>,
     {
-        let step = flow.steps.first().expect("interactive flow has one step");
+        let step = flow.steps.first().ok_or_else(|| InteractiveStepError {
+            category: FailureCategory::Protocol,
+            message: "interactive flow has no steps".into(),
+            last_observed: None,
+        })?;
         let context_id = self
             .context
             .as_ref()
@@ -722,7 +737,11 @@ impl SessionRuntime {
             // which stores an open browser context; context is only taken by
             // close(), which consumes the runtime. This method runs before
             // close, so context is always Some.
-            .expect("open session context on a live runtime")
+            .ok_or_else(|| InteractiveStepError {
+                category: FailureCategory::Protocol,
+                message: "the browser session is not open".into(),
+                last_observed: None,
+            })?
             .id()
             .clone();
         let placeholder = ActiveContext::new(self.active.page.clone());
@@ -878,7 +897,7 @@ impl SessionRuntime {
             // Invariant: SessionRuntime is only constructed with an open
             // context, and context is only taken by close(), which consumes
             // the runtime. inspect runs on a live session, so context is Some.
-            .expect("open session context on a live runtime");
+            .ok_or_else(|| anyhow::anyhow!("the browser session is not open"))?;
         let target_id = self.active.page.target_id();
         let targets = host
             .browser()
@@ -970,7 +989,7 @@ impl SessionRuntime {
                     // Invariant: this is close(); SessionRuntime is only
                     // constructed with an open context and context is taken
                     // only here, exactly once, on the terminal close path.
-                    .expect("close disposes an open session context")),
+                    .ok_or_else(|| anyhow::anyhow!("the browser session is not open"))?),
             ) => match result {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!("dispose browser context timed out")),
@@ -1238,16 +1257,21 @@ async fn execute_flow(
     if is_cancelled(options.cancellation.as_ref()) {
         return report(flow, started, artifacts, Vec::new(), true);
     }
-    let context_id = session
-        .context
-        .as_ref()
-        // Invariant: SessionRuntime::open (which produced `session`) stores an
-        // open browser context; context is only taken by close(), which runs
-        // after execute_flow. execute_flow runs on a live session, so context
-        // is Some.
-        .expect("open session context during execute_flow")
-        .id()
-        .clone();
+    let Some(context) = session.context.as_ref() else {
+        return report(
+            flow,
+            started,
+            artifacts,
+            vec![failure(
+                flow,
+                FailureCategory::Protocol,
+                "the browser session is not open",
+                None,
+            )],
+            false,
+        );
+    };
+    let context_id = context.id().clone();
     let placeholder = ActiveContext::new(session.active.page.clone());
     let mut active = std::mem::replace(&mut session.active, placeholder);
     let page = active.page.clone();
@@ -1392,15 +1416,10 @@ async fn execute_flow(
                 }
                 RecordingControl::Stop => {
                     settle_video(&active.page).await;
-                    video_stop_at = Some(Instant::now());
+                    let stop_at = Instant::now();
+                    video_stop_at = Some(stop_at);
                     if let Some(session) = video.take() {
-                        let finish = session
-                            .finish(
-                                &active.page,
-                                true,
-                                video_stop_at.expect("recording stop set"),
-                            )
-                            .await;
+                        let finish = session.finish(&active.page, true, stop_at).await;
                         apply_video_finish(finish, &mut artifacts, &mut recording_error);
                     }
                     deactivate_presentation_overlay(&active, &mut runtime).await;
@@ -1500,7 +1519,9 @@ async fn execute_flow(
             }
         }
         video_stop_at = Some(Instant::now());
-        let error = error.expect("failed attempt records an error");
+        let Some(error) = error else {
+            break;
+        };
         if let Some(visual) = &error.visual_artifacts {
             match publish_visual_artifacts(&options.artifact_directory, visual).await {
                 Ok(()) => {
@@ -1683,6 +1704,10 @@ async fn update_presentation_overlay(
     };
     // ponytail: values are JSON-serialized before injection; any new dynamic
     // value must go through serde_json::to_string to stay injection-safe.
+    let step_json = serde_json::to_string(&step_text)
+        .map_err(|e| protocol(format!("presentation overlay step does not serialize: {e}")))?;
+    let url_json = serde_json::to_string(&url)
+        .map_err(|e| protocol(format!("presentation overlay URL does not serialize: {e}")))?;
     let script = format!(
         r#"(() => {{
             const tag = 'playrust-presentation-overlay';
@@ -1759,8 +1784,8 @@ async fn update_presentation_overlay(
             add({url});
             shadow.getElementById('pointer').hidden = !{pointer};
         }})()"#,
-        step = serde_json::to_string(&step_text).expect("overlay step serializes"),
-        url = serde_json::to_string(&url).expect("overlay URL serializes"),
+        step = step_json,
+        url = url_json,
         pointer = overlays.pointer,
     );
     tokio::time::timeout(SECONDARY_TIMEOUT, active.page.evaluate(script))
@@ -2254,11 +2279,17 @@ async fn http_request(
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
         .ok_or_else(|| StepError::new(FailureCategory::Request, "request URL is invalid"))?;
-    let method = reqwest::Method::from_bytes(method.as_bytes()).expect("compiled HTTP method");
+    let method = reqwest::Method::from_bytes(method.as_bytes())
+        .map_err(|_| StepError::new(FailureCategory::Request, "request method is invalid"))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("static HTTP client configuration");
+        .map_err(|e| {
+            StepError::new(
+                FailureCategory::Request,
+                format!("HTTP client configuration failed: {e}"),
+            )
+        })?;
     let mut request = client.request(method, url);
     for (name, value) in headers {
         let value = resolve_runtime(value, outputs)?;
@@ -2661,10 +2692,13 @@ async fn switch_frame(
             })?;
             let oopif = node.content_document.is_none();
             if oopif {
-                active
-                    .router
-                    .as_deref()
-                    .expect("OOPIF router missing")
+                let router = active.router.as_deref().ok_or_else(|| {
+                    StepError::new(
+                        FailureCategory::Protocol,
+                        "OOPIF router is unavailable for out-of-process iframe",
+                    )
+                })?;
+                router
                     .wait_for_target(frame.as_ref(), deadline)
                     .await
                     .map_err(protocol)?;
@@ -2772,7 +2806,7 @@ async fn dispatch_scroll(active: &ActiveContext, x: i64, y: i64) -> Result<(), S
         .delta_x(x as f64)
         .delta_y(y as f64)
         .build()
-        .expect("all mandatory wheel event fields are set");
+        .map_err(|e| protocol(format!("wheel event is invalid: {e}")))?;
     active.page.execute(event).await.map_err(protocol)?;
     Ok(())
 }
@@ -2901,7 +2935,7 @@ async fn dispatch_pointer(
             .button(MouseButton::Left)
             .buttons(buttons)
             .build()
-            .expect("all mandatory pointer event fields are set"),
+            .map_err(|e| protocol(format!("pointer event is invalid: {e}")))?,
     )
     .await
     .map_err(protocol)?;
@@ -3003,7 +3037,12 @@ async fn evaluate_value<T: DeserializeOwned>(
         .map_err(protocol);
     }
     if let CdpTarget::Oopif(_, _) = active.target() {
-        let frame = active.local_frame().expect("local frame checked");
+        let frame = active.local_frame().ok_or_else(|| {
+            StepError::new(
+                FailureCategory::Protocol,
+                "active out-of-process iframe has no local frame",
+            )
+        })?;
         let context = active
             .target()
             .execution_context(frame.as_ref())
@@ -3032,7 +3071,17 @@ async fn evaluate_value<T: DeserializeOwned>(
     }
     let context = active
         .page
-        .frame_execution_context(active.frame().expect("frame checked").clone())
+        .frame_execution_context(
+            active
+                .frame()
+                .ok_or_else(|| {
+                    StepError::new(
+                        FailureCategory::Protocol,
+                        "active frame is unavailable for page evaluation",
+                    )
+                })?
+                .clone(),
+        )
         .await
         .map_err(protocol)?
         .ok_or_else(|| {
@@ -3144,9 +3193,9 @@ async fn dispatch_key(page: &Page, key: &Key, modifiers: &[Modifier]) -> Result<
             .windows_virtual_key_code(key_code)
             .native_virtual_key_code(key_code)
             .build()
-            .expect("all mandatory key event fields are set")
+            .map_err(|error| protocol(format!("key event is invalid: {error}")))
     };
-    page.execute(command(DispatchKeyEventType::RawKeyDown))
+    page.execute(command(DispatchKeyEventType::RawKeyDown)?)
         .await
         .map_err(protocol)?;
 
@@ -3155,7 +3204,7 @@ async fn dispatch_key(page: &Page, key: &Key, modifiers: &[Modifier]) -> Result<
             .iter()
             .any(|value| matches!(value, Modifier::Alt | Modifier::Control | Modifier::Meta))
     {
-        let mut character_event = command(DispatchKeyEventType::Char);
+        let mut character_event = command(DispatchKeyEventType::Char)?;
         character_event.text = Some(text);
         character_event.unmodified_text = Some(unmodified_text);
         page.execute(character_event)
@@ -3167,7 +3216,7 @@ async fn dispatch_key(page: &Page, key: &Key, modifiers: &[Modifier]) -> Result<
     };
 
     let release_result = page
-        .execute(command(DispatchKeyEventType::KeyUp))
+        .execute(command(DispatchKeyEventType::KeyUp)?)
         .await
         .map(|_| ())
         .map_err(protocol);
@@ -3257,11 +3306,11 @@ async fn dispatch_click(
                 .button(MouseButton::Left)
                 .click_count(click_count)
                 .build()
-                .expect("all mandatory mouse event fields are set")
+                .map_err(|error| protocol(format!("mouse event is invalid: {error}")))
         };
         if dispatch_mouse_event(
             page,
-            event(DispatchMouseEventType::MousePressed),
+            event(DispatchMouseEventType::MousePressed)?,
             dialogs.as_deref_mut(),
         )
         .await?
@@ -3273,7 +3322,7 @@ async fn dispatch_click(
         }
         if dispatch_mouse_event(
             page,
-            event(DispatchMouseEventType::MouseReleased),
+            event(DispatchMouseEventType::MouseReleased)?,
             dialogs.as_deref_mut(),
         )
         .await?
