@@ -38,17 +38,21 @@ struct FfmpegRelease {
 impl Platform {
     fn ffmpeg_release(self) -> FfmpegRelease {
         match self {
+            // BtbN retention: only the last 14 daily autobuilds survive, but the
+            // last build of each month is kept for two years. Pin month-end tags
+            // only, and re-pin before the two-year window closes (or mirror the
+            // archives to a playrust release for a permanent URL).
             Self::Linux64 => FfmpegRelease {
                 archive: FfmpegArtifact {
-                    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz",
-                    sha256: "6b1fe14ec5daa1385197d883491527e578479929ddb77456e296d5aa78c4b3b3",
+                    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-7.1.tar.xz",
+                    sha256: "c1e6caf48923dd8e6bc5e54d51ba70c321175b8162ae9c414c392990e72f0e79",
                 },
                 ffprobe_archive: None,
             },
             Self::Win64 => FfmpegRelease {
                 archive: FfmpegArtifact {
-                    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-09-13-03/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-7.1.zip",
-                    sha256: "f82de4709d339c28f1e04d0b40c348f983becf5a3e11185a72c2bac4e6ba3b2d",
+                    url: "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-31-14-10/ffmpeg-n7.1.5-12-g1fdbca85aa-win64-gpl-7.1.zip",
+                    sha256: "c067a1ca58f4fc4449f4bab0890fbcd65cbb3e5f46e066cf9c768e06c0c1d4d9",
                 },
                 ffprobe_archive: None,
             },
