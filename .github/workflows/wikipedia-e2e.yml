@@ -39,4 +39,4 @@ jobs:
           --test wikipedia_search_e2e
           --test wikipedia_navigation_e2e
           --test wikipedia_failure_e2e
-          -- --test-threads=4
+          -- --test-threads=1 --show-output

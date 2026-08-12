@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
+use crate::flow::{compile_file, compile_yaml_with_env};
 use crate::install;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn require_browser(test_name: &str) -> Option<PathBuf> {
     if let Some(path) = install::resolve_existing_browser() {
@@ -25,8 +27,6 @@ fn require_browser(test_name: &str) -> Option<PathBuf> {
     );
     None
 }
-use crate::flow::{compile_file, compile_yaml_with_env};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn pause_waits_until_duration_and_honors_deadline() {
