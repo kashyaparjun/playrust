@@ -20,7 +20,9 @@ futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = "0.0.29"
+# Pin exact 0.0.x: serde-saphyr is the untrusted YAML boundary. Bumps require a
+# changelog review, the existing suite, and `cargo update -p serde-saphyr --precise`.
+serde-saphyr = "=0.0.29"
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
