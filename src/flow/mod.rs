@@ -1,5 +1,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod redact;
+
+pub(crate) use redact::meets_min_secret_len;
+pub use redact::{MIN_SECRET_LEN, REDACTED, Redactor, Resolved};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -16,12 +21,6 @@ use url::Url;
 
 use crate::browser::Geolocation;
 
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-};
-
-pub const REDACTED: &str = "[REDACTED]";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum accepted YAML flow source size in bytes (1 MiB).
 pub const MAX_FLOW_SOURCE_BYTES: usize = 1024 * 1024;
@@ -55,15 +54,6 @@ pub const MAX_GESTURE_DELTA: i32 = 10_000;
 pub const MAX_GESTURE_DURATION: Duration = Duration::from_secs(10);
 pub const DEFAULT_SWIPE_DURATION: Duration = Duration::from_millis(300);
 pub const DEFAULT_LONG_PRESS_DURATION: Duration = Duration::from_millis(500);
-/// Minimum length a declared or runtime secret must reach before it is
-/// registered with the redactor. Shorter values are rejected at compile time
-/// (declared secrets) or silently skipped (runtime outputs) to avoid
-/// over-redacting common short substrings.
-pub const MIN_SECRET_LEN: usize = 4;
-
-pub(crate) fn meets_min_secret_len(value: &str) -> bool {
-    value.chars().count() >= MIN_SECRET_LEN
-}
 
 #[derive(Debug, Error)]
 pub enum FlowError {
@@ -77,150 +67,6 @@ pub enum FlowError {
     Yaml(String),
     #[error("{0}")]
     Invalid(String),
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct Resolved<T> {
-    value: T,
-    secret: bool,
-}
-
-impl<T> Resolved<T> {
-    pub fn expose(&self) -> &T {
-        &self.value
-    }
-
-    pub fn is_secret(&self) -> bool {
-        self.secret
-    }
-
-    pub(crate) fn new(value: T, secret: bool) -> Self {
-        Self { value, secret }
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for Resolved<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.secret {
-            formatter.write_str(REDACTED)
-        } else {
-            self.value.fmt(formatter)
-        }
-    }
-}
-
-impl<T: fmt::Display> fmt::Display for Resolved<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.secret {
-            formatter.write_str(REDACTED)
-        } else {
-            self.value.fmt(formatter)
-        }
-    }
-}
-
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct Redactor {
-    variants: Vec<String>,
-}
-
-impl Redactor {
-    pub fn redact(&self, text: &str) -> String {
-        self.variants.iter().fold(text.to_owned(), |text, variant| {
-            text.replace(variant, REDACTED)
-        })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.variants.is_empty()
-    }
-
-    pub(crate) fn extend(&mut self, other: &Self) {
-        self.variants.extend(other.variants.iter().cloned());
-        self.sort_and_dedupe();
-    }
-
-    pub(crate) fn add_secret(&mut self, secret: String) {
-        if meets_min_secret_len(&secret) {
-            self.register_variants(&secret);
-            self.sort_and_dedupe();
-        }
-    }
-
-    /// Register a JSON-serialized runtime output for redaction.
-    /// When `bare_string` is `Some`, length is measured on that bare string so
-    /// JSON quotes do not promote a short value past `MIN_SECRET_LEN`.
-    pub(crate) fn add_serialized_secret(&mut self, serialized: String, bare_string: Option<&str>) {
-        match bare_string {
-            Some(bare) if !meets_min_secret_len(bare) => {}
-            _ => self.add_secret(serialized),
-        }
-    }
-
-    fn register_variants(&mut self, secret: &str) {
-        self.variants.push(secret.to_owned());
-        // Percent-encoding hex digits are case-insensitive in URLs, but
-        // str::replace is not — register both cases for each space form.
-        for mode in PERCENT_ENCODINGS {
-            self.variants.push(mode.encode(secret));
-        }
-        self.variants.push(STANDARD.encode(secret.as_bytes()));
-        self.variants
-            .push(STANDARD_NO_PAD.encode(secret.as_bytes()));
-        self.variants.push(URL_SAFE.encode(secret.as_bytes()));
-        self.variants
-            .push(URL_SAFE_NO_PAD.encode(secret.as_bytes()));
-    }
-
-    fn sort_and_dedupe(&mut self) {
-        self.variants
-            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        self.variants.dedup();
-    }
-}
-
-#[derive(Clone, Copy)]
-enum PercentEncoding {
-    ComponentUpper,
-    ComponentLower,
-    FormUpper,
-    FormLower,
-}
-
-const PERCENT_ENCODINGS: [PercentEncoding; 4] = [
-    PercentEncoding::ComponentUpper,
-    PercentEncoding::ComponentLower,
-    PercentEncoding::FormUpper,
-    PercentEncoding::FormLower,
-];
-
-impl PercentEncoding {
-    fn encode(self, value: &str) -> String {
-        let form = matches!(self, Self::FormUpper | Self::FormLower);
-        let lower_hex = matches!(self, Self::ComponentLower | Self::FormLower);
-        let mut encoded = String::with_capacity(value.len());
-        for byte in value.bytes() {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-                encoded.push(byte as char);
-            } else if form && byte == b' ' {
-                encoded.push('+');
-            } else if lower_hex {
-                encoded.push_str(&format!("%{byte:02x}"));
-            } else {
-                encoded.push_str(&format!("%{byte:02X}"));
-            }
-        }
-        encoded
-    }
-}
-
-impl fmt::Debug for Redactor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Redactor")
-            .field("variant_count", &self.variants.len())
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2085,16 +1931,6 @@ pub fn artifact_key(root: impl AsRef<Path>, file: impl AsRef<Path>) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("{safe}-{hash}")
-}
-
-impl Redactor {
-    fn from_inputs(inputs: &BTreeMap<String, Resolved<String>>) -> Self {
-        let mut redactor = Self::default();
-        for value in inputs.values().filter(|value| value.secret) {
-            redactor.add_secret(value.value.clone());
-        }
-        redactor
-    }
 }
 
 enum CompiledWhen {
