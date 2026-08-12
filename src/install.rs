@@ -160,6 +160,23 @@ pub fn cached_browser_path(
         .join(platform.executable_relative_path()))
 }
 
+/// Resolve Chrome without downloading: `PLAYRUST_CHROME` when it names a file,
+/// otherwise the pinned browser in the Playrust cache when present.
+///
+/// Used by tests and tooling that must never trigger an install.
+pub fn resolve_existing_browser() -> Option<PathBuf> {
+    if let Some(path) = env::var_os(CHROME_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let root = cache_root().ok()?;
+    let platform = Platform::current().ok()?;
+    let path = cached_browser_path(&root, PINNED_CHROME_VERSION, platform).ok()?;
+    path.is_file().then_some(path)
+}
+
 /// Resolve an explicit path, then `PLAYRUST_CHROME`, then the Playrust cache,
 /// installing the project's pinned Chrome for Testing version when absent.
 pub async fn resolve_or_install_browser(explicit: Option<&Path>) -> Result<PathBuf, InstallError> {

@@ -22,8 +22,28 @@ steps:
 "##;
 
 #[test]
-#[ignore = "requires Wikipedia network access, pinned Chromium, FFmpeg, and ffprobe"]
 fn failed_flow_redacts_secrets_and_retains_debug_artifacts() {
+    let Some(()) =
+        support::require_live_e2e("failed_flow_redacts_secrets_and_retains_debug_artifacts")
+    else {
+        return;
+    };
+    let Some(chrome) =
+        support::require_browser("failed_flow_redacts_secrets_and_retains_debug_artifacts")
+    else {
+        return;
+    };
+    let Some(_ffmpeg) =
+        support::require_ffmpeg("failed_flow_redacts_secrets_and_retains_debug_artifacts")
+    else {
+        return;
+    };
+    let Some(_ffprobe) =
+        support::require_ffprobe("failed_flow_redacts_secrets_and_retains_debug_artifacts")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let secret = "#playrust-wikipedia-secret-canary";
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("failure.yaml");
@@ -40,7 +60,10 @@ fn failed_flow_redacts_secrets_and_retains_debug_artifacts() {
             artifacts.to_str().unwrap(),
             "--junit",
         ],
-        &[("PLAYRUST_WIKI_SECRET", secret)],
+        &[
+            (&chrome_env.0, &chrome_env.1),
+            ("PLAYRUST_WIKI_SECRET", secret),
+        ],
     );
     assert_eq!(output.status.code(), Some(3));
 

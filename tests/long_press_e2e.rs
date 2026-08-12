@@ -14,8 +14,12 @@ target.addEventListener('mouseup', () => result.textContent = performance.now() 
 </script></body>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn holds_and_releases_an_actionable_target_once() {
+    let Some(chrome) = support::require_browser("holds_and_releases_an_actionable_target_once")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("long-press.yaml");
@@ -36,7 +40,7 @@ fn holds_and_releases_an_actionable_target_once() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);

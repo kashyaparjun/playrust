@@ -1,8 +1,6 @@
 mod support;
 
 use std::collections::BTreeMap;
-use std::env;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use playrust::browser::BrowserHost;
@@ -41,9 +39,10 @@ fn page_switching_rejects_enabled_video() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn popup_and_opener_switch_active_page_state() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) = support::require_browser("popup_and_opener_switch_active_page_state") else {
+        return;
+    };
     let server = FixtureServer::start(&[("/", "text/html", ROOT), ("/popup", "text/html", POPUP)]);
     let source = format!(
         r##"version: 1

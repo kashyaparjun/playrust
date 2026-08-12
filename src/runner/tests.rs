@@ -1,12 +1,32 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
 use crate::flow::{compile_file, compile_yaml_with_env};
+use crate::install;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn require_browser(test_name: &str) -> Option<PathBuf> {
+    if let Some(path) = install::resolve_existing_browser() {
+        return Some(path);
+    }
+    if std::env::var_os("PLAYRUST_REQUIRE_BROWSER").is_some_and(|value| {
+        !matches!(
+            value.to_str(),
+            Some("0") | Some("false") | Some("no") | Some("")
+        )
+    }) {
+        panic!(
+            "{test_name}: no Chrome available (set PLAYRUST_CHROME or run `playrust browser install`)"
+        );
+    }
+    eprintln!(
+        "SKIP {test_name}: no Chrome available (set PLAYRUST_CHROME or run `playrust browser install`)"
+    );
+    None
+}
 
 #[tokio::test]
 async fn pause_waits_until_duration_and_honors_deadline() {
@@ -30,9 +50,12 @@ async fn pause_waits_until_duration_and_honors_deadline() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn cancelling_an_in_flight_compiled_pause_interrupts_the_flow() {
-    let chrome = PathBuf::from(env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME"));
+    let Some(chrome) =
+        require_browser("cancelling_an_in_flight_compiled_pause_interrupts_the_flow")
+    else {
+        return;
+    };
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let flow = crate::flow::compile_yaml(
         "version: 1\nname: cancelled-pause\nsettings: { timeout: 30s, video: off }\nsteps: [{ pause: 20s }]\n",
@@ -756,9 +779,11 @@ fn erase_and_select_dispatch_native_form_events_once() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn fill_replaces_all_supported_text_controls_in_chrome() {
-    let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+    let Some(chrome) = require_browser("fill_replaces_all_supported_text_controls_in_chrome")
+    else {
+        return;
+    };
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let context = host
         .create_context(Viewport::new(800, 600).unwrap(), None)
@@ -801,9 +826,12 @@ async fn fill_replaces_all_supported_text_controls_in_chrome() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn incompatible_and_mixed_namespace_nodes_do_not_break_text_locators_in_chrome() {
-    let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+    let Some(chrome) = require_browser(
+        "incompatible_and_mixed_namespace_nodes_do_not_break_text_locators_in_chrome",
+    ) else {
+        return;
+    };
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let context = host
         .create_context(Viewport::new(800, 600).unwrap(), None)
@@ -840,9 +868,11 @@ async fn incompatible_and_mixed_namespace_nodes_do_not_break_text_locators_in_ch
 }
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 async fn labels_resolve_native_wrapping_and_aria_names_in_chrome() {
-    let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+    let Some(chrome) = require_browser("labels_resolve_native_wrapping_and_aria_names_in_chrome")
+    else {
+        return;
+    };
     let host = BrowserHost::launch(chrome, false).await.unwrap();
     let context = host
         .create_context(Viewport::new(800, 600).unwrap(), None)

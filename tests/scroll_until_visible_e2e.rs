@@ -18,8 +18,13 @@ render();
 </script></body>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME to point to the pinned Chrome executable"]
 fn scrolls_a_virtualized_list_until_the_target_exists() {
+    let Some(chrome) =
+        support::require_browser("scrolls_a_virtualized_list_until_the_target_exists")
+    else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("scroll-until-visible.yaml");
@@ -40,7 +45,7 @@ fn scrolls_a_virtualized_list_until_the_target_exists() {
             "--artifacts",
             artifacts.to_str().unwrap(),
         ],
-        &[],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     server.shutdown();
     assert_success("run", &run);

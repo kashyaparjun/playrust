@@ -14,9 +14,18 @@ const HTML: &str =
     r#"<!doctype html><html><body><h1>Fixture</h1><button id="ready">Ready</button></body></html>"#;
 
 #[test]
-#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
 fn html_report_embeds_fixture_screenshot_and_recording_with_relative_media_links() {
-    let chrome = env::var("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
+    let Some(chrome) = support::require_browser(
+        "html_report_embeds_fixture_screenshot_and_recording_with_relative_media_links",
+    ) else {
+        return;
+    };
+    let Some(_ffmpeg) = support::require_ffmpeg(
+        "html_report_embeds_fixture_screenshot_and_recording_with_relative_media_links",
+    ) else {
+        return;
+    };
+    let chrome_env = support::chrome_env(&chrome);
     let server = FixtureServer::start(&[("/", "text/html", HTML)]);
     let directory = tempfile::tempdir().expect("create E2E directory");
     let flow = directory.path().join("viewer.yaml");
@@ -52,7 +61,7 @@ fn html_report_embeds_fixture_screenshot_and_recording_with_relative_media_links
             artifacts.to_str().unwrap(),
             "--html",
         ],
-        &[("PLAYRUST_CHROME", chrome.as_str())],
+        &[(&chrome_env.0, &chrome_env.1)],
     );
     assert_success("run", &run);
 
