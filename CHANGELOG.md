@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Encoding-aware secret redaction: diagnostics and protocol output redact the raw secret plus percent-encoded forms (component `%20` and form `+` space encodings, upper- and lowercase hex) and base64 forms (standard and URL-safe alphabets, padded and unpadded), longest-first.
+- Pinned, checksum-verified FFmpeg/ffprobe provisioning (BtbN Linux/Windows, evermeet macOS x86_64, martin-riedl macOS arm64). Auto-installs when video is enabled. GPL static builds are invoked as a subprocess, not linked.
 
 ### Changed
 

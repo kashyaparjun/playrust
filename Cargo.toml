@@ -30,3 +30,4 @@ tar = "0.4"
 zip = "4"
 tokio = { version = "1", features = ["full"] }
 url = "2"
+liblzma = { version = "0.4.8", features = ["static"] }
