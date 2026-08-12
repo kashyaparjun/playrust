@@ -6,6 +6,7 @@ rust-version = "1.89"
 description = "Chromium browser runtime for AI agents with audited, secret-safe, replayable sessions"
 repository = "https://github.com/kashyaparjun/playrust"
 homepage = "https://github.com/kashyaparjun/playrust"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1"

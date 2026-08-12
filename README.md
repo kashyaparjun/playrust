@@ -382,3 +382,10 @@ Each `run` writes `<artifacts>/report.json`. Pass `--junit` to also atomically w
 Playrust supports only its pinned Chromium build and rejects a different version supplied by path. V1 supports popup, opener, exact named/URL page selection, and the tested same-origin and cross-origin frame behavior described above. Shadow-root traversal, uploads/downloads, browser extensions, and mobile-native automation are not supported. Swipe and long press retain mouse semantics because desktop Chrome touch emulation synthesizes an additional, timing-incompatible mouse sequence. Flows are sequential and provide only bounded, cancellable pauses—not unbounded sleeps—and do not provide mutable variables, unbounded loops, transactional subflow retries, dynamic paths, plugins, arbitrary host expressions, or a JavaScript sandbox.
 
 See [`examples/example.yaml`](examples/example.yaml) for a complete runnable V1 flow.
+
+## License
+
+Playrust is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+The CLI and the NDJSON session protocol are the supported compatibility surfaces. The Rust library API (`playrust::*`) is internal and may change without a major version bump.
+

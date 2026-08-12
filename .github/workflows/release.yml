@@ -47,8 +47,8 @@ jobs:
         run: |
           asset="playrust-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           mkdir -p dist package
-          cp "target/${{ matrix.target }}/release/playrust" README.md package/
-          tar -C package -czf "dist/$asset" playrust README.md
+          cp "target/${{ matrix.target }}/release/playrust" README.md LICENSE-MIT LICENSE-APACHE package/
+          tar -C package -czf "dist/$asset" playrust README.md LICENSE-MIT LICENSE-APACHE
           cd dist
           shasum -a 256 "$asset" > "$asset.sha256"
       - name: Package archive
@@ -57,8 +57,8 @@ jobs:
         run: |
           $asset = "playrust-$env:RELEASE_TAG-${{ matrix.target }}.zip"
           New-Item -ItemType Directory -Force dist, package
-          Copy-Item -Path "target/${{ matrix.target }}/release/playrust.exe", "README.md" -Destination package
-          Compress-Archive -Path package/playrust.exe, package/README.md -DestinationPath "dist/$asset"
+          Copy-Item -Path "target/${{ matrix.target }}/release/playrust.exe", "README.md", "LICENSE-MIT", "LICENSE-APACHE" -Destination package
+          Compress-Archive -Path package/playrust.exe, package/README.md, package/LICENSE-MIT, package/LICENSE-APACHE -DestinationPath "dist/$asset"
           Set-Location dist
           "{0}  {1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower(), $asset | Set-Content -NoNewline "$asset.sha256"
       - uses: actions/upload-artifact@v4
