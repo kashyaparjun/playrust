@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `report.json` (`report_version` 4) lists each flow's top-level steps under `steps` with a redacted `label`, `started_ms` measured from the recording's first frame (or flow start without a recording), `duration_ms`, and `status`, so players can mark and seek steps in `recording.mp4`.
 - Encoding-aware secret redaction: diagnostics and protocol output redact the raw secret plus percent-encoded forms (component `%20` and form `+` space encodings, upper- and lowercase hex) and base64 forms (standard and URL-safe alphabets, padded and unpadded), longest-first.
 
 ### Changed

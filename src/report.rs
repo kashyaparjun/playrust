@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 mod html;
 mod junit;
 
-pub const REPORT_VERSION: u32 = 3;
+pub const REPORT_VERSION: u32 = 4;
 pub const REDACTED: &str = "[REDACTED]";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -259,12 +259,49 @@ pub enum FlowStatus {
     Interrupted,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Passed,
+    Failed,
+    /// The step was in progress when the run was cancelled.
+    Interrupted,
+}
+
+/// Timing of one top-level step execution.
+///
+/// Only steps that actually ran are listed, in execution order. Steps whose
+/// `when` or `while` condition skipped them are omitted, as are steps after a
+/// failed or interrupted step. A `run:` subflow is one entry spanning its
+/// inlined steps, and every `repeat` or `while` iteration is its own entry
+/// sharing the same `index`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StepReport {
+    /// One-based step number in the flow file being run. It equals
+    /// `failures[].step.number` unless an earlier `run:`, `repeat`, or `while`
+    /// step expanded into several compiled steps.
+    pub index: usize,
+    /// Operation and target, such as `click role="button" name="Send"` or
+    /// `run ./login.yaml`. Typed values are never included, and secret-derived
+    /// text is redacted.
+    pub label: SafeText,
+    /// Milliseconds from the first frame of the flow's video recording to the
+    /// step's start, so it can be used to seek `recording.mp4`. Flows without
+    /// a recording measure from the start of the flow. Steps that started
+    /// before a later `recording.start` report 0.
+    pub started_ms: u64,
+    pub duration_ms: u64,
+    pub status: StepStatus,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FlowReport {
     pub name: String,
     pub path: String,
     pub duration_ms: u64,
     pub status: FlowStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<Failure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -549,6 +586,7 @@ mod tests {
             path: "flows/flow.yaml".to_owned(),
             duration_ms: 12,
             status,
+            steps: Vec::new(),
             failures: category
                 .map(|category| Failure::new(category, SafeText::public("failed")))
                 .into_iter()
@@ -642,6 +680,34 @@ mod tests {
         );
         assert!(!json.contains("canary-secret"));
         assert!(json.ends_with('\n'));
+    }
+
+    #[test]
+    fn flow_report_steps_are_optional_and_omitted_when_empty() {
+        let passed = flow(FlowStatus::Passed, None);
+        let json = serde_json::to_value(&passed).unwrap();
+        assert!(json.get("steps").is_none(), "{json}");
+        let decoded: FlowReport = serde_json::from_value(json).unwrap();
+        assert!(decoded.steps.is_empty());
+
+        let mut timed = passed;
+        timed.steps = vec![StepReport {
+            index: 1,
+            label: SafeText::public("open /"),
+            started_ms: 0,
+            duration_ms: 5,
+            status: StepStatus::Passed,
+        }];
+        assert_eq!(
+            serde_json::to_value(&timed).unwrap()["steps"],
+            serde_json::json!([{
+                "index": 1,
+                "label": "open /",
+                "started_ms": 0,
+                "duration_ms": 5,
+                "status": "passed"
+            }])
+        );
     }
 
     #[test]

@@ -833,6 +833,20 @@ pub struct CompiledStep {
     pub guards: Vec<Guard>,
     pub retries: usize,
     pub operation: Operation,
+    /// The top-level `run:` step this step was inlined from, if any.
+    pub include: Option<StepInclude>,
+}
+
+/// Identifies one execution of a top-level `run:` step whose subflow steps
+/// were inlined into the compiled flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepInclude {
+    /// One-based step number of the `run:` step in the including flow file.
+    pub index: usize,
+    /// The subflow path as written in the `run:` step.
+    pub path: String,
+    /// Distinguishes `repeat` and `while` iterations of the same `run:` step.
+    pub occurrence: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1550,6 +1564,7 @@ fn compile_raw_inner(
                     guards,
                     retries,
                     operation: operation.clone(),
+                    include: None,
                 });
             }
         }
@@ -1753,12 +1768,19 @@ fn compile_raw_expanded(
                 continue;
             }
             let mut first_when_step = true;
+            let mut occurrence = 0;
             for _ in 0..*repeat {
                 let iterations = while_control
                     .as_ref()
                     .map_or(1, |(_, max_iterations)| *max_iterations);
                 for iteration in 0..iterations {
+                    occurrence += 1;
                     for (child_offset, mut step) in child.steps.iter().cloned().enumerate() {
+                        step.include = Some(StepInclude {
+                            index: local_index,
+                            path: run.to_owned(),
+                            occurrence,
+                        });
                         step.retries = step.retries.checked_add(*retries).filter(|value| *value <= MAX_RETRIES).ok_or_else(|| {
                             FlowError::Invalid(format!(
                                 "{}: step {local_index} combined retry must not exceed {MAX_RETRIES}",

@@ -676,6 +676,74 @@ fn report_preserves_failure_order_and_uses_infrastructure_precedence() {
 }
 
 #[test]
+fn step_timeline_reports_top_level_steps_relative_to_the_origin() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("see.subflow.yaml"),
+        "version: 1\nname: see\nsteps:\n  - assert: { visible: { css: '#a' } }\n  - assert: { hidden: { css: '#b' } }\n",
+    )
+    .unwrap();
+    let root = directory.path().join("root.yaml");
+    std::fs::write(
+        &root,
+        "version: 1\nname: root\nbase_url: https://x.test\nsecrets: { token: { env: STEP_TIMELINE_TOKEN } }\nsteps:\n  - open: /\n  - fill: { target: { css: textarea }, value: 'typed ${token}' }\n  - repeat: 2\n    run: ./see.subflow.yaml\n  - click: { target: { role: { value: button, name: Send message } } }\n",
+    )
+    .unwrap();
+    let environment = BTreeMap::from([(
+        "STEP_TIMELINE_TOKEN".to_owned(),
+        "timeline-secret".to_owned(),
+    )]);
+    let flow = crate::flow::compile_file_with_env(&root, &BTreeMap::new(), &environment).unwrap();
+    assert_eq!(flow.steps.len(), 7);
+
+    let origin = Instant::now();
+    let at = |ms| origin + Duration::from_millis(ms);
+    let mut timeline = StepTimeline::default();
+    for (offset, step) in flow.steps.iter().enumerate() {
+        let start = 100 * offset as u64 + 50;
+        let status = if offset + 1 == flow.steps.len() {
+            StepStatus::Failed
+        } else {
+            StepStatus::Passed
+        };
+        timeline.record(step, &flow.redactor, at(start), at(start + 40), status);
+    }
+    let steps = timeline.into_reports(origin);
+
+    let summary = steps
+        .iter()
+        .map(|step| {
+            (
+                step.index,
+                step.label.as_str(),
+                step.started_ms,
+                step.duration_ms,
+                step.status,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary,
+        [
+            (1, "open https://x.test/", 50, 40, StepStatus::Passed),
+            (2, "fill css=\"textarea\"", 150, 40, StepStatus::Passed),
+            (3, "run ./see.subflow.yaml", 250, 140, StepStatus::Passed),
+            (3, "run ./see.subflow.yaml", 450, 140, StepStatus::Passed),
+            (
+                4,
+                "click role=\"button\" name=\"Send message\"",
+                650,
+                40,
+                StepStatus::Failed
+            ),
+        ]
+    );
+    let json = serde_json::to_string(&steps).unwrap();
+    assert!(!json.contains("timeline-secret"), "{json}");
+    assert!(!json.contains("typed"), "{json}");
+}
+
+#[test]
 fn shifted_character_events_use_shifted_and_unmodified_text() {
     assert_eq!(
         character_text('a', &[Modifier::Shift]),
@@ -889,6 +957,7 @@ steps:
         dialog_listener: None,
         presentation_overlays: PresentationOverlays::default(),
         presentation_overlay_recording: false,
+        step_skipped: false,
     };
     for step in &flow.steps {
         execute_step(

@@ -635,6 +635,7 @@ fn setup_failure_reports(
             path: run.flow.source.to_string_lossy().into_owned(),
             duration_ms: 0,
             status: FlowStatus::Failed,
+            steps: Vec::new(),
             failures: vec![Failure::new(
                 category,
                 SafeText::public(run.flow.redactor.redact(&message)),
@@ -662,6 +663,7 @@ fn specification_report(file: &Path, artifacts: &Path, message: String) -> FlowR
         path: file.to_string_lossy().into_owned(),
         duration_ms: 0,
         status: FlowStatus::Failed,
+        steps: Vec::new(),
         failures: vec![Failure::new(
             FailureCategory::Specification,
             SafeText::public(message),
@@ -680,6 +682,7 @@ fn interrupted_report(run: &FlowRun) -> FlowReport {
         path: run.flow.source.to_string_lossy().into_owned(),
         duration_ms: 0,
         status: FlowStatus::Interrupted,
+        steps: Vec::new(),
         failures: Vec::new(),
         warnings: recording_secret_warnings(&run.flow),
         artifacts: ArtifactPaths {
@@ -1089,6 +1092,7 @@ mod tests {
                     path: path.to_string_lossy().into_owned(),
                     duration_ms: 42,
                     status: FlowStatus::Passed,
+                    steps: Vec::new(),
                     failures: Vec::new(),
                     warnings: Vec::new(),
                     artifacts: ArtifactPaths {

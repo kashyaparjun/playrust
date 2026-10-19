@@ -57,7 +57,8 @@ use crate::locator::{
 };
 use crate::oopif::{CdpTarget, OopifRouter};
 use crate::report::{
-    ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, SafeText, StepContext,
+    ArtifactPaths, Failure, FailureCategory, FlowReport, FlowStatus, REDACTED, SafeText,
+    StepContext, StepReport, StepStatus,
 };
 use crate::session_snapshot::{
     Bounds as SnapshotBounds, CapturedElement, CapturedSnapshot, LocatorIdentity,
@@ -739,6 +740,7 @@ impl SessionRuntime {
             dialog_listener: None,
             presentation_overlays: PresentationOverlays::default(),
             presentation_overlay_recording: false,
+            step_skipped: false,
         };
         let deadline = Instant::now()
             .checked_add(step.timeout)
@@ -1269,17 +1271,21 @@ async fn execute_flow(
         dialog_listener: None,
         presentation_overlays: flow.settings.overlays,
         presentation_overlay_recording: false,
+        step_skipped: false,
     };
     let mut interrupted = is_cancelled(options.cancellation.as_ref());
     let mut browser_status = host.subscribe_status();
     let mut recording_error = None;
     let mut video = None;
+    let mut recording_started_at = None;
+    let mut timeline = StepTimeline::default();
     let manual_recording = flow.manual_recording;
     if !interrupted && !manual_recording {
         if let Some(deadline) = Instant::now().checked_add(flow.settings.timeout) {
             match start_video(&page, flow, options, deadline).await {
                 Ok(VideoStartup::Ready(session)) => {
                     video = session;
+                    recording_started_at = video.as_ref().map(|video| video.first_frame_at);
                     runtime.presentation_overlay_recording = video.is_some();
                     interrupted = is_cancelled(options.cancellation.as_ref());
                 }
@@ -1300,10 +1306,13 @@ async fn execute_flow(
     }
 
     let mut video_stop_at = None;
+    let mut running = None;
     'steps: for step in &flow.steps {
         if interrupted {
             break;
         }
+        let step_started = Instant::now();
+        running = Some((step, step_started));
         if let Operation::Recording(control) = step.operation {
             let Some(deadline) = Instant::now().checked_add(step.timeout) else {
                 primary = Some(
@@ -1343,7 +1352,10 @@ async fn execute_flow(
                 ) => result,
             };
             match matches {
-                Ok(Ok(false)) => continue,
+                Ok(Ok(false)) => {
+                    running = None;
+                    continue;
+                }
                 Ok(Ok(true)) => {}
                 Ok(Err(error)) => {
                     primary = Some(
@@ -1372,6 +1384,7 @@ async fn execute_flow(
                     match start_video(&active.page, flow, options, deadline).await {
                         Ok(VideoStartup::Ready(session)) => {
                             video = session;
+                            recording_started_at = video.as_ref().map(|video| video.first_frame_at);
                             runtime.presentation_overlay_recording = video.is_some();
                         }
                         Ok(VideoStartup::Cancelled(finish)) => {
@@ -1419,6 +1432,14 @@ async fn execute_flow(
                 ));
                 break;
             }
+            timeline.record(
+                step,
+                &runtime.redactor,
+                step_started,
+                Instant::now(),
+                StepStatus::Passed,
+            );
+            running = None;
             continue;
         }
         let mut error = None;
@@ -1472,6 +1493,16 @@ async fn execute_flow(
             };
             match result {
                 Ok(Ok(screenshot)) => {
+                    if !runtime.step_skipped {
+                        timeline.record(
+                            step,
+                            &runtime.redactor,
+                            step_started,
+                            Instant::now(),
+                            StepStatus::Passed,
+                        );
+                    }
+                    running = None;
                     if runtime.presentation_overlays_active() {
                         let _ = update_presentation_overlay(
                             &active,
@@ -1499,7 +1530,16 @@ async fn execute_flow(
                 continue;
             }
         }
-        video_stop_at = Some(Instant::now());
+        let failed_at = Instant::now();
+        video_stop_at = Some(failed_at);
+        timeline.record(
+            step,
+            &runtime.redactor,
+            step_started,
+            failed_at,
+            StepStatus::Failed,
+        );
+        running = None;
         let error = error.expect("failed attempt records an error");
         if let Some(visual) = &error.visual_artifacts {
             match publish_visual_artifacts(&options.artifact_directory, visual).await {
@@ -1529,6 +1569,17 @@ async fn execute_flow(
                 .map(|path| path_text(&path));
         primary = Some(step_failure(host, flow, &runtime.redactor, &active, step, error).await);
         break;
+    }
+    if let Some((step, step_started)) = running {
+        let status = if primary.is_some() {
+            StepStatus::Failed
+        } else {
+            StepStatus::Interrupted
+        };
+        let finished = video_stop_at
+            .filter(|stopped| *stopped >= step_started)
+            .unwrap_or_else(Instant::now);
+        timeline.record(step, &runtime.redactor, step_started, finished, status);
     }
 
     if primary.is_none() && !interrupted && video.is_some() {
@@ -1580,7 +1631,9 @@ async fn execute_flow(
     session.active = active;
     session.outputs = runtime.outputs;
     session.redactor = runtime.redactor;
-    report(flow, started, artifacts, failures, interrupted)
+    let mut report = report(flow, started, artifacts, failures, interrupted);
+    report.steps = timeline.into_reports(recording_started_at.unwrap_or(started));
+    report
 }
 
 async fn settle_video(page: &Page) {
@@ -1638,6 +1691,9 @@ struct RuntimeState {
     dialog_listener: Option<EventStream<EventJavascriptDialogOpening>>,
     presentation_overlays: PresentationOverlays,
     presentation_overlay_recording: bool,
+    /// Whether the last `execute_step` call skipped its step because a `when`
+    /// or `while` condition did not match.
+    step_skipped: bool,
 }
 
 impl RuntimeState {
@@ -1798,7 +1854,8 @@ async fn execute_step(
     artifact_directory: &Path,
     runtime: &mut RuntimeState,
 ) -> Result<Option<PathBuf>, StepError> {
-    if !step_matches(active, step, runtime).await? {
+    runtime.step_skipped = !step_matches(active, step, runtime).await?;
+    if runtime.step_skipped {
         return Ok(None);
     }
     match &step.operation {
@@ -3560,6 +3617,8 @@ struct VideoSession {
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<(VideoRecorder, Result<(), String>)>,
     partial_path: PathBuf,
+    /// When the first screencast frame was received: time zero of the video.
+    first_frame_at: Instant,
 }
 
 struct ScreencastSource {
@@ -4021,9 +4080,10 @@ async fn start_video(
                     }
                     match base64::engine::general_purpose::STANDARD.decode(event.data.as_ref() as &[u8]) {
                         Ok(jpeg) => {
-                            recorder.push_frame(jpeg);
+                            let received_at = Instant::now();
+                            recorder.push_frame_at(jpeg, received_at);
                             if let Some(first_frame) = first_frame.take() {
-                                let _ = first_frame.send(());
+                                let _ = first_frame.send(received_at);
                             }
                         }
                         Err(error) => break Err(format!("decode screencast frame: {error}")),
@@ -4033,10 +4093,11 @@ async fn start_video(
         };
         (recorder, result)
     });
-    let session = VideoSession {
+    let mut session = VideoSession {
         stop: Some(stop),
         task,
         partial_path,
+        first_frame_at: Instant::now(),
     };
     let first_frame =
         match await_video_start(options.cancellation.as_ref(), deadline, first_frame_rx).await {
@@ -4059,7 +4120,10 @@ async fn start_video(
             }
         };
     let first_frame_error = match first_frame {
-        Ok(()) => return Ok(VideoStartup::Ready(Some(session))),
+        Ok(first_frame_at) => {
+            session.first_frame_at = first_frame_at;
+            return Ok(VideoStartup::Ready(Some(session)));
+        }
         Err(_) => "screencast ended before the first frame".to_owned(),
     };
     let cleanup_error = session
@@ -4266,6 +4330,103 @@ fn step_context(flow: &CompiledFlow, step: &CompiledStep) -> StepContext {
     }
 }
 
+/// Collects the timings of top-level steps as a flow runs.
+#[derive(Default)]
+struct StepTimeline {
+    entries: Vec<StepTiming>,
+}
+
+struct StepTiming {
+    key: StepKey,
+    index: usize,
+    label: SafeText,
+    started: Instant,
+    finished: Instant,
+    status: StepStatus,
+}
+
+/// Identifies one execution of a top-level step. Consecutive steps inlined
+/// from the same `run:` execution share a key and are reported as one step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepKey {
+    Compiled(usize),
+    Include { index: usize, occurrence: usize },
+}
+
+impl StepTimeline {
+    fn record(
+        &mut self,
+        step: &CompiledStep,
+        redactor: &Redactor,
+        started: Instant,
+        finished: Instant,
+        status: StepStatus,
+    ) {
+        let (key, index) = match &step.include {
+            Some(include) => (
+                StepKey::Include {
+                    index: include.index,
+                    occurrence: include.occurrence,
+                },
+                include.index,
+            ),
+            None => (StepKey::Compiled(step.index), step.source_index),
+        };
+        if let Some(last) = self.entries.last_mut()
+            && last.key == key
+        {
+            last.finished = finished;
+            last.status = status;
+            return;
+        }
+        self.entries.push(StepTiming {
+            key,
+            index,
+            label: step_label(step, redactor),
+            started,
+            finished,
+            status,
+        });
+    }
+
+    fn into_reports(self, origin: Instant) -> Vec<StepReport> {
+        self.entries
+            .into_iter()
+            .map(|entry| StepReport {
+                index: entry.index,
+                label: entry.label,
+                started_ms: duration_ms(entry.started.saturating_duration_since(origin)),
+                duration_ms: duration_ms(entry.finished.saturating_duration_since(entry.started)),
+                status: entry.status,
+            })
+            .collect()
+    }
+}
+
+/// Describes a top-level step by operation and target, never by typed value.
+fn step_label(step: &CompiledStep, redactor: &Redactor) -> SafeText {
+    let label = match (&step.include, &step.operation) {
+        (Some(include), _) => format!("run {}", include.path),
+        (None, operation) => {
+            let mut label = operation_name(operation).to_owned();
+            if let Operation::Open { url, .. } = operation {
+                label.push(' ');
+                label.push_str(if url.is_secret() {
+                    REDACTED
+                } else {
+                    url.expose().as_str()
+                });
+            }
+            if let Some(locator) = operation_locator(operation) {
+                label.push(' ');
+                label.push_str(locator_text(locator).as_str());
+            }
+            label
+        }
+    };
+    SafeText::public(redactor.redact(&label))
+}
+
 fn operation_name(operation: &Operation) -> &'static str {
     match operation {
         Operation::Open { .. } => "open",
@@ -4429,6 +4590,7 @@ fn report(
         } else {
             FlowStatus::Failed
         },
+        steps: Vec::new(),
         failures,
         warnings: recording_secret_warnings(flow),
         artifacts,
