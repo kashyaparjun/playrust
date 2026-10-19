@@ -27,8 +27,8 @@ independent `playrust` name (or `playrust.exe` on Windows):
 
 ```sh
 playrust install \
-  --archive ./playrust-v0.2.1-x86_64-unknown-linux-gnu.tar.gz \
-  --checksum ./playrust-v0.2.1-x86_64-unknown-linux-gnu.tar.gz.sha256 \
+  --archive ./playrust-v0.3.0-x86_64-unknown-linux-gnu.tar.gz \
+  --checksum ./playrust-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256 \
   --destination ~/.local/bin
 ```
 
@@ -41,13 +41,13 @@ To manually verify a downloaded archive before installing, use the command for
 your operating system:
 
 ```sh
-sha256sum -c playrust-v0.2.1-x86_64-unknown-linux-gnu.tar.gz.sha256  # Linux
-shasum -a 256 -c playrust-v0.2.1-aarch64-apple-darwin.tar.gz.sha256    # macOS
+sha256sum -c playrust-v0.3.0-x86_64-unknown-linux-gnu.tar.gz.sha256  # Linux
+shasum -a 256 -c playrust-v0.3.0-aarch64-apple-darwin.tar.gz.sha256    # macOS
 ```
 
 ```powershell
-$actual = (Get-FileHash .\playrust-v0.2.1-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
-$expected = (Get-Content .\playrust-v0.2.1-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToLower()
+$actual = (Get-FileHash .\playrust-v0.3.0-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash.ToLower()
+$expected = (Get-Content .\playrust-v0.3.0-x86_64-pc-windows-msvc.zip.sha256).Split()[0].ToLower()
 if ($actual -ne $expected) { throw "SHA-256 mismatch" }
 "SHA-256 verified: $actual"
 ```
@@ -58,7 +58,7 @@ Never skip checksum verification when installing a downloaded binary.
 Alternatively, install a tagged version from source with Rust 1.89 or newer:
 
 ```sh
-cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.2.1 playrust
+cargo install --locked --git https://github.com/kashyaparjun/playrust.git --tag v0.3.0 playrust
 ```
 
 For a local checkout:

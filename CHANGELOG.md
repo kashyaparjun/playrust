@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-19
+
 ### Added
 
 - `playrust session --live-frame PATH` keeps the newest recording frame at `PATH` as a JPEG, replaced atomically at most ten times a second, for a person watching the session.
