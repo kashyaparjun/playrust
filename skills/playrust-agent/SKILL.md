@@ -32,7 +32,7 @@ The browser context and continuous recorder start immediately. Playrust records 
 2. Snapshot before every ref-based action.
 3. Choose only refs present in the latest snapshot. Never guess refs.
 4. After a successful mutation, navigation, page/frame switch, or scroll, snapshot again.
-5. Use `act` for one action and `scroll` for viewport movement.
+5. Use `act` for one action and `scroll` for viewport movement. Do not use `input`: it is for a person taking over from a live view, works by coordinates, and cannot be replayed.
 6. If `pending_dialog` appears or an action returns `dialog_pending`, use `dialog` to accept or dismiss it, then snapshot again.
 7. Verify the goal with structured assertions and/or a final snapshot.
 8. Send `export` before `close`; close finalizes the recording into the bundle.

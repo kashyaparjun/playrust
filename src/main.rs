@@ -130,6 +130,9 @@ struct SessionArgs {
     /// Path to FFmpeg for continuous session recording.
     #[arg(long)]
     ffmpeg_path: Option<PathBuf>,
+    /// Keep the newest screencast frame at PATH as a JPEG, for a live view. Requires video.
+    #[arg(long, value_name = "PATH")]
+    live_frame: Option<PathBuf>,
     /// Root directory for session artifacts.
     #[arg(long, default_value = DEFAULT_ARTIFACTS)]
     artifacts: PathBuf,
@@ -271,6 +274,10 @@ async fn session(args: SessionArgs) -> ExitCode {
         eprintln!("error: session video requires even viewport width and height");
         return ExitCode::Specification;
     }
+    if args.live_frame.is_some() && matches!(args.video, SessionVideoMode::Off) {
+        eprintln!("error: --live-frame requires --video on");
+        return ExitCode::Specification;
+    }
     let browser = match resolve_or_install_browser(args.browser.as_deref()).await {
         Ok(path) => path,
         Err(error) => {
@@ -304,6 +311,7 @@ async fn session(args: SessionArgs) -> ExitCode {
                     SessionDialogPolicy::Accept => playrust::session_dialog::DialogPolicy::Accept,
                     SessionDialogPolicy::Dismiss => playrust::session_dialog::DialogPolicy::Dismiss,
                 },
+                live_frame: args.live_frame,
             })
             .await
         }

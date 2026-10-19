@@ -10,11 +10,14 @@ playrust session --protocol ndjson [--headed] [--browser PATH]
                     [--video on|off]
                     [--dialog-policy explicit|accept|dismiss]
                     [--ffmpeg-path PATH] [--artifacts DIR]
+                    [--live-frame PATH]
 ```
 
 The command eagerly opens one isolated browser context on `about:blank`. `--viewport` defaults to `1280x720`, `--timeout` defaults to `10s`, `--video` defaults to `on`, and `--dialog-policy` defaults to `explicit`. The viewport, timeout, video mode, and dialog policy are fixed for the session and recorded in its journal.
 
 Video `on` starts one continuous recording when the context opens and finalizes it at close. Video `off` disables recording. Session mode does not use `retain-on-failure`; an interactive recording is evidence for the entire session. A recorder failure is reported as degraded status with warnings and any partial path, but does not make later browser commands unusable.
+
+`--live-frame PATH` keeps the newest frame of the continuous recording at `PATH` as a JPEG, for a person watching the session. It is replaced atomically (written beside it, then renamed) at most ten times a second, and the newest frame of a burst is always written, so the file shows the page as it last changed. Frames match the viewport in CSS pixels. It requires `--video on`. The file shows whatever the page shows, including values filled from secrets; keep it as private as the recording.
 
 Dialog policy `explicit` requires a `dialog` command. `accept` and `dismiss` automatically handle every observed native dialog; automatic prompt acceptance uses an empty string. Automatic handling is journaled.
 
@@ -145,6 +148,29 @@ Mutating actions are dispatched once and are not automatically retried. Waits an
 ```
 
 Snapshot again before the next ref-based action.
+
+## Input
+
+`input` sends one event from a person watching the session, usually through `--live-frame`, so they can take over from the agent. Coordinates are CSS pixels in the viewport, the same as the live frame's pixels.
+
+```json
+{"id":60,"command":"input","event":{"type":"click","x":200,"y":130}}
+{"id":61,"command":"input","event":{"type":"click","x":200,"y":130,"count":2}}
+{"id":62,"command":"input","event":{"type":"move","x":320,"y":40}}
+{"id":63,"command":"input","event":{"type":"wheel","x":640,"y":360,"delta_y":600}}
+{"id":64,"command":"input","event":{"type":"text","text":"hello"}}
+{"id":65,"command":"input","event":{"type":"key","key":"Enter","modifiers":["Shift"]}}
+```
+
+`click` takes a `count` of 1 to 3 (default 1). `wheel` takes `delta_x` and `delta_y` (default 0, not both). `text` inserts up to 10,000 characters at the focus. `key` takes the key names and modifiers of the `press` action. Coordinates outside the viewport and other invalid events return `validation` without touching the page; a pending dialog returns `dialog_pending`.
+
+Success returns the event type and the page URL, and `dialog` if the event opened one:
+
+```json
+{"input":"click","url":"https://example.com/"}
+```
+
+Every input invalidates current refs, since the page may have changed under them. Inputs have no locator, so `replay.yaml` cannot repeat them: the journal records each as `manual_input` with its type only, never typed text, and `export` reports how many there were as `manual_inputs`. A replay with a non-zero count is missing the person's steps.
 
 ## Dialogs
 

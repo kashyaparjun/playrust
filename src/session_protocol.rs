@@ -15,7 +15,7 @@ use crate::report::{
     AggregateReport, ChromiumInfo, ExitCode, FlowReport, FlowStatus, RunnerInfo,
     write_aggregate_report,
 };
-use crate::runner::{CancellationToken, RunOptions, SessionSettings};
+use crate::runner::{CancellationToken, ManualInput, RunOptions, SessionSettings};
 use crate::session_dialog::DialogPolicy;
 use crate::session_journal::{
     ActionOutcome, JournalEvent, JournalWriter, build_replay_yaml, is_safe_bundle_name,
@@ -37,6 +37,7 @@ pub struct SessionOptions {
     pub settings: SessionSettings,
     pub video: VideoMode,
     pub dialog_policy: DialogPolicy,
+    pub live_frame: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +79,9 @@ enum SessionCommand {
     Dialog {
         action: DialogAction,
         text: Option<String>,
+    },
+    Input {
+        event: ManualInput,
     },
     Export {
         name: String,
@@ -321,6 +325,7 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                 .unwrap_or_else(|| PathBuf::from("ffmpeg")),
             artifacts: session_artifacts,
             dialog_policy: options.dialog_policy,
+            live_frame: options.live_frame.clone(),
         },
     )
     .await
@@ -1046,6 +1051,64 @@ pub async fn run(options: SessionOptions) -> ExitCode {
                     break;
                 }
             }
+            SessionCommand::Input { event } => {
+                let opened = match require_session_mut(&mut session, &mut state, request.id.clone())
+                {
+                    Ok(opened) => opened,
+                    Err(response) => {
+                        if write_response(&mut stdout, &response).await.is_err() {
+                            exit_code = ExitCode::Infrastructure;
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if let Err(message) = event.validate(opened.viewport()) {
+                    let response = state.error(request.id, "validation", message, None);
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(dialog) = opened.pending_dialog() {
+                    let response = state.error(
+                        request.id,
+                        "dialog_pending",
+                        "handle the pending native dialog before sending input",
+                        Some(json!(dialog)),
+                    );
+                    if write_response(&mut stdout, &response).await.is_err() {
+                        exit_code = ExitCode::Infrastructure;
+                        break;
+                    }
+                    continue;
+                }
+                let result = opened.manual_input(&event).await;
+                if let Err(error) = state.append(JournalEvent::ManualInput {
+                    kind: event.kind().to_owned(),
+                }) {
+                    let response = state.error(request.id, "artifacts", error.to_string(), None);
+                    let _ = write_response(&mut stdout, &response).await;
+                    exit_code = ExitCode::Infrastructure;
+                    break;
+                }
+                let response = match result {
+                    Ok(()) => {
+                        let url = opened.current_url().await.unwrap_or_default();
+                        let mut result = json!({ "input": event.kind(), "url": url });
+                        if let Some(dialog) = opened.pending_dialog() {
+                            result["dialog"] = json!(dialog);
+                        }
+                        state.response(request.id, result)
+                    }
+                    Err(message) => state.error(request.id, "action_failed", message, None),
+                };
+                if write_response(&mut stdout, &response).await.is_err() {
+                    exit_code = ExitCode::Infrastructure;
+                    break;
+                }
+            }
             SessionCommand::Dialog { action, text } => {
                 let opened = match require_session_ref(&session, &mut state, request.id.clone()) {
                     Ok(opened) => opened,
@@ -1534,6 +1597,11 @@ fn export_bundle(
     let screenshots =
         copy_screenshots(&state.artifacts, &bundle).map_err(artifact_command_error)?;
     state.bundle = Some(bundle.clone());
+    let manual_inputs = state
+        .events
+        .iter()
+        .filter(|event| matches!(event, JournalEvent::ManualInput { .. }))
+        .count();
     Ok(json!({
         "name": name,
         "bundle": bundle,
@@ -1543,6 +1611,7 @@ fn export_bundle(
         "screenshots": screenshots,
         "recording_pending": true,
         "step_count": replay.step_count,
+        "manual_inputs": manual_inputs,
     }))
 }
 

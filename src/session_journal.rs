@@ -275,6 +275,11 @@ pub enum JournalEvent {
     Export {
         name: String,
     },
+    /// Input a person sent while watching the session. It has no locator, so a replay cannot
+    /// repeat it; typed text is never recorded.
+    ManualInput {
+        kind: String,
+    },
     Close {
         summary: Value,
     },

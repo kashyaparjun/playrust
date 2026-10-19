@@ -37,8 +37,8 @@ use chromiumoxide::keys::get_key_definition;
 use chromiumoxide::listeners::EventStream;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, oneshot};
@@ -444,6 +444,114 @@ pub struct SessionInspection {
     pub screenshot: Option<String>,
 }
 
+/// One input from a person watching an interactive session, at CSS pixel coordinates in the
+/// viewport, which are also the coordinates of the session's screencast frames.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManualInput {
+    Click {
+        x: f64,
+        y: f64,
+        #[serde(default = "one_click")]
+        count: i64,
+    },
+    Move {
+        x: f64,
+        y: f64,
+    },
+    Wheel {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        delta_x: f64,
+        #[serde(default)]
+        delta_y: f64,
+    },
+    Text {
+        text: String,
+    },
+    Key {
+        key: String,
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
+}
+
+fn one_click() -> i64 {
+    1
+}
+
+/// The longest text one manual `text` input may insert.
+pub const MAX_MANUAL_TEXT_CHARS: usize = 10_000;
+
+impl ManualInput {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Click { .. } => "click",
+            Self::Move { .. } => "move",
+            Self::Wheel { .. } => "wheel",
+            Self::Text { .. } => "text",
+            Self::Key { .. } => "key",
+        }
+    }
+
+    /// Checks the input against the session viewport before anything reaches the page.
+    pub fn validate(&self, viewport: Viewport) -> Result<(), String> {
+        let inside = |x: f64, y: f64| {
+            x.is_finite()
+                && y.is_finite()
+                && (0.0..=f64::from(viewport.width)).contains(&x)
+                && (0.0..=f64::from(viewport.height)).contains(&y)
+        };
+        match self {
+            Self::Click { x, y, count } => {
+                if !inside(*x, *y) {
+                    return Err("input coordinates must lie inside the viewport".to_owned());
+                }
+                if !(1..=3).contains(count) {
+                    return Err("click count must be 1, 2 or 3".to_owned());
+                }
+            }
+            Self::Move { x, y } => {
+                if !inside(*x, *y) {
+                    return Err("input coordinates must lie inside the viewport".to_owned());
+                }
+            }
+            Self::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => {
+                if !inside(*x, *y) {
+                    return Err("input coordinates must lie inside the viewport".to_owned());
+                }
+                if !delta_x.is_finite()
+                    || !delta_y.is_finite()
+                    || (*delta_x == 0.0 && *delta_y == 0.0)
+                {
+                    return Err("wheel input requires a finite, non-zero delta".to_owned());
+                }
+            }
+            Self::Text { text } => {
+                if text.is_empty() || text.chars().count() > MAX_MANUAL_TEXT_CHARS {
+                    return Err(format!(
+                        "text input must be 1 to {MAX_MANUAL_TEXT_CHARS} characters"
+                    ));
+                }
+            }
+            Self::Key { key, modifiers } => {
+                crate::flow::parse_key(1, key).map_err(|_| format!("unsupported key {key:?}"))?;
+                for modifier in modifiers {
+                    crate::flow::parse_modifier(1, modifier)
+                        .map_err(|_| format!("unsupported modifier {modifier:?}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SessionRuntime {
     pub(crate) async fn open(host: &BrowserHost, flow: &CompiledFlow) -> anyhow::Result<Self> {
         Self::open_settings(
@@ -495,6 +603,55 @@ impl SessionRuntime {
 
     pub(crate) fn viewport(&self) -> Viewport {
         self.page_settings.viewport
+    }
+
+    /// Sends one validated manual input to the active page.
+    pub(crate) async fn manual_input(&self, input: &ManualInput) -> Result<(), String> {
+        let page = &self.active.page;
+        let result = match input {
+            ManualInput::Click { x, y, count } => {
+                dispatch_click(page, *x, *y, *count, false, None).await
+            }
+            ManualInput::Move { x, y } => page
+                .move_mouse(chromiumoxide::layout::Point::new(*x, *y))
+                .await
+                .map(|_| ())
+                .map_err(protocol),
+            ManualInput::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => page
+                .execute(
+                    DispatchMouseEventParams::builder()
+                        .r#type(DispatchMouseEventType::MouseWheel)
+                        .x(*x)
+                        .y(*y)
+                        .delta_x(*delta_x)
+                        .delta_y(*delta_y)
+                        .build()
+                        .expect("all mandatory wheel event fields are set"),
+                )
+                .await
+                .map(|_| ())
+                .map_err(protocol),
+            ManualInput::Text { text } => page
+                .execute(InsertTextParams::new(text.clone()))
+                .await
+                .map(|_| ())
+                .map_err(protocol),
+            ManualInput::Key { key, modifiers } => {
+                let key = crate::flow::parse_key(1, key).map_err(|error| error.to_string())?;
+                let modifiers = modifiers
+                    .iter()
+                    .map(|modifier| crate::flow::parse_modifier(1, modifier))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?;
+                dispatch_key(page, &key, &modifiers).await
+            }
+        };
+        result.map_err(|error| error.message)
     }
 
     pub(crate) async fn capture_agent_snapshot(&self) -> anyhow::Result<CapturedSnapshot> {
@@ -3635,6 +3792,21 @@ pub(crate) struct SessionRecorder {
     viewport_width: u32,
     viewport_height: u32,
     warnings: Vec<String>,
+    /// Where the latest screencast frame is published for a live view, if anywhere.
+    live_frame: Option<PathBuf>,
+}
+
+/// The shortest gap between two live-frame writes; the newest frame in a gap is written after it.
+const LIVE_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Replaces the live frame atomically, so a reader never sees a partly written JPEG.
+async fn publish_live_frame(path: &Path, jpeg: &[u8]) {
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    if tokio::fs::write(&partial, jpeg).await.is_ok() {
+        let _ = tokio::fs::rename(&partial, path).await;
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3648,7 +3820,11 @@ pub struct SessionRecordingFinish {
 }
 
 impl SessionRecorder {
-    pub(crate) async fn start(config: VideoConfig, page: &Page) -> Result<Self, String> {
+    pub(crate) async fn start(
+        config: VideoConfig,
+        page: &Page,
+        live_frame: Option<PathBuf>,
+    ) -> Result<Self, String> {
         tokio::fs::create_dir_all(
             config
                 .output_path
@@ -3668,6 +3844,7 @@ impl SessionRecorder {
             viewport_width: config.viewport_width,
             viewport_height: config.viewport_height,
             warnings: Vec::new(),
+            live_frame,
         };
         session.bind(page).await?;
         Ok(session)
@@ -3702,11 +3879,21 @@ impl SessionRecorder {
         .map_err(|error| format!("start screencast: {error}"))?;
         let sink = recorder.frame_sink();
         let task_page = page.clone();
+        let live_frame = self.live_frame.clone();
         let (stop, mut stop_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
+            let mut live_written = Instant::now() - LIVE_FRAME_INTERVAL;
+            let mut live_pending: Option<Vec<u8>> = None;
             loop {
+                let live_due = live_written + LIVE_FRAME_INTERVAL;
                 tokio::select! {
                     _ = &mut stop_rx => return Ok(()),
+                    _ = tokio::time::sleep_until(live_due.into()), if live_pending.is_some() => {
+                        if let (Some(path), Some(jpeg)) = (&live_frame, live_pending.take()) {
+                            publish_live_frame(path, &jpeg).await;
+                            live_written = Instant::now();
+                        }
+                    }
                     event = events.next() => {
                         let Some(event) = event else {
                             return Err("screencast event stream closed".to_owned());
@@ -3718,6 +3905,15 @@ impl SessionRecorder {
                         let jpeg = base64::engine::general_purpose::STANDARD
                             .decode(event.data.as_ref() as &[u8])
                             .map_err(|error| format!("decode screencast frame: {error}"))?;
+                        if let Some(path) = &live_frame {
+                            if Instant::now() >= live_due {
+                                publish_live_frame(path, &jpeg).await;
+                                live_written = Instant::now();
+                                live_pending = None;
+                            } else {
+                                live_pending = Some(jpeg.clone());
+                            }
+                        }
                         sink.push_frame(jpeg);
                     }
                 }

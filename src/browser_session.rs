@@ -11,7 +11,7 @@ use crate::browser::BrowserHost;
 use crate::flow::{CompiledFlow, FrameSwitch, Operation, Redactor, VideoMode};
 use crate::report::FlowReport;
 use crate::runner::{
-    InteractiveStepError, InteractiveStepResult, RunOptions, SessionRecorder,
+    InteractiveStepError, InteractiveStepResult, ManualInput, RunOptions, SessionRecorder,
     SessionRecordingFinish, SessionRuntime, SessionSettings,
 };
 use crate::session_dialog::{DialogPolicy, NativeDialogState, PendingDialog};
@@ -28,6 +28,8 @@ pub struct BrowserSessionOptions {
     pub ffmpeg_path: PathBuf,
     pub artifacts: PathBuf,
     pub dialog_policy: DialogPolicy,
+    /// Publish the newest screencast frame here as a JPEG for a live view.
+    pub live_frame: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,7 +66,7 @@ impl BrowserSession {
                 viewport_width: viewport.width,
                 viewport_height: viewport.height,
             };
-            match SessionRecorder::start(config, runtime.page()).await {
+            match SessionRecorder::start(config, runtime.page(), options.live_frame).await {
                 Ok(recorder) => Some(recorder),
                 Err(error) => {
                     recording_warnings.push(error);
@@ -292,6 +294,21 @@ impl BrowserSession {
             }
         }
         Ok(report)
+    }
+
+    pub fn viewport(&self) -> crate::browser::Viewport {
+        self.runtime.viewport()
+    }
+
+    /// Sends a person's input to the page. Element references from earlier snapshots go stale,
+    /// since the page may have changed under them.
+    pub async fn manual_input(&mut self, input: &ManualInput) -> Result<(), String> {
+        self.snapshots.invalidate_for_mutation();
+        tokio::select! {
+            result = self.runtime.manual_input(input) => result,
+            // A dialog the input opened blocks the event until it is handled.
+            _ = self.dialogs.wait_for_pending() => Ok(()),
+        }
     }
 
     pub async fn close(mut self, host: &BrowserHost) -> anyhow::Result<BrowserSessionClose> {

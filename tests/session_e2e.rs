@@ -462,6 +462,128 @@ fn interactive_snapshot_refs_actions_scroll_and_dialog_recover() {
 
 #[test]
 #[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
+fn manual_input_drives_the_page_and_the_live_frame_follows() {
+    const TYPED: &str = "typed-by-a-person";
+    let server = FixtureServer::start(&[(
+        "/",
+        "text/html; charset=utf-8",
+        "<!doctype html><title>Manual</title><style>body{margin:0;background:#fff;height:3000px}button,input{position:absolute;left:100px;width:200px;height:60px}</style><button style='top:100px' onclick=\"document.body.style.background='rgb(255,0,0)';document.title='clicked'\">Press</button><input aria-label='Name' style='top:300px' onkeydown=\"if(event.key==='Enter')document.title='entered:'+this.value\">",
+    )]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifacts = directory.path().join("artifacts");
+    let live = directory.path().join("live.jpg");
+    let mut session =
+        Session::start_with_args(&artifacts, "on", &["--live-frame", live.to_str().unwrap()]);
+    // The test build of `image` decodes PNG only, so FFmpeg converts each JPEG frame.
+    let png = directory.path().join("live.png");
+    let pixel = |path: &Path| {
+        let converted = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(path)
+            .arg(&png)
+            .output()
+            .unwrap();
+        assert_exit(converted, 0);
+        let image = image::load_from_memory(&std::fs::read(&png).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(image.dimensions(), (1280, 720));
+        image.get_pixel(1000, 600).0
+    };
+    let wait_for = |path: &Path, expected: [u8; 3]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if path.is_file()
+                && pixel(path)
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(expected) < 30)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live frame never showed {expected:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let open = session.command(json!({
+        "id": "open",
+        "command": "act",
+        "action": { "open": { "url": format!("{}/", server.url) } }
+    }));
+    assert_eq!(open["ok"], true, "{open}");
+    wait_for(&live, [255, 255, 255]);
+    let snapshot = session.command(json!({ "id": "snapshot", "command": "snapshot" }));
+    let press = snapshot["result"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|element| element["name"] == "Press")
+        .unwrap()["ref"]
+        .clone();
+
+    let outside = session.command(json!({
+        "id": "outside",
+        "command": "input",
+        "event": { "type": "click", "x": 5000, "y": 10 }
+    }));
+    assert_eq!(outside["error"]["code"], "validation", "{outside}");
+
+    let click = session.command(json!({
+        "id": "click",
+        "command": "input",
+        "event": { "type": "click", "x": 200, "y": 130 }
+    }));
+    assert_eq!(click["ok"], true, "{click}");
+    assert_eq!(click["result"]["input"], "click");
+    // The page changed under the agent: its last snapshot's refs are no longer valid.
+    let stale = session.command(json!({
+        "id": "stale",
+        "command": "act",
+        "action": { "click": { "ref": press } }
+    }));
+    assert_eq!(stale["ok"], false, "{stale}");
+    wait_for(&live, [255, 0, 0]);
+
+    for (id, event) in [
+        ("focus", json!({ "type": "click", "x": 200, "y": 330 })),
+        ("text", json!({ "type": "text", "text": TYPED })),
+        ("enter", json!({ "type": "key", "key": "Enter" })),
+        (
+            "wheel",
+            json!({ "type": "wheel", "x": 640, "y": 360, "delta_y": 600 }),
+        ),
+    ] {
+        let response = session.command(json!({ "id": id, "command": "input", "event": event }));
+        assert_eq!(response["ok"], true, "{id}: {response}");
+    }
+    let inspection = session.command(json!({ "id": "inspect", "command": "inspect" }));
+    assert_eq!(inspection["result"]["title"], format!("entered:{TYPED}"));
+    let scrolled = session.command(json!({ "id": "after", "command": "snapshot" }));
+    assert!(
+        scrolled["result"]["scroll"]["y"].as_f64().unwrap() > 0.0,
+        "{}",
+        scrolled["result"]["scroll"]
+    );
+
+    let export = session.command(json!({ "id": "export", "command": "export", "name": "manual" }));
+    assert_eq!(export["ok"], true, "{export}");
+    assert_eq!(export["result"]["manual_inputs"], 5);
+    let replay = std::fs::read_to_string(artifacts.join("manual/replay.yaml")).unwrap();
+    assert!(!replay.contains("input"), "{replay}");
+    let journal = std::fs::read_to_string(artifacts.join("manual/session.ndjson")).unwrap();
+    assert!(journal.contains("manual_input"), "{journal}");
+    assert!(!journal.contains(TYPED), "typed text reached the journal");
+    let close = session.command(json!({ "id": "close", "command": "close" }));
+    assert_eq!(close["ok"], true, "{close}");
+    assert_exit(session.finish(), 0);
+}
+
+#[test]
+#[ignore = "requires PLAYRUST_CHROME and FFmpeg"]
 fn interactive_session_records_one_continuous_video() {
     let server = FixtureServer::start(&[(
         "/",
@@ -615,6 +737,10 @@ impl Session {
     }
 
     fn start_with_video(artifacts: &Path, video: &str) -> Self {
+        Self::start_with_args(artifacts, video, &[])
+    }
+
+    fn start_with_args(artifacts: &Path, video: &str, extra: &[&str]) -> Self {
         let chrome = env::var_os("PLAYRUST_CHROME").expect("set PLAYRUST_CHROME");
         let mut child = Command::new(env!("CARGO_BIN_EXE_playrust"))
             .args([
@@ -628,6 +754,7 @@ impl Session {
                 "--video",
                 video,
             ])
+            .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

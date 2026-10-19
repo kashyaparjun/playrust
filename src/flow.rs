@@ -3340,7 +3340,7 @@ fn parse_url_path(index: usize, value: Resolved<String>) -> Result<Resolved<Stri
     Ok(Resolved::new(normalized, value.secret))
 }
 
-fn parse_key(index: usize, value: &str) -> Result<Key, FlowError> {
+pub(crate) fn parse_key(index: usize, value: &str) -> Result<Key, FlowError> {
     let named = match value {
         "Enter" => Some(NamedKey::Enter),
         "Tab" => Some(NamedKey::Tab),
@@ -3370,7 +3370,7 @@ fn parse_key(index: usize, value: &str) -> Result<Key, FlowError> {
     }
 }
 
-fn parse_modifier(index: usize, value: &str) -> Result<Modifier, FlowError> {
+pub(crate) fn parse_modifier(index: usize, value: &str) -> Result<Modifier, FlowError> {
     match value {
         "Alt" => Ok(Modifier::Alt),
         "Control" => Ok(Modifier::Control),

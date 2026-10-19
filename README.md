@@ -94,6 +94,8 @@ Snapshots contain compact semantic context and interactive elements with tempora
 
 With explicit dialog handling, an action that opens a native dialog succeeds and reports it. While a dialog is pending, `act`, `scroll`, and `submit` return recoverable `dialog_pending`; `snapshot`, `dialog`, `export`, and `close` remain available. A blocked snapshot returns dialog metadata and `capture_status: "blocked_by_dialog"` instead of hanging.
 
+A person can watch and take over: `--live-frame PATH` keeps the newest recording frame at `PATH` as a JPEG, and `{"command":"input","event":{"type":"click","x":200,"y":130}}` sends a click, move, wheel, text or key event at viewport coordinates. Inputs invalidate refs and are not replayable; `export` counts them as `manual_inputs`.
+
 `fill` and `select` accept literal values or environment-backed values such as `{"env":"TEST_PASSWORD"}`. Playrust resolves and redacts environment values; responses, journals, reports, and exported YAML contain the environment-variable name, never its plaintext value.
 
 `export` is nonterminal and writes `<artifacts>/<name>/` with canonical `replay.yaml`, `session.ndjson`, `report.json`, referenced screenshots, and a pending recording result. Always export before close: `close` finalizes `recording.mp4` (or documents a partial recording) and the report into that bundle. If no export was requested, close uses the normal `session-<id>/` artifact directory. Validate exported flows with `playrust check <bundle>/replay.yaml`; replay them in a fresh browser with `playrust run`.
