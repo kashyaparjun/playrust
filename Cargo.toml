@@ -20,7 +20,9 @@ futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = "0.0.29"
+# Pinned: 0.0.x semver is unstable. Upgrade only after reading the serde-saphyr
+# changelog, running the yaml hardening suite, and bumping with `cargo update -p serde-saphyr --precise <version>`.
+serde-saphyr = "=0.0.29"
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
@@ -30,3 +32,6 @@ tar = "0.4"
 zip = "4"
 tokio = { version = "1", features = ["full"] }
 url = "2"
+
+[dev-dependencies]
+proptest = "1"

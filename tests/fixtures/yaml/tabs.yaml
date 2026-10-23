@@ -1,0 +1,3 @@
+version: 1
+name:	x
+steps: [{ open: https://x.test }]

@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{
     Arc,
@@ -14,6 +14,36 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use playrust::report::AggregateReport;
+
+/// Shared adversarial YAML corpus under `tests/fixtures/yaml`.
+pub const YAML_FIXTURE_DIR: &str = "tests/fixtures/yaml";
+
+/// Layer-independent fixture names shared by parser and CLI suites.
+pub const YAML_ADVERSARIAL_FILES: &[&str] = &[
+    "alias_bomb.yaml",
+    "deep_nesting.yaml",
+    "large_scalar.yaml",
+    "tabs.yaml",
+    "bom_crlf.yaml",
+    "duplicate_keys_at_depth.yaml",
+    "merge_keys.yaml",
+];
+
+pub fn yaml_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(YAML_FIXTURE_DIR)
+        .join(name)
+}
+
+pub fn read_yaml_fixture(name: &str) -> String {
+    let bytes = fs::read(yaml_fixture_path(name)).unwrap_or_else(|error| {
+        panic!("failed to read fixture {name}: {error}");
+    });
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    String::from_utf8(bytes.to_vec()).unwrap_or_else(|error| {
+        panic!("fixture {name} is not valid UTF-8: {error}");
+    })
+}
 
 pub fn playrust(arguments: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_playrust"));

@@ -38,6 +38,25 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check for unexpected duplicate dependency versions
+        # Known baseline duplicates in the lockfile graph. Fail only when a new
+        # package appears with multiple versions.
+        run: |
+          allow='getrandom|hashbrown|rootcause|rootcause-internals|zip|libc'
+          duplicates="$(cargo tree --locked -d 2>/dev/null || true)"
+          if [ -z "$duplicates" ]; then
+            echo "No duplicate dependency versions."
+            exit 0
+          fi
+          echo "Duplicate dependency versions detected:"
+          echo "$duplicates"
+          unexpected="$(printf '%s\n' "$duplicates" | awk '/^[a-zA-Z0-9_-]+ v/ {print $1}' | sort -u | grep -Ev "^($allow)$" || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected duplicate packages (not in baseline allowlist):"
+            echo "$unexpected"
+            exit 1
+          fi
+          echo "Only known baseline duplicates present; allowing."
       - name: Test all features
         run: cargo test --all-features --locked
       - name: Clippy

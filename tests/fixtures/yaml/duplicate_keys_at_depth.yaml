@@ -1,0 +1,17 @@
+version: 1
+name: duplicate-at-depth
+steps:
+  - click:
+      target:
+        within:
+          within:
+            within:
+              within:
+                within:
+                  within:
+                    within:
+                      within:
+                        within:
+                          within:
+                            css: first
+                            css: second
